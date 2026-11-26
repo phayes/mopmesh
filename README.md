@@ -82,8 +82,14 @@ import mopmesh::topology::csr::{CsrRow, row_from_count, row_length};
 import mopmesh::geometry::triangle::triangle_centroid;
 import mopmesh::parallel::scan::exclusive_scan_64;
 import mopmesh::topology::edge::{EdgeRecord, is_boundary_edge, edge_face_count};
+import mopmesh::topology::edge::{INVALID_FACE, INVALID_VERTEX};
+import mopmesh::topology::face::INVALID_SLOT;
 import mopmesh::geometry::edge::edge_length;
 ```
+
+`INVALID_FACE`, `INVALID_VERTEX` and `INVALID_SLOT` all equal `0xffffffff`, the
+same value as the Rust constant `mopmesh::gpu::INVALID_ID`. Helpers that look up
+a missing face, endpoint or face slot return the matching constant.
 
 These public modules declare no resource bindings or compute entry points.
 Consumers choose those themselves. See `tests/shaders/consumer.wesl` and
@@ -138,9 +144,11 @@ and result checks as they are implemented.
 `examples/neighborhood.rs` demonstrates VE/VV composition. Its shader imports
 public CSR, boundary and length helpers, traverses each vertex's paired
 edge/neighbor entries, and returns degree, incident boundary-edge count, mean
-edge length, and an application-weighted mean. It uses five storage bindings and
-chooses its own bindings, entry point and output policy. Its actual operator code
-is exercised against Alum in the GPU tests; only the final results are read back.
+edge length, and an application-weighted mean. Its per-vertex weights are an
+ordinary `GpuVertexAttribute<f32>`. It uses five storage bindings and chooses
+its own bindings, entry point and output policy. Both example operators assert
+that their inputs report the same `mesh_id()`. Its actual operator code is
+exercised against Alum in the GPU tests; only the final results are read back.
 
 ## GPU usage
 
@@ -152,17 +160,35 @@ use mopmesh::gpu::{FaceVertexQuery, GpuMesh};
 let gpu_mesh = GpuMesh::upload(&device, &mesh)?;
 let query = FaceVertexQuery::new(&device); // Cache once per device.
 let mut encoder = device.create_command_encoder(&Default::default());
-let result = query.encode(&device, &mut encoder, &gpu_mesh);
-// Encode downstream compute or an explicit readback copy here.
+let face_vertices = query.encode(&device, &mut encoder, &gpu_mesh)?;
+// Bind face_vertices.buffer() downstream or copy it for readback.
 queue.submit([encoder.finish()]);
 ```
 
 The result is three u32 global vertex IDs per original input face, preserving
 winding. It has STORAGE and COPY_SRC usage and stays on the GPU. Each owned
 face is queried exactly once; ribbon copies do not duplicate output. Empty
-meshes dispatch no work and return a four-byte placeholder. Resources must
-belong to the same device. The query uses baseline compute limits: two storage
+meshes dispatch no work and return a four-byte placeholder; `face_count()` gives
+the logical record count. The query uses baseline compute limits: two storage
 bindings and 64 invocations per workgroup.
+
+### Shared contracts
+
+- **Errors.** Uploads and queries return `GpuError`. `LimitsExceeded { resource }`
+  means a buffer, u32 index range or dispatch would exceed u32 addressing or the
+  device limits; `resource` names it. `MeshMismatch` means typed inputs came from
+  different meshes. On error nothing has been allocated or recorded.
+- **Mesh identity.** `Mesh::id()` returns a `MeshId`. Host and GPU attributes,
+  `GpuMesh` and every query result report it through `mesh_id()`. Separately
+  built meshes never share an ID, even with identical input. Built-in queries
+  check typed attribute inputs; downstream operators can compare `mesh_id()`
+  values themselves, as both examples do.
+- **Device identity.** Every resource passed to one call must come from the same
+  `wgpu::Device`. This is not checked: a mismatch is reported by wgpu validation
+  rather than as a `GpuError`.
+- **Results.** Every query returns a typed result exposing `buffer()` or named
+  buffers, logical counts and `mesh_id()`. Empty results hold zeroed placeholders
+  so the buffer is always bindable; use the counts, never the buffer size.
 
 `GpuMesh::arena()` exposes immutable scalar connectivity. All offsets are u32
 word offsets, with no struct padding. The four-word header holds face count,
@@ -173,7 +199,9 @@ record offset, vertex offset, and global face ID. Each seven-word edge task stor
 local edge ID, local face count, FE base, face-ID base, global edge ID,
 vertex-ID base, and EV base.
 This static ABI is experimental; it contains no edit capacities or active masks.
-Upload checks device buffer, binding-size, and dispatch limits before allocation.
+Upload checks the arena against u32 addressing and the device buffer and
+binding-size limits before allocation. Each query checks its own outputs and
+dispatches.
 
 ### Edge endpoints and incident faces
 
@@ -187,7 +215,7 @@ let edges = query.encode(&device, &mut encoder, &gpu_mesh)?;
 
 Each canonical edge has a 16-byte record: two global vertex IDs, followed by two
 global face IDs. Endpoints are ascending; incident-face order is unspecified.
-Boundary edges use `0xffffffff` for the missing face. Edge IDs are deterministic
+Boundary edges use `INVALID_ID` (`0xffffffff`) for the missing face. Edge IDs are deterministic
 constructed IDs, accessible through each patch's `edge_ids()` table; they need
 not match another library's edge numbering. The result has STORAGE and COPY_SRC
 usage, and an empty mesh returns a zeroed 16-byte placeholder with zero logical
@@ -216,8 +244,8 @@ let diamonds = adjacency.edge_diamonds();
 face connectivity intermediates. It also exposes `edge_connectivity()` for
 downstream composition. All result buffers have STORAGE and COPY_SRC usage.
 The batch requires four storage bindings, one uniform binding, and 64 lanes.
-All resources must belong to the same device. Buffer, scalar-index, scratch and
-dispatch limits are checked before commands are recorded.
+Buffer, scalar-index, scratch and dispatch limits are checked before commands
+are recorded.
 
 - **Vertex-edge and vertex-neighbor:** one CSR buffer with `V + 1` u32 offsets,
   followed by `2E` pairs `(canonical edge ID, neighbor vertex ID)`. Offsets count
@@ -226,12 +254,12 @@ dispatch limits are checked before commands are recorded.
   endpoint. Row order is unspecified and is not a cyclic one-ring ordering.
 - **Face-neighbor:** three contiguous u32 face IDs per original input face.
   Slot `i` is across `(triangle[i], triangle[(i + 1) % 3])`, preserving input
-  winding and corner order. `0xffffffff` denotes a boundary. Do not bind this
+  winding and corner order. `INVALID_ID` denotes a boundary. Do not bind this
   12-byte-per-face layout as a WGSL array of vec3, whose stride would be 16 bytes.
 - **Edge-diamond:** one 16-byte quartet per canonical edge:
   `[endpoint0, endpoint1, opposite0, opposite1]`. Endpoints are ascending and the
   opposite vertices correspond to the two incident-face slots in
-  `edge_connectivity()`. A missing boundary-side opposite is `0xffffffff`.
+  `edge_connectivity()`. A missing boundary-side opposite is `INVALID_ID`.
   This quartet is not cyclic or oriented by side; consumers must use face
   winding when they need an oriented cavity boundary.
 
@@ -288,14 +316,21 @@ queue.submit([encoder.finish()]);
 
 // After editing host_positions through mesh vertex handles:
 positions.write(&queue, &host_positions)?;
+
+// Per-vertex application data, in input vertex order:
+let weights = mesh.vertex_attribute_from(vec![1.0f32; mesh.positions().len()]).unwrap();
+let weights = gpu_mesh.upload_vertex_attribute(&device, &weights)?;
 ```
 
+Host attributes come from `Mesh::vertex_attribute(value)`,
+`Mesh::position_attribute()` or `Mesh::vertex_attribute_from(values)`, which
+returns `None` unless there is exactly one value per input vertex.
+`VertexAttribute::as_slice()` exposes the values in input vertex order.
 GPU attributes store one value per original input vertex. Resolve patch-local
 vertices through the arena's global vertex-ID table; ribbon references share
 the same canonical slot. Uploads, updates, and centroid queries reject attributes
-from another mesh, even if the meshes have identical topology. Resources must
-still belong to the same device. The buffer is exposed for downstream shaders
-and has STORAGE, COPY_SRC, and COPY_DST usage.
+from another mesh, even if the meshes have identical topology. The buffer is
+exposed for downstream shaders and has STORAGE, COPY_SRC, and COPY_DST usage.
 
 Supported element types are `f32`, `u32`, `i32`, and arrays of two or four of
 those scalars, matching WGSL scalar/vec2/vec4 storage-array strides. Three-element
@@ -308,9 +343,9 @@ writes also affect commands already encoded but not submitted. Updating a
 position attribute does not change `Mesh::positions()` or revalidate geometry.
 GPU writes are not automatically copied back to host attributes.
 
-The centroid result contains one `vec4<f32>` per original face ID, with centroid
-xyz and zero w; input w lanes are ignored. Empty meshes return a zero vec4
-placeholder without dispatch. The query uses three storage bindings and the
+The `FaceCentroids` result contains one `vec4<f32>` per original face ID, with
+centroid xyz and zero w; input w lanes are ignored. Empty meshes return a zero
+vec4 placeholder without dispatch. The query uses three storage bindings and the
 existing FV evaluation. Finite, reasonably scaled f32 positions are expected;
 extreme coordinates remain subject to floating-point overflow and rounding.
 
@@ -324,11 +359,13 @@ centroids before and after position updates through ribbon handles, edge
 connectivity, VE/VV, FF slot order, boundary/interior diamonds, and both downstream
 operators. Repeated adjacency execution is also checked. They passed on
 Apple M1 Max / Metal; other backends have not yet been exercised.
-The ordinary test suite runs shader validation
-and scan allocation/dispatch-limit checks without requiring GPU hardware.
+The ordinary test suite runs shader validation, arena sizing, binding and
+dispatch-limit checks, and scan allocation checks without requiring GPU
+hardware. GPU tests also check mesh IDs on every result and per-query limit
+errors on devices with reduced limits.
 GPU scan tests cover empty, exact, and partial blocks, zeros, varying values,
 wrapping arithmetic, and up to four hierarchy levels (262,145 values).
-The latest recorded full run passed 13 tests (11 hardware-independent and two
+The latest recorded full run passed 16 tests (14 hardware-independent and two
 opt-in GPU tests); both examples, Clippy and formatting checks also passed.
 These are correctness results, not benchmarks or exhaustive topology coverage.
 
@@ -363,8 +400,9 @@ objects reuse pipelines while encode calls allocate fresh output/scratch
 buffers. The batched adjacency API computes all four families together.
 Their performance and allocation tradeoffs remain to be measured.
 
-Typed attribute APIs check mesh identity; raw-buffer compositions require the
-application to supply matching mesh/device resources. Keep the caller's queue
+Built-in queries check mesh identity for typed attribute inputs. Downstream
+compositions can compare `mesh_id()` values but must enforce that themselves;
+device identity is never checked. Keep the caller's queue
 alive while encoding and submitting work. No automatic device selection,
 resource pooling, generation-checked handles or migration exists yet.
 
@@ -383,8 +421,9 @@ Alum and do not require those checkouts.
 
 ## Next steps
 
-Follow the [execution milestones](ROADMAP.md#next-execution-milestones): review
-the static API, establish an unpartitioned GPU benchmark baseline, then evaluate
+Follow the [execution milestones](ROADMAP.md#next-execution-milestones). The
+static API review is complete ([findings](docs/static_api_review.md)). Next,
+establish an unpartitioned GPU benchmark baseline, then evaluate
 workgroup-local traversal. Complete remaining static attributes and geometry
 operators before starting interior edge flips. Static performance viability
 remains an open gate rather than an assumed property of the patch representation.

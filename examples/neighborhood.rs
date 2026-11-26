@@ -26,11 +26,14 @@ async fn run() {
     let positions = gpu
         .upload_vertex_attribute(&device, &mesh.position_attribute())
         .unwrap();
+    let weights = gpu
+        .upload_vertex_attribute(&device, &mesh.vertex_attribute(1f32))
+        .unwrap();
     let query = AdjacencyQuery::new(&device);
     let operator = neighborhood::NeighborhoodOperator::new(&device);
     let mut encoder = device.create_command_encoder(&Default::default());
     let adjacency = query.encode(&device, &mut encoder, &gpu).unwrap();
-    let output = operator.encode(&device, &mut encoder, &adjacency, &positions, &[1.; 4]);
+    let output = operator.encode(&device, &mut encoder, &adjacency, &positions, &weights);
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("neighborhood final readback"),
         size: output.size(),

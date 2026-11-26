@@ -16,7 +16,9 @@ attributes, hierarchical scans, and two runnable downstream WESL examples.
 Geometry algorithms have begun; topology editing has not. Construction and
 partitioning run on the CPU; uploaded topology is immutable.
 
-The last full verification run passed 13 tests: 11 hardware-independent tests
+The static API review is complete; see the [findings and decisions](docs/static_api_review.md).
+
+The last full verification run passed 16 tests: 14 hardware-independent tests
 and two opt-in GPU tests. Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
 checks passed, and both examples ran. GPU execution has only been verified on
@@ -82,9 +84,10 @@ See [reference setup](prior_art/REFERENCES.md).
 - [x] Validate shaders with Naga; run GPU tests explicitly, failing if no adapter is available.
 - [x] Check arena/result sizes, scalar addressing and relevant dispatch limits.
 
-Device-profile selection, error-contract consolidation and scratch/pipeline
-management still need review; these are follow-up hardening tasks, not evidence
-of production readiness.
+Errors are consolidated into `GpuError` and pipeline setup shares one private
+helper module. Device-profile selection and scratch/pipeline reuse across
+queries still need measurement; these are follow-up hardening tasks, not
+evidence of production readiness.
 
 ### 2 — Static topology: connectivity complete; broader acceptance open
 
@@ -96,7 +99,7 @@ of production readiness.
 - [x] Verify query results across patch sizes against Alum, including repeated execution.
 - [x] Run downstream boundary and neighborhood compositions using the public WESL package.
 - [ ] Add canonical edge and face attributes with identity checks and reference tests.
-- [ ] Review the static API and buffer contracts before expanding them further.
+- [x] Review the static API and buffer contracts before expanding them further.
 - [ ] Stage topology in workgroup memory and evaluate patch-local traversal.
 - [ ] Demonstrate locality benefits against an unpartitioned GPU baseline.
 
@@ -151,10 +154,11 @@ local cavities. The current Cargo version does not mean that release scope is co
 
 ## Next execution milestones
 
-1. **Static API and architecture review.** Audit layouts, identity/device
-   requirements, ordering, sentinels, error handling, duplicate pipeline setup,
-   batched-query cost and temporary allocations. Acceptance: an actionable
-   findings list, contract decisions and focused fixes with regression tests.
+1. **Static API and architecture review — done.** [Findings](docs/static_api_review.md)
+   cover layouts, identity/device requirements, ordering, sentinels, error
+   handling, pipeline setup, batched-query cost and temporary allocations.
+   Fixes landed with regression tests; deferred findings P2–P4 and L3 feed
+   the benchmark baseline.
 2. **Benchmark baseline.** Add representative meshes and an unpartitioned WESL
    baseline. Measure construction/upload separately from warm GPU execution;
    report allocations, dispatches, query throughput, bytes/triangle, scratch and
@@ -205,9 +209,10 @@ comparison against the unpartitioned WESL baseline.
   do not update host data. Queue writes affect the next submission, including
   commands already encoded. Attribute updates do not revalidate geometry.
 - **Lifetimes and identities are distinct.** Keep the caller's queue alive while
-  encoding/submitting work. Typed attribute APIs check mesh identity, but raw
-  buffers/downstream compositions still require the caller to match mesh and
-  device resources. Handles are not generation-checked.
+  encoding/submitting work. Every attribute and query result reports a
+  `MeshId`; built-in queries check typed attribute inputs, and downstream
+  compositions compare IDs themselves. Device identity is documented as a
+  caller responsibility and not checked. Handles are not generation-checked.
 - **Reusable operators are core scope.** Both runnable examples import only
   public WESL symbols and choose their own bindings. Common operations belong
   in the library, and runtime wrappers use them. New families need linking and

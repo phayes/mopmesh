@@ -224,7 +224,27 @@ fn ribbon_attributes_share_canonical_values() {
     assert_ne!(ribbon, owner);
     *attr.get_mut(&mesh, ribbon).unwrap() = 42;
     assert_eq!(attr.get(&mesh, owner), Some(&42));
-    assert_eq!(attr.get(&build(), owner), None);
+    let other = build();
+    assert_ne!(other.id(), mesh.id());
+    assert_eq!(attr.get(&other, owner), None);
+    assert_eq!(attr.mesh_id(), mesh.id());
+
+    // Per-vertex construction uses input vertex order and requires one value each.
+    let ramp = mesh.vertex_attribute_from(vec![10u32, 11, 12, 13]).unwrap();
+    assert_eq!(ramp.as_slice(), [10, 11, 12, 13]);
+    assert_eq!(ramp.len(), 4);
+    assert!(!ramp.is_empty());
+    for p in mesh.patches() {
+        for (local, &global) in p.vertex_ids().iter().enumerate() {
+            let h = VertexHandle {
+                patch: p.id(),
+                local: local as u32,
+            };
+            assert_eq!(ramp.get(&mesh, h), Some(&(10 + global)));
+        }
+    }
+    assert!(mesh.vertex_attribute_from(vec![0u32; 3]).is_none());
+    assert!(mesh.vertex_attribute_from(vec![0u32; 5]).is_none());
     assert_eq!(
         mesh.vertex_owner(VertexHandle {
             patch: u32::MAX,
@@ -297,6 +317,15 @@ fn invalid_inputs_are_rejected() {
     assert_eq!(
         build(&p, &[[0, 1, 2], [1, 0, 3], [0, 1, 4]]),
         BuildError::NonManifoldEdge([0, 1])
+    );
+    // Messages name the offending input element rather than a Debug dump.
+    assert_eq!(
+        BuildError::InvalidVertex { face: 0, vertex: 9 }.to_string(),
+        "face 0 references missing vertex 9"
+    );
+    assert_eq!(
+        BuildError::NonManifoldEdge([0, 1]).to_string(),
+        "edge (0, 1) is shared by more than two faces"
     );
 }
 

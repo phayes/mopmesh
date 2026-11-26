@@ -1,6 +1,5 @@
 //! Downstream VE/VV composition, shared with GPU result tests.
 use mopmesh::gpu::{GpuVertexAttribute, MeshAdjacency};
-use wgpu::util::DeviceExt;
 
 pub struct NeighborhoodOperator {
     pipeline: wgpu::ComputePipeline,
@@ -31,19 +30,20 @@ impl NeighborhoodOperator {
             }),
         }
     }
-    // Caller supplies matching mesh resources. Output lanes: degree, boundary
-    // incident edges, mean edge length, application weight times mean length.
+    // Record four values per vertex: number of edges touching it, number of those
+    // edges on the boundary, mean edge length, and weight times mean edge length.
+    // Adjacency, positions, and weights must have the same mesh ID; a mismatch panics.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         adjacency: &MeshAdjacency,
         positions: &GpuVertexAttribute<[f32; 4]>,
-        weights: &[f32],
+        weights: &GpuVertexAttribute<f32>,
     ) -> wgpu::Buffer {
-        assert_eq!(weights.len(), adjacency.vertex_count() as usize);
-        assert_eq!(positions.len(), adjacency.vertex_count());
-        let size = (weights.len() as u64 * 16).max(16);
+        assert_eq!(adjacency.mesh_id(), positions.mesh_id());
+        assert_eq!(adjacency.mesh_id(), weights.mesh_id());
+        let size = (u64::from(adjacency.vertex_count()) * 16).max(16);
         let limits = device.limits();
         assert!(
             size <= limits
@@ -56,19 +56,14 @@ impl NeighborhoodOperator {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        if weights.is_empty() {
+        if adjacency.vertex_count() == 0 {
             return output;
         }
-        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("application vertex weights"),
-            contents: bytemuck::cast_slice(weights),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
         let buffers = [
             adjacency.vertex_neighbors(),
             adjacency.edge_connectivity().buffer(),
             positions.buffer(),
-            &weights,
+            weights.buffer(),
             &output,
         ];
         let entries: Vec<_> = buffers

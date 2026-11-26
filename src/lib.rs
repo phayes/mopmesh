@@ -8,7 +8,7 @@ mod mesh;
 mod patch;
 
 pub use handle::{EdgeHandle, FaceHandle, VertexHandle};
-pub use mesh::{BuildError, Mesh, MeshBuilder, VertexAttribute};
+pub use mesh::{BuildError, Mesh, MeshBuilder, MeshId, VertexAttribute};
 pub use patch::{DirectedEdge, Patch};
 
 // Packaged sources can be linked by downstream WESL compilers independently

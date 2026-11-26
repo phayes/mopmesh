@@ -54,6 +54,9 @@ impl Patch {
         &self.face_owners
     }
 
+    /// Returns the three patch-local vertex IDs for face `local`, preserving
+    /// the input triangle's vertex order. Use each ID to index [`Patch::vertex_ids`]
+    /// to obtain the original input vertex ID. Returns `None` if `local` is out of range.
     pub fn face_vertices(&self, local: u32) -> Option<[u32; 3]> {
         Some(
             self.fe

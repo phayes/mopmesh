@@ -1,4 +1,7 @@
+// Mark missing faces and vertices with 0xffffffff, matching Rust's mopmesh::gpu::INVALID_ID.
+// These values are sentinels, not valid indices into mesh data.
 public const INVALID_FACE: u32 = 0xffffffffu;
+public const INVALID_VERTEX: u32 = 0xffffffffu;
 
 // Storage-array stride: 16 bytes. Endpoint IDs are global vertex IDs; faces
 // are global face IDs, with INVALID_FACE denoting the missing boundary face.
@@ -33,9 +36,11 @@ public fn other_edge_face(faces: vec2<u32>, face: u32) -> u32 {
     return INVALID_FACE;
 }
 
+// Returns the other endpoint of the edge. If vertex is not one of the two
+// endpoints in vertices, returns INVALID_VERTEX.
 public fn other_edge_vertex(vertices: vec2<u32>, vertex: u32) -> u32 {
     if (vertices.x == vertex) { return vertices.y; }
     if (vertices.y == vertex) { return vertices.x; }
-    return 0xffffffffu;
+    return INVALID_VERTEX;
 }
 

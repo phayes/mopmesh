@@ -1,8 +1,22 @@
 use crate::{DirectedEdge, EdgeHandle, FaceHandle, Patch, VertexHandle};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Identifies a [`Mesh`] and its attributes, GPU uploads, and query results.
+/// Compare IDs before combining resources to check that they belong to the same mesh.
+/// Building another mesh assigns a new ID, even if its input data is identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeshId(u64);
+impl MeshId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// An input error reported by [`MeshBuilder::build`]. Vertex and face IDs are
+/// zero-based indices into the positions and triangles supplied to the builder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuildError {
     InvalidPatchSize,
@@ -18,7 +32,26 @@ pub enum BuildError {
 }
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid mesh input: {self:?}")
+        match self {
+            Self::InvalidPatchSize => {
+                f.write_str("patch size must be between 1 and u32::MAX faces")
+            }
+            Self::TooManyElements => f.write_str("too many vertices or faces for u32 indices"),
+            Self::NonFinitePosition(v) => write!(f, "vertex {v} has a non-finite coordinate"),
+            Self::InvalidVertex { face, vertex } => {
+                write!(f, "face {face} references missing vertex {vertex}")
+            }
+            Self::DegenerateFace(face) => write!(f, "face {face} has zero area"),
+            Self::DuplicateFace(face) => write!(f, "face {face} repeats an earlier face"),
+            Self::NonManifoldEdge([a, b]) => {
+                write!(f, "edge ({a}, {b}) is shared by more than two faces")
+            }
+            Self::InconsistentWinding([a, b]) => {
+                write!(f, "faces sharing edge ({a}, {b}) have inconsistent winding")
+            }
+            Self::NonManifoldVertex(v) => write!(f, "vertex {v} is non-manifold"),
+            Self::IsolatedVertex(v) => write!(f, "vertex {v} is not used by any face"),
+        }
     }
 }
 impl std::error::Error for BuildError {}
@@ -285,20 +318,27 @@ impl<'a> MeshBuilder<'a> {
             edge_count: edges.len(),
             face_count: self.triangles.len(),
             patches,
-            identity: Arc::new(()),
+            id: MeshId::next(),
         })
     }
 }
 
+/// A validated triangle mesh created by [`MeshBuilder`].
+/// Stores vertex positions and fixed connections between vertices, edges, and faces,
+/// divided into patches for local access.
 #[derive(Debug)]
 pub struct Mesh {
     positions: Vec<[f32; 3]>,
     edge_count: usize,
     face_count: usize,
     patches: Vec<Patch>,
-    pub(crate) identity: Arc<()>,
+    id: MeshId,
 }
 impl Mesh {
+    /// Returns this mesh's ID, also reported by its attributes, GPU uploads, and query results.
+    pub fn id(&self) -> MeshId {
+        self.id
+    }
     pub fn positions(&self) -> &[[f32; 3]] {
         &self.positions
     }
@@ -332,11 +372,20 @@ impl Mesh {
             .get(h.local as usize)
             .copied()
     }
+    /// Creates an attribute with a clone of `value` for each input vertex.
     pub fn vertex_attribute<T: Clone>(&self, value: T) -> VertexAttribute<T> {
         VertexAttribute {
             values: vec![value; self.positions.len()],
-            identity: self.identity.clone(),
+            mesh: self.id,
         }
+    }
+    /// Creates an attribute from values in the original input vertex order.
+    /// Returns `None` unless `values` contains exactly one value per vertex.
+    pub fn vertex_attribute_from<T>(&self, values: Vec<T>) -> Option<VertexAttribute<T>> {
+        (values.len() == self.positions.len()).then_some(VertexAttribute {
+            values,
+            mesh: self.id,
+        })
     }
     /// Original positions as WGSL-compatible vec4 values; the fourth lane is zero.
     pub fn position_attribute(&self) -> VertexAttribute<[f32; 4]> {
@@ -346,7 +395,7 @@ impl Mesh {
                 .iter()
                 .map(|&[x, y, z]| [x, y, z, 0.])
                 .collect(),
-            identity: self.identity.clone(),
+            mesh: self.id,
         }
     }
 }
@@ -357,11 +406,25 @@ impl Mesh {
 #[derive(Debug)]
 pub struct VertexAttribute<T> {
     pub(crate) values: Vec<T>,
-    pub(crate) identity: Arc<()>,
+    pub(crate) mesh: MeshId,
 }
 impl<T> VertexAttribute<T> {
+    /// Returns the ID of the mesh that created this attribute.
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
+    }
+    /// Borrows the attribute values in the original input vertex order.
+    pub fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
     fn index(&self, mesh: &Mesh, h: VertexHandle) -> Option<usize> {
-        if !Arc::ptr_eq(&self.identity, &mesh.identity) {
+        if self.mesh != mesh.id {
             return None;
         }
         Some(

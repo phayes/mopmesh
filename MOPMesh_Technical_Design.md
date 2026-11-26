@@ -168,13 +168,14 @@ See [ROADMAP.md](ROADMAP.md) for the maintained phase checklist, acceptance gate
 
 Current position: the reference setup is mostly complete; infrastructure and static query coverage are in place; static algorithms have begun; dynamics and measured optimization have not. Downstream examples are core acceptance work, and both boundary and neighborhood compositions now run against the public package.
 
-The next sequence is **static API review → benchmark baseline → workgroup-local traversal experiment → remaining static attributes/algorithms → interior edge flips**. Baseline profiling has been moved ahead of dynamics rather than deferred to the late optimization phase. Broader cross-vendor tuning still belongs to later phases.
+The static API review is complete ([findings](docs/static_api_review.md)). The next sequence is **benchmark baseline → workgroup-local traversal experiment → remaining static attributes/algorithms → interior edge flips**. Baseline profiling has been moved ahead of dynamics rather than deferred to the late optimization phase. Broader cross-vendor tuning still belongs to later phases.
 
 ## Current project layout
 
 ```text
 src/                       CPU construction, handles, patches, public GPU API
-src/gpu/                   Attributes, adjacency, edge queries, scan orchestration
+src/gpu/                   Attributes, adjacency, edge queries, scan orchestration, shared pipeline helpers
+docs/                      Review findings and contract decisions
 shaders/                   Public core, topology, geometry and parallel WESL modules
 runtime_shaders/           Concrete bindings and dispatch entry points
 examples/                  Runnable downstream applications

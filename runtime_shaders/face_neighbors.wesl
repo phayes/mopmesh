@@ -1,4 +1,4 @@
-import package::shaders::topology::edge::{EdgeRecord, INVALID_FACE, other_edge_face};
+import package::shaders::topology::edge::{EdgeRecord, INVALID_FACE, INVALID_VERTEX, other_edge_face};
 import package::shaders::topology::face::{face_edge_slot, opposite_vertex};
 
 @group(0) @binding(0) var<storage, read> edges: array<EdgeRecord>;
@@ -11,7 +11,7 @@ import package::shaders::topology::face::{face_edge_slot, opposite_vertex};
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= arrayLength(&edges)) { return; }
     let edge = edges[id.x];
-    var opposite = vec2(0xffffffffu);
+    var opposite = vec2(INVALID_VERTEX);
     for (var side = 0u; side < 2u; side++) {
         let face = edge.faces[side];
         if (face != INVALID_FACE) {

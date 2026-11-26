@@ -1,11 +1,16 @@
-use super::{GpuLimitError, GpuMesh};
+use super::pipeline::{self, check_binding, workgroups};
+use super::{GpuError, GpuMesh};
+use crate::MeshId;
 
-/// One 16-byte WESL EdgeRecord per canonical edge ID: two global vertex IDs
-/// followed by two global face IDs. A missing face is u32::MAX. Incident-face
-/// order is unspecified; endpoint IDs are ascending. Usage: STORAGE | COPY_SRC.
+/// Edge endpoints and the faces that touch each edge.
+/// The buffer contains one 16-byte WESL `EdgeRecord` per canonical edge ID:
+/// two input vertex IDs in ascending order, then two input face IDs in
+/// unspecified order. A boundary edge's missing face is [`super::INVALID_ID`].
+/// The buffer supports `STORAGE | COPY_SRC`.
 pub struct EdgeConnectivity {
     buffer: wgpu::Buffer,
     edge_count: u32,
+    mesh: MeshId,
 }
 impl EdgeConnectivity {
     pub fn buffer(&self) -> &wgpu::Buffer {
@@ -13,6 +18,9 @@ impl EdgeConnectivity {
     }
     pub fn edge_count(&self) -> u32 {
         self.edge_count
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
     }
 }
 
@@ -24,75 +32,57 @@ pub struct EdgeQuery {
 }
 impl EdgeQuery {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh edge connectivity"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/edges.wgsl")).into(),
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh edge connectivity",
+            include_str!(concat!(env!("OUT_DIR"), "/edges.wgsl")),
+        );
+        Self {
+            pipeline: pipeline::compute_pipeline(
+                device,
+                "MOPMesh edge connectivity",
+                &module,
+                "main",
+                None,
             ),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MOPMesh edge connectivity"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        Self { pipeline }
+        }
     }
 
-    /// Record into a caller-owned encoder. Checks output and dispatch limits
-    /// before allocating or recording anything. Uses two storage bindings and
-    /// 64 invocations per workgroup. All resources must belong to the same device.
-    /// Empty meshes return a 16-byte zero placeholder without dispatch.
+    /// Records a query for each edge's endpoints and adjoining faces in `mesh`.
+    /// Returns [`GpuError::LimitsExceeded`] before allocating or recording commands
+    /// if the result or dispatch is too large. An empty mesh returns zero edges
+    /// with a 16-byte zero placeholder buffer and records no GPU work.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
-    ) -> Result<EdgeConnectivity, GpuLimitError> {
-        let size = (u64::from(mesh.edge_count) * 16).max(16);
+    ) -> Result<EdgeConnectivity, GpuError> {
+        const RESOURCE: &str = "edge connectivity";
         let limits = device.limits();
-        if size
-            > limits
-                .max_buffer_size
-                .min(limits.max_storage_buffer_binding_size)
-            || mesh.edge_count.div_ceil(64) > limits.max_compute_workgroups_per_dimension
-        {
-            return Err(GpuLimitError);
-        }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh edge records"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        if mesh.edge_count != 0 {
-            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("MOPMesh edge bindings"),
-                layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: mesh.arena.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: buffer.as_entire_binding(),
-                    },
-                ],
-            });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MOPMesh edge query"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(mesh.edge_count.div_ceil(64), 1, 1);
-        }
-        Ok(EdgeConnectivity {
-            buffer,
+        let bytes = (u64::from(mesh.edge_count) * 16).max(16);
+        check_binding(&limits, bytes, RESOURCE)?;
+        let groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
+        let result = EdgeConnectivity {
+            buffer: pipeline::output_buffer(device, "MOPMesh edge records", bytes),
             edge_count: mesh.edge_count,
-        })
+            mesh: mesh.mesh,
+        };
+        if mesh.edge_count != 0 {
+            let bindings = pipeline::bind_buffers(
+                device,
+                "MOPMesh edge bindings",
+                &self.pipeline.get_bind_group_layout(0),
+                &[&mesh.arena, &result.buffer],
+            );
+            pipeline::dispatch(
+                encoder,
+                "MOPMesh edge connectivity",
+                &self.pipeline,
+                &bindings,
+                groups,
+            );
+        }
+        Ok(result)
     }
 }

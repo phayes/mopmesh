@@ -2,8 +2,8 @@ use alum::{Handle, HasIterators, HasTopology, PolyMeshF32, Vec3};
 use mopmesh::{
     MeshBuilder, VertexHandle,
     gpu::{
-        AdjacencyQuery, EdgeQuery, FaceCentroidQuery, FaceVertexQuery, GpuAttributeError, GpuMesh,
-        VertexFaceQuery,
+        AdjacencyQuery, EdgeQuery, FaceCentroidQuery, FaceVertexQuery, GpuError, GpuMesh,
+        INVALID_ID, VertexFaceQuery,
     },
 };
 #[path = "../examples/support/boundary.rs"]
@@ -107,7 +107,9 @@ fn gpu_topology_queries_match_alum() {
         .unwrap();
     assert!(matches!(
         GpuMesh::upload(&small_device, &mesh),
-        Err(mopmesh::gpu::GpuLimitError)
+        Err(GpuError::LimitsExceeded {
+            resource: "connectivity arena"
+        })
     ));
     // Face work can fit while edge work exceeds the dispatch limit.
     let (limited_device, _limited_queue) =
@@ -135,11 +137,31 @@ fn gpu_topology_queries_match_alum() {
     let mut encoder = limited_device.create_command_encoder(&Default::default());
     assert!(matches!(
         EdgeQuery::new(&limited_device).encode(&limited_device, &mut encoder, &gpu),
-        Err(mopmesh::gpu::GpuLimitError)
+        Err(GpuError::LimitsExceeded { .. })
     ));
     assert!(matches!(
         AdjacencyQuery::new(&limited_device).encode(&limited_device, &mut encoder, &gpu),
-        Err(mopmesh::gpu::GpuLimitError)
+        Err(GpuError::LimitsExceeded { .. })
+    ));
+    // Face work now checks its own dispatch limit instead of relying on upload.
+    let positions: Vec<_> = (0..65)
+        .flat_map(|i| {
+            let x = i as f32 * 3.;
+            [[x, 0., 0.], [x + 1., 0., 0.], [x, 1., 0.]]
+        })
+        .collect();
+    let faces: Vec<_> = (0..65).map(|i| [3 * i, 3 * i + 1, 3 * i + 2]).collect();
+    let mesh = MeshBuilder::new()
+        .positions(&positions)
+        .triangles(&faces)
+        .build()
+        .unwrap();
+    let gpu = GpuMesh::upload(&limited_device, &mesh).unwrap();
+    assert!(matches!(
+        FaceVertexQuery::new(&limited_device).encode(&limited_device, &mut encoder, &gpu),
+        Err(GpuError::LimitsExceeded {
+            resource: "face vertices"
+        })
     ));
 }
 
@@ -191,15 +213,17 @@ fn check(
             .build()
             .unwrap();
         let gpu = GpuMesh::upload(device, &mesh).unwrap();
+        assert_eq!(gpu.mesh_id(), mesh.id());
         let other_mesh = MeshBuilder::new()
             .positions(positions)
             .triangles(triangles)
             .build()
             .unwrap();
+        assert_ne!(other_mesh.id(), mesh.id());
         let wrong_attribute = other_mesh.position_attribute();
         assert!(matches!(
             gpu.upload_vertex_attribute(device, &wrong_attribute),
-            Err(GpuAttributeError::MeshMismatch)
+            Err(GpuError::MeshMismatch)
         ));
         let mut host_positions = mesh.position_attribute();
         let mut gpu_positions = gpu
@@ -207,15 +231,16 @@ fn check(
             .unwrap();
         assert_eq!(gpu_positions.len() as usize, positions.len());
         assert_eq!(gpu_positions.is_empty(), positions.is_empty());
+        assert_eq!(gpu_positions.mesh_id(), mesh.id());
         assert_eq!(
             gpu_positions.write(queue, &wrong_attribute),
-            Err(GpuAttributeError::MeshMismatch)
+            Err(GpuError::MeshMismatch)
         );
         let other_gpu = GpuMesh::upload(device, &other_mesh).unwrap();
         let mut encoder = device.create_command_encoder(&Default::default());
         assert!(matches!(
             centroids.encode(device, &mut encoder, &other_gpu, &gpu_positions),
-            Err(GpuAttributeError::MeshMismatch)
+            Err(GpuError::MeshMismatch)
         ));
         // Both scalar and vector storage use original input vertex IDs.
         let scalar = gpu
@@ -224,6 +249,15 @@ fn check(
         let encoder = device.create_command_encoder(&Default::default());
         let values = read_words(device, queue, encoder, scalar.buffer());
         assert_eq!(&values[..positions.len()], vec![42u32; positions.len()]);
+        // Per-vertex values keep input vertex order on the GPU.
+        let ramp = mesh
+            .vertex_attribute_from((0..positions.len() as u32).map(|v| 3 * v + 1).collect())
+            .unwrap();
+        let ramp = gpu.upload_vertex_attribute(device, &ramp).unwrap();
+        let encoder = device.create_command_encoder(&Default::default());
+        let values = read_words(device, queue, encoder, ramp.buffer());
+        let expected_ramp: Vec<_> = (0..positions.len() as u32).map(|v| 3 * v + 1).collect();
+        assert_eq!(&values[..positions.len()], expected_ramp);
         for scale in [1., 2.] {
             if scale != 1. {
                 // Write through every patch, including ribbon handles. The same
@@ -256,7 +290,9 @@ fn check(
             let output = centroids
                 .encode(device, &mut encoder, &gpu, &gpu_positions)
                 .unwrap();
-            let words = read_words(device, queue, encoder, &output);
+            assert_eq!(output.face_count() as usize, triangles.len());
+            assert_eq!(output.mesh_id(), mesh.id());
+            let words = read_words(device, queue, encoder, output.buffer());
             if positions.is_empty() {
                 assert_eq!(words, [0; 4]);
             }
@@ -282,6 +318,7 @@ fn check(
         }
         let mut encoder = device.create_command_encoder(&Default::default());
         let edge_records = edge_query.encode(device, &mut encoder, &gpu).unwrap();
+        assert_eq!(edge_records.mesh_id(), mesh.id());
         assert_eq!(edge_records.edge_count() as usize, reference_edges.len());
         assert_eq!(edge_records.edge_count(), gpu.edge_count());
         let weights: Vec<_> = (0..mesh.edge_count())
@@ -319,7 +356,7 @@ fn check(
             let mut actual_faces: Vec<_> = actual[2..]
                 .iter()
                 .copied()
-                .filter(|&f| f != u32::MAX)
+                .filter(|&f| f != INVALID_ID)
                 .collect();
             actual_faces.sort_unstable();
             assert_eq!(
@@ -351,8 +388,10 @@ fn check(
         );
         assert_eq!(gpu.face_count() as usize, expected.len());
         let mut encoder = device.create_command_encoder(&Default::default());
-        let output = query.encode(device, &mut encoder, &gpu);
-        let words = read_words(device, queue, encoder, &output);
+        let output = query.encode(device, &mut encoder, &gpu).unwrap();
+        assert_eq!(output.face_count() as usize, triangles.len());
+        assert_eq!(output.mesh_id(), mesh.id());
+        let words = read_words(device, queue, encoder, output.buffer());
         for (face, expected) in expected.iter().enumerate() {
             let actual = &words[3 * face..3 * face + 3];
             assert!(
@@ -364,6 +403,7 @@ fn check(
         for _ in 0..2 {
             let mut encoder = device.create_command_encoder(&Default::default());
             let adjacency = inverse.encode(device, &mut encoder, &gpu).unwrap();
+            assert_eq!(adjacency.mesh_id(), mesh.id());
             assert_eq!(adjacency.vertex_count() as usize, positions.len());
             assert_eq!(adjacency.entry_count() as usize, 3 * triangles.len());
             assert_eq!(
@@ -418,9 +458,16 @@ fn check_remaining_adjacency(
     let weights: Vec<_> = (0..mesh.positions().len())
         .map(|v| (v % 7) as f32 * 0.5 - 1.5)
         .collect();
+    let gpu_weights = gpu
+        .upload_vertex_attribute(
+            device,
+            &mesh.vertex_attribute_from(weights.clone()).unwrap(),
+        )
+        .unwrap();
     for _ in 0..2 {
         let mut encoder = device.create_command_encoder(&Default::default());
         let adjacency = query.encode(device, &mut encoder, gpu).unwrap();
+        assert_eq!(adjacency.mesh_id(), mesh.id());
         assert_eq!(adjacency.vertex_count() as usize, mesh.positions().len());
         assert_eq!(adjacency.edge_count() as usize, mesh.edge_count());
         assert_eq!(adjacency.face_count() as usize, triangles.len());
@@ -432,7 +479,7 @@ fn check_remaining_adjacency(
             adjacency.vertex_entries_byte_offset(),
             (mesh.positions().len() as u64 + 1) * 4
         );
-        let summary = operator.encode(device, &mut encoder, &adjacency, positions, &weights);
+        let summary = operator.encode(device, &mut encoder, &adjacency, positions, &gpu_weights);
         let vertices = read_words(device, queue, encoder, adjacency.vertex_neighbors());
         let read = |buffer| {
             read_words(

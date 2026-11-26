@@ -1,24 +1,49 @@
-//! Immutable GPU connectivity and explicit, caller-encoded topology queries.
-use crate::Mesh;
+//! Upload mesh connectivity to the GPU and query connections between mesh elements.
+//!
+//! Query `encode` methods record commands into your encoder. Submit those commands
+//! before reading the results, or use the result buffers in later commands.
+//! Create each query, encoder, and input resource on the same `wgpu::Device` passed
+//! to the call. Device mismatches are reported by wgpu validation, not [`GpuError`].
+use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
 mod adjacency;
 mod attribute;
 mod edge;
+mod pipeline;
 mod scan;
 pub use adjacency::{AdjacencyQuery, MeshAdjacency};
-pub use attribute::{FaceCentroidQuery, GpuAttributeError, GpuValue, GpuVertexAttribute};
+pub use attribute::{FaceCentroidQuery, FaceCentroids, GpuValue, GpuVertexAttribute};
 pub use edge::{EdgeConnectivity, EdgeQuery};
+use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 
-/// A mesh exceeded the scalar arena, binding, or dispatch limits.
+/// Marks a missing element in GPU results, with the value `u32::MAX`.
+/// For example, an edge on the mesh boundary has no second face. Never use this
+/// value as an index into a vertex, face, or edge buffer.
+pub const INVALID_ID: u32 = u32::MAX;
+
+/// An input or size error from a GPU upload or query.
+/// These errors are returned before the call allocates GPU buffers or records commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GpuLimitError;
+pub enum GpuError {
+    /// A required buffer or compute dispatch exceeds the device limits, or
+    /// its data cannot be indexed with `u32`. `resource` identifies the affected
+    /// operation or buffer.
+    LimitsExceeded { resource: &'static str },
+    /// The inputs belong to different meshes. Use resources with matching mesh IDs.
+    MeshMismatch,
+}
 
-impl std::fmt::Display for GpuLimitError {
+impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("mesh exceeds GPU arena, binding, or dispatch limits")
+        match self {
+            Self::LimitsExceeded { resource } => {
+                write!(f, "{resource} exceeds GPU buffer, index or dispatch limits")
+            }
+            Self::MeshMismatch => f.write_str("GPU resources belong to different meshes"),
+        }
     }
 }
-impl std::error::Error for GpuLimitError {}
+impl std::error::Error for GpuError {}
 
 /// Static connectivity, including ribbons, uploaded to one read-only arena.
 ///
@@ -28,33 +53,40 @@ pub struct GpuMesh {
     face_count: u32,
     vertex_count: u32,
     edge_count: u32,
-    identity: std::sync::Arc<()>,
+    mesh: MeshId,
+}
+
+/// Returns the connectivity buffer size in `u32` words, or an error if it exceeds
+/// the device's buffer limits or the supported index range.
+fn arena_words(mesh: &Mesh, limits: &wgpu::Limits) -> Result<u64, GpuError> {
+    const RESOURCE: &str = "connectivity arena";
+    let too_large = GpuError::LimitsExceeded { resource: RESOURCE };
+    let mut words = 4 + 4 * mesh.face_count() as u64 + 7 * mesh.edge_count() as u64;
+    for p in mesh.patches() {
+        words = words
+            .checked_add(p.vertex_ids().len() as u64)
+            .and_then(|n| n.checked_add(2 * p.edge_vertices().len() as u64))
+            .and_then(|n| n.checked_add(7 * p.face_edges().len() as u64))
+            .ok_or(too_large)?;
+    }
+    check_binding(limits, words.checked_mul(4).ok_or(too_large)?, RESOURCE)?;
+    Ok(words)
 }
 
 impl GpuMesh {
-    pub fn upload(device: &wgpu::Device, mesh: &Mesh) -> Result<Self, GpuLimitError> {
-        let limits = device.limits();
-        let count = u32::try_from(mesh.face_count()).map_err(|_| GpuLimitError)?;
-        let vertex_count = u32::try_from(mesh.positions().len()).map_err(|_| GpuLimitError)?;
-        let edge_count = u32::try_from(mesh.edge_count()).map_err(|_| GpuLimitError)?;
-        let mut word_count = 4u64 + 4 * u64::from(count) + 7 * u64::from(edge_count);
-        for p in mesh.patches() {
-            word_count = word_count
-                .checked_add(p.vertex_ids().len() as u64)
-                .and_then(|n| n.checked_add(2 * p.edge_vertices().len() as u64))
-                .and_then(|n| n.checked_add(7 * p.face_edges().len() as u64))
-                .ok_or(GpuLimitError)?;
-        }
-        let max_bytes = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
-        if word_count > u64::from(u32::MAX)
-            || word_count * 4 > max_bytes
-            || (u64::from(count) * 12).max(4) > max_bytes
-            || count.div_ceil(64) > limits.max_compute_workgroups_per_dimension
-        {
-            return Err(GpuLimitError);
-        }
+    /// Uploads `mesh`'s fixed connectivity for use by GPU queries.
+    /// Upload vertex attributes, such as positions, separately with
+    /// [`GpuMesh::upload_vertex_attribute`]. Returns [`GpuError::LimitsExceeded`]
+    /// before allocating GPU buffers if the connectivity is too large.
+    pub fn upload(device: &wgpu::Device, mesh: &Mesh) -> Result<Self, GpuError> {
+        let word_count = arena_words(mesh, &device.limits())?;
+        // Counts fit u32: the builder allows at most u32::MAX / 3 faces,
+        // each contributing at most three edges, and at most u32::MAX vertices.
+        let count = mesh.face_count() as u32;
+        let edge_count = mesh.edge_count() as u32;
+
+        // Store each patch's vertex IDs, edge endpoints, face edges, and face IDs.
+        // Collect one query task per owned face or edge to avoid duplicate results.
         let mut words = Vec::with_capacity(word_count as usize);
         words.extend([count, 0, edge_count, 0]);
         let mut tasks = Vec::with_capacity(count as usize);
@@ -92,6 +124,8 @@ impl GpuMesh {
                 }
             }
         }
+
+        // Append the face and edge tasks, and store their starting word offsets in the header.
         words[1] = words.len() as u32;
         for task in tasks {
             words.extend(task);
@@ -108,9 +142,9 @@ impl GpuMesh {
         Ok(Self {
             arena,
             face_count: count,
-            vertex_count,
+            vertex_count: mesh.positions().len() as u32,
             edge_count,
-            identity: mesh.identity.clone(),
+            mesh: mesh.id(),
         })
     }
 
@@ -124,6 +158,10 @@ impl GpuMesh {
     pub fn arena(&self) -> &wgpu::Buffer {
         &self.arena
     }
+    /// Returns the ID of the CPU mesh used for this upload.
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
+    }
     pub fn face_count(&self) -> u32 {
         self.face_count
     }
@@ -135,6 +173,27 @@ impl GpuMesh {
     }
 }
 
+/// The three input vertex IDs of each face, preserving the input triangle order.
+/// The buffer contains packed `u32` triples indexed by input face ID, with 12 bytes
+/// per face. It supports `STORAGE | COPY_SRC`. For an empty mesh, the buffer is a
+/// four-byte zero placeholder; `face_count()` is zero.
+pub struct FaceVertices {
+    buffer: wgpu::Buffer,
+    face_count: u32,
+    mesh: MeshId,
+}
+impl FaceVertices {
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+    pub fn face_count(&self) -> u32 {
+        self.face_count
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
+    }
+}
+
 /// Compile once per device and reuse across meshes uploaded to that device.
 pub struct FaceVertexQuery {
     pipeline: wgpu::ComputePipeline,
@@ -142,66 +201,58 @@ pub struct FaceVertexQuery {
 
 impl FaceVertexQuery {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh face vertices"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/face_vertices.wgsl")).into(),
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh face vertices",
+            include_str!(concat!(env!("OUT_DIR"), "/face_vertices.wgsl")),
+        );
+        Self {
+            pipeline: pipeline::compute_pipeline(
+                device,
+                "MOPMesh face vertices",
+                &module,
+                "main",
+                None,
             ),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MOPMesh face vertices"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        Self { pipeline }
+        }
     }
 
-    /// Record one invocation per owned face. Returns tightly packed u32 triples
-    /// indexed by original input face ID, with STORAGE and COPY_SRC usage.
-    /// The empty result has a four-byte placeholder and dispatches no work.
-    /// All resources and the encoder must belong to the same device.
+    /// Records a query for the three vertex IDs of every face in `mesh`.
+    /// Returns [`GpuError::LimitsExceeded`] before allocating or recording commands
+    /// if the result or dispatch is too large. An empty mesh returns an empty
+    /// [`FaceVertices`] result without recording GPU work.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
-    ) -> wgpu::Buffer {
-        let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh face vertices result"),
-            size: (u64::from(mesh.face_count) * 12).max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        if mesh.face_count == 0 {
-            return output;
+    ) -> Result<FaceVertices, GpuError> {
+        const RESOURCE: &str = "face vertices";
+        let limits = device.limits();
+        let bytes = (u64::from(mesh.face_count) * 12).max(4);
+        check_binding(&limits, bytes, RESOURCE)?;
+        let groups = workgroups(&limits, mesh.face_count, RESOURCE)?;
+        let result = FaceVertices {
+            buffer: pipeline::output_buffer(device, "MOPMesh face vertices result", bytes),
+            face_count: mesh.face_count,
+            mesh: mesh.mesh,
+        };
+        if mesh.face_count != 0 {
+            let bindings = pipeline::bind_buffers(
+                device,
+                "MOPMesh face vertices bindings",
+                &self.pipeline.get_bind_group_layout(0),
+                &[&mesh.arena, &result.buffer],
+            );
+            pipeline::dispatch(
+                encoder,
+                "MOPMesh face vertices",
+                &self.pipeline,
+                &bindings,
+                groups,
+            );
         }
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MOPMesh face query bindings"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: mesh.arena.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output.as_entire_binding(),
-                },
-            ],
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MOPMesh face query"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(mesh.face_count.div_ceil(64), 1, 1);
-        }
-        output
+        Ok(result)
     }
 }
 
@@ -209,17 +260,21 @@ impl FaceVertexQuery {
 ///
 /// The buffer contains V + 1 u32 offsets followed by 3F u32 face IDs. Offsets
 /// are relative to the face-ID region. A vertex's incident faces occupy
-/// offsets[v]..offsets[v + 1]; ordering within each row is unspecified.
+/// `offsets[v]..offsets[v + 1]`; ordering within each row is unspecified.
 /// The buffer has STORAGE and COPY_SRC usage and remains on the GPU.
 pub struct VertexFaceAdjacency {
     buffer: wgpu::Buffer,
     vertex_count: u32,
     entry_count: u32,
+    mesh: MeshId,
 }
 
 impl VertexFaceAdjacency {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
     }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
@@ -244,51 +299,28 @@ pub struct VertexFaceQuery {
 
 impl VertexFaceQuery {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh vertex faces"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/vertex_faces.wgsl")).into(),
-            ),
-        });
-        // A shared explicit layout allows all three entry points to bind the
-        // same resources even when an entry point uses only a subset.
-        let entries = [
-            wgpu::BufferBindingType::Uniform,
-            wgpu::BufferBindingType::Storage { read_only: true },
-            wgpu::BufferBindingType::Storage { read_only: false },
-            wgpu::BufferBindingType::Storage { read_only: false },
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh vertex faces",
+            include_str!(concat!(env!("OUT_DIR"), "/vertex_faces.wgsl")),
+        );
+        let (layout, pipeline_layout) = pipeline::buffer_layout(
+            device,
+            "MOPMesh vertex faces layout",
+            &[
+                wgpu::BufferBindingType::Uniform,
+                wgpu::BufferBindingType::Storage { read_only: true },
+                wgpu::BufferBindingType::Storage { read_only: false },
+                wgpu::BufferBindingType::Storage { read_only: false },
+            ],
+        );
+        let pipelines = [
+            ("MOPMesh vertex faces count", "count"),
+            ("MOPMesh vertex faces initialize", "initialize"),
+            ("MOPMesh vertex faces scatter", "scatter"),
         ]
-        .into_iter()
-        .enumerate()
-        .map(|(binding, ty)| wgpu::BindGroupLayoutEntry {
-            binding: binding as u32,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        })
-        .collect::<Vec<_>>();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MOPMesh vertex face layout"),
-            entries: &entries,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MOPMesh vertex face pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipelines = ["count", "initialize", "scatter"].map(|entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
+        .map(|(label, entry)| {
+            pipeline::compute_pipeline(device, label, &module, entry, Some(&pipeline_layout))
         });
         Self {
             face_vertices: FaceVertexQuery::new(device),
@@ -298,93 +330,112 @@ impl VertexFaceQuery {
         }
     }
 
-    /// Record FV evaluation, incidence counts, hierarchical prefix scans,
-    /// offset initialization, and scatter passes. Limits are
-    /// checked before allocating or recording anything. Requires three storage
-    /// bindings, one uniform binding, and 64 invocations per workgroup.
-    /// Empty meshes return a single zero offset and dispatch no work.
-    /// All resources must belong to the same device.
+    /// Records a query listing the faces that touch each vertex in `mesh`.
+    /// See [`VertexFaceAdjacency`] for the buffer layout and ordering.
+    /// Returns [`GpuError::LimitsExceeded`] before allocating or recording commands
+    /// if a required buffer or dispatch is too large. An empty mesh returns a
+    /// single zero offset without recording GPU work.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
-    ) -> Result<VertexFaceAdjacency, GpuLimitError> {
+    ) -> Result<VertexFaceAdjacency, GpuError> {
+        // Validate result and temporary buffer sizes, plus dispatch limits, before GPU work.
+        const RESOURCE: &str = "vertex-face CSR";
+        let limits = device.limits();
         let entries = u64::from(mesh.face_count) * 3;
         let words = u64::from(mesh.vertex_count) + 1 + entries;
-        let limits = device.limits();
         let scan_plan = scan::ScanPlan::new(mesh.vertex_count, &limits)?;
-        if words > u64::from(u32::MAX)
-            || words * 4
-                > limits
-                    .max_buffer_size
-                    .min(limits.max_storage_buffer_binding_size)
-        {
-            return Err(GpuLimitError);
-        }
-        // WebGPU initializes fresh buffers to zero, including the cursor counts.
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh vertex face CSR"),
-            size: words * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        check_binding(&limits, words * 4, RESOURCE)?;
+        check_binding(&limits, (u64::from(mesh.face_count) * 12).max(4), RESOURCE)?;
+        let face_groups = workgroups(&limits, mesh.face_count, RESOURCE)?;
+        let vertex_groups = mesh.vertex_count.div_ceil(WORKGROUP_SIZE);
+
         let result = VertexFaceAdjacency {
-            buffer,
+            buffer: pipeline::output_buffer(device, "MOPMesh vertex faces CSR", words * 4),
             vertex_count: mesh.vertex_count,
             entry_count: entries as u32,
+            mesh: mesh.mesh,
         };
         if mesh.face_count == 0 {
             return Ok(result);
         }
-        let faces = self.face_vertices.encode(device, encoder, mesh);
+        let faces = self.face_vertices.encode(device, encoder, mesh)?;
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh transpose sizes"),
+            label: Some("MOPMesh vertex faces sizes"),
             contents: bytemuck::cast_slice(&[mesh.vertex_count, mesh.face_count]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        // The counting pass starts from zero, as guaranteed for new WebGPU buffers.
         let cursors = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh transpose cursors"),
+            label: Some("MOPMesh vertex faces cursors"),
             size: scan_plan.byte_size(),
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let buffers = [&params, &faces, &cursors, &result.buffer];
-        let entries = buffers
-            .iter()
-            .enumerate()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: buffer.as_entire_binding(),
-            })
-            .collect::<Vec<_>>();
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MOPMesh transpose bindings"),
-            layout: &self.layout,
-            entries: &entries,
-        });
-        for (index, (pipeline, workgroups)) in self
-            .pipelines
-            .iter()
-            .zip([
-                mesh.face_count.div_ceil(64),
-                mesh.vertex_count.div_ceil(64),
-                mesh.face_count.div_ceil(64),
-            ])
-            .enumerate()
-        {
-            if index == 1 {
-                self.scan.encode(device, encoder, &cursors, &scan_plan);
-            }
-            // Separate passes establish visibility between counts, prefix, and scatter.
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MOPMesh transpose pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
+        let bindings = pipeline::bind_buffers(
+            device,
+            "MOPMesh vertex faces bindings",
+            &self.layout,
+            &[&params, faces.buffer(), &cursors, &result.buffer],
+        );
+
+        // Count faces per vertex, convert counts to row offsets, then fill each row with face IDs.
+        let [count, initialize, scatter] = &self.pipelines;
+        pipeline::dispatch(
+            encoder,
+            "MOPMesh vertex faces count",
+            count,
+            &bindings,
+            face_groups,
+        );
+        self.scan.encode(device, encoder, &cursors, &scan_plan);
+        pipeline::dispatch(
+            encoder,
+            "MOPMesh vertex faces initialize",
+            initialize,
+            &bindings,
+            vertex_groups,
+        );
+        pipeline::dispatch(
+            encoder,
+            "MOPMesh vertex faces scatter",
+            scatter,
+            &bindings,
+            face_groups,
+        );
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MeshBuilder;
+
+    #[test]
+    fn arena_size_matches_the_documented_word_count() {
+        let mesh = MeshBuilder::new()
+            .positions(&[[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]])
+            .triangles(&[[0, 1, 2], [0, 2, 3]])
+            .patch_size(1)
+            .build()
+            .unwrap();
+        // Count u32 words: 4 for the header, 4 per face task, 7 per edge task,
+        // and (vertices + 2 * edges + 7 * faces) per patch. Each patch owns one
+        // face and includes the other as a neighbor, so both store the whole square.
+        let expected = 4 + 4 * 2 + 7 * 5 + 2 * (4 + 2 * 5 + 7 * 2);
+        let mut limits = wgpu::Limits::default();
+        assert_eq!(arena_words(&mesh, &limits), Ok(expected));
+        limits.max_storage_buffer_binding_size = 4 * expected;
+        assert_eq!(arena_words(&mesh, &limits), Ok(expected));
+        limits.max_storage_buffer_binding_size = 4 * expected - 4;
+        assert_eq!(
+            arena_words(&mesh, &limits),
+            Err(GpuError::LimitsExceeded {
+                resource: "connectivity arena"
+            })
+        );
     }
 }

@@ -1,4 +1,6 @@
-use super::{EdgeConnectivity, EdgeQuery, FaceVertexQuery, GpuLimitError, GpuMesh, scan};
+use super::pipeline::{self, WORKGROUP_SIZE, check_binding, workgroups};
+use super::{EdgeConnectivity, EdgeQuery, FaceVertexQuery, GpuError, GpuMesh, scan};
+use crate::MeshId;
 use wgpu::util::DeviceExt;
 
 /// Batched VE, VV, FF and edge-diamond results. All buffers have STORAGE and
@@ -18,19 +20,27 @@ impl MeshAdjacency {
     pub fn vertex_neighbors(&self) -> &wgpu::Buffer {
         &self.vertices
     }
-    /// Three u32 neighbor face IDs per input face. Slot i is across the edge
-    /// (input_triangle[i], input_triangle[(i+1)%3]); u32::MAX means boundary.
+    /// Returns three packed `u32` neighbor face IDs per input face (12 bytes per face).
+    /// For input triangle `[a, b, c]`, the entries are the faces across edges
+    /// `(a, b)`, `(b, c)`, and `(c, a)`. A boundary edge has no neighbor and
+    /// uses [`super::INVALID_ID`].
     pub fn face_neighbors(&self) -> &wgpu::Buffer {
         &self.faces
     }
-    /// Four u32 vertex IDs per edge: [endpoint0, endpoint1, opposite0, opposite1].
-    /// Opposites correspond to edge_connectivity().faces slots; u32::MAX means
-    /// no face on that side. This is not a cyclic or orientation-sorted quartet.
+    /// Returns four packed `u32` vertex IDs per canonical edge (16 bytes per edge):
+    /// `[endpoint0, endpoint1, opposite0, opposite1]`. An opposite vertex is the
+    /// third vertex of an adjoining triangle, outside the shared edge.
+    /// The opposite vertices follow the face order in [`Self::edge_connectivity`];
+    /// a missing boundary face gives [`super::INVALID_ID`]. The four vertices
+    /// are not ordered around the edge.
     pub fn edge_diamonds(&self) -> &wgpu::Buffer {
         &self.diamonds
     }
     pub fn edge_connectivity(&self) -> &EdgeConnectivity {
         &self.edges
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.edges.mesh_id()
     }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
@@ -62,64 +72,41 @@ pub struct AdjacencyQuery {
 }
 impl AdjacencyQuery {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh vertex edge/neighbor adjacency"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/vertex_neighbors.wgsl")).into(),
-            ),
-        });
-        let entries = [
-            wgpu::BufferBindingType::Uniform,
-            wgpu::BufferBindingType::Storage { read_only: true },
-            wgpu::BufferBindingType::Storage { read_only: false },
-            wgpu::BufferBindingType::Storage { read_only: false },
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh vertex neighbors",
+            include_str!(concat!(env!("OUT_DIR"), "/vertex_neighbors.wgsl")),
+        );
+        let (vertex_layout, layout) = pipeline::buffer_layout(
+            device,
+            "MOPMesh vertex neighbors layout",
+            &[
+                wgpu::BufferBindingType::Uniform,
+                wgpu::BufferBindingType::Storage { read_only: true },
+                wgpu::BufferBindingType::Storage { read_only: false },
+                wgpu::BufferBindingType::Storage { read_only: false },
+            ],
+        );
+        let vertex_pipelines = [
+            ("MOPMesh vertex neighbors count", "count"),
+            ("MOPMesh vertex neighbors initialize", "initialize"),
+            ("MOPMesh vertex neighbors scatter", "scatter"),
         ]
-        .into_iter()
-        .enumerate()
-        .map(|(binding, ty)| wgpu::BindGroupLayoutEntry {
-            binding: binding as u32,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        })
-        .collect::<Vec<_>>();
-        let vertex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MOPMesh vertex adjacency layout"),
-            entries: &entries,
+        .map(|(label, entry)| {
+            pipeline::compute_pipeline(device, label, &module, entry, Some(&layout))
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MOPMesh vertex adjacency pipeline layout"),
-            bind_group_layouts: &[Some(&vertex_layout)],
-            immediate_size: 0,
-        });
-        let vertex_pipelines = ["count", "initialize", "scatter"].map(|entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh face neighbors and diamonds"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/face_neighbors.wgsl")).into(),
-            ),
-        });
-        let face_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MOPMesh face neighbors and diamonds"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh face neighbors and diamonds",
+            include_str!(concat!(env!("OUT_DIR"), "/face_neighbors.wgsl")),
+        );
+        let face_pipeline = pipeline::compute_pipeline(
+            device,
+            "MOPMesh face neighbors and diamonds",
+            &module,
+            "main",
+            None,
+        );
         Self {
             edges: EdgeQuery::new(device),
             faces: FaceVertexQuery::new(device),
@@ -130,43 +117,36 @@ impl AdjacencyQuery {
         }
     }
 
-    /// Checks all new buffer, scalar-index, and dispatch limits before recording.
-    /// Requires four storage bindings, one uniform binding and 64 lanes. Use one
-    /// device for all resources. Empty meshes dispatch nothing; CSR is [0],
-    /// FF has a four-byte zero placeholder, and diamonds/edges each have 16 bytes.
+    /// Records queries for vertex neighbors, neighboring faces, edge endpoints,
+    /// and opposite vertices. See [`MeshAdjacency`] for each result's buffer layout.
+    /// Returns [`GpuError::LimitsExceeded`] before allocating or recording commands
+    /// if a required buffer or dispatch is too large. An empty mesh records no
+    /// GPU work: vertex offsets contain `[0]`, and the face, diamond, and edge
+    /// buffers contain zero placeholders of 4, 16, and 16 bytes respectively.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
-    ) -> Result<MeshAdjacency, GpuLimitError> {
+    ) -> Result<MeshAdjacency, GpuError> {
+        // Validate sizes for results and temporary buffers before allocating or recording work.
+        const RESOURCE: &str = "mesh adjacency";
         let limits = device.limits();
         let plan = scan::ScanPlan::new(mesh.vertex_count, &limits)?;
-        let vertex_words = u64::from(mesh.vertex_count) + 1 + 4 * u64::from(mesh.edge_count);
+        let vertex_bytes = 4 * (u64::from(mesh.vertex_count) + 1 + 4 * u64::from(mesh.edge_count));
         let face_bytes = (12 * u64::from(mesh.face_count)).max(4);
         let edge_bytes = (16 * u64::from(mesh.edge_count)).max(16);
-        let max_bytes = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
-        if vertex_words > u64::from(u32::MAX)
-            || vertex_words * 4 > max_bytes
-            || face_bytes > max_bytes
-            || edge_bytes > max_bytes
-            || mesh.edge_count.div_ceil(64) > limits.max_compute_workgroups_per_dimension
-        {
-            return Err(GpuLimitError);
+        for bytes in [vertex_bytes, face_bytes, edge_bytes] {
+            check_binding(&limits, bytes, RESOURCE)?;
         }
-        let allocate = |label, size| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        let vertices = allocate("MOPMesh vertex edge/neighbor CSR", vertex_words * 4);
-        let faces = allocate("MOPMesh face neighbors", face_bytes);
-        let diamonds = allocate("MOPMesh edge diamonds", edge_bytes);
+        let edge_groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
+        workgroups(&limits, mesh.face_count, RESOURCE)?;
+        let vertex_groups = mesh.vertex_count.div_ceil(WORKGROUP_SIZE);
+
+        let vertices =
+            pipeline::output_buffer(device, "MOPMesh vertex edge/neighbor CSR", vertex_bytes);
+        let faces = pipeline::output_buffer(device, "MOPMesh face neighbors", face_bytes);
+        let diamonds = pipeline::output_buffer(device, "MOPMesh edge diamonds", edge_bytes);
         let edges = self.edges.encode(device, encoder, mesh)?;
         let result = MeshAdjacency {
             edges,
@@ -179,88 +159,71 @@ impl AdjacencyQuery {
         if mesh.edge_count == 0 {
             return Ok(result);
         }
-        let fv = self.faces.encode(device, encoder, mesh);
-        let bindings = bind_buffers(
+
+        // For each edge, find the neighboring faces and their opposite vertices.
+        // Write the neighbor entry for each face that touches the edge.
+        let fv = self.faces.encode(device, encoder, mesh)?;
+        let bindings = pipeline::bind_buffers(
             device,
+            "MOPMesh face neighbors bindings",
             &self.face_pipeline.get_bind_group_layout(0),
-            &[result.edges.buffer(), &fv, &result.faces, &result.diamonds],
+            &[
+                result.edges.buffer(),
+                fv.buffer(),
+                &result.faces,
+                &result.diamonds,
+            ],
         );
-        dispatch(
+        pipeline::dispatch(
             encoder,
+            "MOPMesh face neighbors and diamonds",
             &self.face_pipeline,
             &bindings,
-            mesh.edge_count.div_ceil(64),
+            edge_groups,
         );
 
+        // Build a neighbor list for each vertex: count its edges, turn the counts
+        // into row offsets, then fill the rows with edge and neighbor vertex IDs.
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh vertex adjacency sizes"),
+            label: Some("MOPMesh vertex neighbors sizes"),
             contents: bytemuck::cast_slice(&[mesh.vertex_count, mesh.edge_count]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let cursors = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh vertex adjacency counts/scan"),
+            label: Some("MOPMesh vertex neighbors cursors"),
             size: plan.byte_size(),
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let bindings = bind_buffers(
+        let bindings = pipeline::bind_buffers(
             device,
+            "MOPMesh vertex neighbors bindings",
             &self.vertex_layout,
             &[&params, result.edges.buffer(), &cursors, &result.vertices],
         );
-        dispatch(
+        let [count, initialize, scatter] = &self.vertex_pipelines;
+        pipeline::dispatch(
             encoder,
-            &self.vertex_pipelines[0],
+            "MOPMesh vertex neighbors count",
+            count,
             &bindings,
-            mesh.edge_count.div_ceil(64),
+            edge_groups,
         );
         self.scan.encode(device, encoder, &cursors, &plan);
-        dispatch(
+        pipeline::dispatch(
             encoder,
-            &self.vertex_pipelines[1],
+            "MOPMesh vertex neighbors initialize",
+            initialize,
             &bindings,
-            mesh.vertex_count.div_ceil(64),
+            vertex_groups,
         );
-        dispatch(
+        pipeline::dispatch(
             encoder,
-            &self.vertex_pipelines[2],
+            "MOPMesh vertex neighbors scatter",
+            scatter,
             &bindings,
-            mesh.edge_count.div_ceil(64),
+            edge_groups,
         );
         Ok(result)
     }
-}
-
-fn bind_buffers(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &[&wgpu::Buffer],
-) -> wgpu::BindGroup {
-    let entries: Vec<_> = buffers
-        .iter()
-        .enumerate()
-        .map(|(binding, buffer)| wgpu::BindGroupEntry {
-            binding: binding as u32,
-            resource: buffer.as_entire_binding(),
-        })
-        .collect();
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("MOPMesh adjacency bindings"),
-        layout,
-        entries: &entries,
-    })
-}
-fn dispatch(
-    encoder: &mut wgpu::CommandEncoder,
-    pipeline: &wgpu::ComputePipeline,
-    bindings: &wgpu::BindGroup,
-    groups: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("MOPMesh adjacency pass"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bindings, &[]);
-    pass.dispatch_workgroups(groups, 1, 1);
 }

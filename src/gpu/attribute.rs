@@ -1,6 +1,7 @@
-use super::{FaceVertexQuery, GpuMesh};
-use crate::VertexAttribute;
-use std::{marker::PhantomData, sync::Arc};
+use super::pipeline::{self, check_binding, workgroups};
+use super::{FaceVertexQuery, GpuError, GpuMesh};
+use crate::{MeshId, VertexAttribute};
+use std::marker::PhantomData;
 use wgpu::util::DeviceExt;
 
 mod sealed {
@@ -20,44 +21,35 @@ mod sealed {
 pub trait GpuValue: sealed::Sealed + bytemuck::Pod {}
 impl<T: sealed::Sealed + bytemuck::Pod> GpuValue for T {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpuAttributeError {
-    MeshMismatch,
-    LimitsExceeded,
-}
-impl std::fmt::Display for GpuAttributeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::MeshMismatch => "attribute belongs to another mesh",
-            Self::LimitsExceeded => "attribute or result exceeds GPU buffer limits",
-        })
-    }
-}
-impl std::error::Error for GpuAttributeError {}
-
-/// One value per original input vertex, shared by every ribbon reference.
-/// Bind as an array of the matching WGSL scalar/vector type. Usage is STORAGE,
-/// COPY_SRC, and COPY_DST. Device/queue consistency is the caller's responsibility.
-/// Raw-buffer writes must preserve the element layout and canonical indexing.
+/// A GPU buffer with one attribute value per vertex, in original input order.
+/// Bind it as an array of the WGSL scalar or vector type matching `T`. The buffer
+/// supports `STORAGE | COPY_SRC | COPY_DST`; direct writes must preserve that
+/// element layout and vertex order. An empty attribute has a zero placeholder
+/// the size of one element, but its length is zero.
 pub struct GpuVertexAttribute<T: GpuValue> {
     buffer: wgpu::Buffer,
-    identity: Arc<()>,
+    mesh: MeshId,
     len: u32,
     marker: PhantomData<T>,
 }
 
 impl GpuMesh {
+    /// Copies a CPU vertex attribute to a new GPU buffer. Later CPU changes
+    /// do not update the GPU copy; use [`GpuVertexAttribute::write`] to replace it.
+    /// The attribute must belong to the same mesh as this upload. Returns
+    /// [`GpuError::MeshMismatch`] otherwise, or [`GpuError::LimitsExceeded`]
+    /// if the buffer would be too large. Errors occur before GPU allocation.
     pub fn upload_vertex_attribute<T: GpuValue>(
         &self,
         device: &wgpu::Device,
         attribute: &VertexAttribute<T>,
-    ) -> Result<GpuVertexAttribute<T>, GpuAttributeError> {
-        if !Arc::ptr_eq(&self.identity, &attribute.identity) {
-            return Err(GpuAttributeError::MeshMismatch);
+    ) -> Result<GpuVertexAttribute<T>, GpuError> {
+        if self.mesh != attribute.mesh {
+            return Err(GpuError::MeshMismatch);
         }
         let bytes = bytemuck::cast_slice(&attribute.values);
         let size = bytes.len().max(std::mem::size_of::<T>()) as u64;
-        check_size(device, size)?;
+        check_binding(&device.limits(), size, "vertex attribute")?;
         let zero = T::zeroed();
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh canonical vertex attribute"),
@@ -72,7 +64,7 @@ impl GpuMesh {
         });
         Ok(GpuVertexAttribute {
             buffer,
-            identity: self.identity.clone(),
+            mesh: self.mesh,
             len: self.vertex_count,
             marker: PhantomData,
         })
@@ -82,6 +74,9 @@ impl GpuMesh {
 impl<T: GpuValue> GpuVertexAttribute<T> {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
     }
     pub fn len(&self) -> u32 {
         self.len
@@ -98,9 +93,9 @@ impl<T: GpuValue> GpuVertexAttribute<T> {
         &mut self,
         queue: &wgpu::Queue,
         attribute: &VertexAttribute<T>,
-    ) -> Result<(), GpuAttributeError> {
-        if !Arc::ptr_eq(&self.identity, &attribute.identity) {
-            return Err(GpuAttributeError::MeshMismatch);
+    ) -> Result<(), GpuError> {
+        if self.mesh != attribute.mesh {
+            return Err(GpuError::MeshMismatch);
         }
         if !self.is_empty() {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&attribute.values));
@@ -109,16 +104,25 @@ impl<T: GpuValue> GpuVertexAttribute<T> {
     }
 }
 
-fn check_size(device: &wgpu::Device, size: u64) -> Result<(), GpuAttributeError> {
-    let limits = device.limits();
-    if size
-        > limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size)
-    {
-        return Err(GpuAttributeError::LimitsExceeded);
+/// The center of each triangle, computed as the average of its three positions.
+/// The buffer contains one `vec4<f32>` per input face ID (16 bytes per face):
+/// `[x, y, z, 0]`. It supports `STORAGE | COPY_SRC`. An empty mesh has one zero
+/// vector as a placeholder and a face count of zero.
+pub struct FaceCentroids {
+    buffer: wgpu::Buffer,
+    face_count: u32,
+    mesh: MeshId,
+}
+impl FaceCentroids {
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
     }
-    Ok(())
+    pub fn face_count(&self) -> u32 {
+        self.face_count
+    }
+    pub fn mesh_id(&self) -> MeshId {
+        self.mesh
+    }
 }
 
 /// A first attribute-consuming geometry query. Cache once per device.
@@ -128,75 +132,70 @@ pub struct FaceCentroidQuery {
 }
 impl FaceCentroidQuery {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh face centroids"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/face_centroids.wgsl")).into(),
-            ),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MOPMesh face centroids"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh face centroids",
+            include_str!(concat!(env!("OUT_DIR"), "/face_centroids.wgsl")),
+        );
         Self {
             face_vertices: FaceVertexQuery::new(device),
-            pipeline,
+            pipeline: pipeline::compute_pipeline(
+                device,
+                "MOPMesh face centroids",
+                &module,
+                "main",
+                None,
+            ),
         }
     }
 
-    /// Returns one vec4<f32> (centroid xyz, zero w) per original face ID with
-    /// STORAGE | COPY_SRC usage. Position w lanes are ignored. Empty meshes
-    /// return one zero vec4 placeholder without dispatch. Checks identity and
-    /// output limits before recording commands. Uses three storage bindings.
+    /// Records a query for triangle centers using the supplied vertex positions.
+    /// Each position is `[x, y, z, w]`; `w` is ignored. `positions` must belong
+    /// to `mesh`, or the call returns [`GpuError::MeshMismatch`].
+    /// Returns [`GpuError::LimitsExceeded`] if a required buffer or dispatch is
+    /// too large. Errors occur before allocating or recording commands. An empty
+    /// mesh returns an empty [`FaceCentroids`] result without recording GPU work.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
         positions: &GpuVertexAttribute<[f32; 4]>,
-    ) -> Result<wgpu::Buffer, GpuAttributeError> {
-        if !Arc::ptr_eq(&mesh.identity, &positions.identity) {
-            return Err(GpuAttributeError::MeshMismatch);
+    ) -> Result<FaceCentroids, GpuError> {
+        // Validate the mesh ID and sizes, including the temporary face-vertex result,
+        // before allocating buffers or recording commands.
+        const RESOURCE: &str = "face centroids";
+        if mesh.mesh != positions.mesh {
+            return Err(GpuError::MeshMismatch);
         }
-        let size = (u64::from(mesh.face_count) * 16).max(16);
-        check_size(device, size)?;
-        let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MOPMesh face centroid result"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let limits = device.limits();
+        let bytes = (u64::from(mesh.face_count) * 16).max(16);
+        check_binding(&limits, bytes, RESOURCE)?;
+        check_binding(&limits, (u64::from(mesh.face_count) * 12).max(4), RESOURCE)?;
+        let groups = workgroups(&limits, mesh.face_count, RESOURCE)?;
+
+        let result = FaceCentroids {
+            buffer: pipeline::output_buffer(device, "MOPMesh face centroid result", bytes),
+            face_count: mesh.face_count,
+            mesh: mesh.mesh,
+        };
         if mesh.face_count == 0 {
-            return Ok(output);
+            return Ok(result);
         }
-        let faces = self.face_vertices.encode(device, encoder, mesh);
-        let buffers = [&faces, positions.buffer(), &output];
-        let entries: Vec<_> = buffers
-            .iter()
-            .enumerate()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: buffer.as_entire_binding(),
-            })
-            .collect();
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MOPMesh face centroid bindings"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MOPMesh face centroids"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(mesh.face_count.div_ceil(64), 1, 1);
-        }
-        Ok(output)
+        let faces = self.face_vertices.encode(device, encoder, mesh)?;
+        let bindings = pipeline::bind_buffers(
+            device,
+            "MOPMesh face centroid bindings",
+            &self.pipeline.get_bind_group_layout(0),
+            &[faces.buffer(), positions.buffer(), &result.buffer],
+        );
+        pipeline::dispatch(
+            encoder,
+            "MOPMesh face centroids",
+            &self.pipeline,
+            &bindings,
+            groups,
+        );
+        Ok(result)
     }
 }

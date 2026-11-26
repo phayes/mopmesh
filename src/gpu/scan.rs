@@ -1,7 +1,8 @@
-use super::GpuLimitError;
+use super::GpuError;
+use super::pipeline::{self, WORKGROUP_SIZE as WIDTH, check_binding};
 use wgpu::util::DeviceExt;
 
-const WIDTH: u32 = 64;
+const RESOURCE: &str = "prefix scan";
 
 struct Level {
     count: u32,
@@ -16,7 +17,7 @@ pub(super) struct ScanPlan {
     words: u64,
 }
 impl ScanPlan {
-    pub(super) fn new(count: u32, limits: &wgpu::Limits) -> Result<Self, GpuLimitError> {
+    pub(super) fn new(count: u32, limits: &wgpu::Limits) -> Result<Self, GpuError> {
         let mut levels = Vec::new();
         let mut remaining = count;
         let mut offset = 0u64;
@@ -26,7 +27,7 @@ impl ScanPlan {
             let next_offset = offset + u64::from(remaining);
             words = next_offset + u64::from(blocks);
             if words > u64::from(u32::MAX) || blocks > limits.max_compute_workgroups_per_dimension {
-                return Err(GpuLimitError);
+                return Err(GpuError::LimitsExceeded { resource: RESOURCE });
             }
             levels.push(Level {
                 count: remaining,
@@ -39,13 +40,7 @@ impl ScanPlan {
             offset = next_offset;
             remaining = blocks;
         }
-        if words * 4
-            > limits
-                .max_buffer_size
-                .min(limits.max_storage_buffer_binding_size)
-        {
-            return Err(GpuLimitError);
-        }
+        check_binding(limits, words * 4, RESOURCE)?;
         Ok(Self { levels, words })
     }
     pub(super) fn byte_size(&self) -> u64 {
@@ -60,51 +55,25 @@ pub(super) struct ScanPipeline {
 }
 impl ScanPipeline {
     pub(super) fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MOPMesh hierarchical scan"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!(concat!(env!("OUT_DIR"), "/scan.wgsl")).into(),
-            ),
-        });
-        let entries = [
-            wgpu::BufferBindingType::Uniform,
-            wgpu::BufferBindingType::Storage { read_only: false },
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(binding, ty)| wgpu::BindGroupLayoutEntry {
-            binding: binding as u32,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        })
-        .collect::<Vec<_>>();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MOPMesh scan layout"),
-            entries: &entries,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MOPMesh scan pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = |entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh hierarchical scan",
+            include_str!(concat!(env!("OUT_DIR"), "/scan.wgsl")),
+        );
+        let (layout, pipeline_layout) = pipeline::buffer_layout(
+            device,
+            "MOPMesh scan layout",
+            &[
+                wgpu::BufferBindingType::Uniform,
+                wgpu::BufferBindingType::Storage { read_only: false },
+            ],
+        );
+        let build = |label, entry| {
+            pipeline::compute_pipeline(device, label, &module, entry, Some(&pipeline_layout))
         };
         Self {
-            scan: pipeline("scan"),
-            add: pipeline("add"),
+            scan: build("MOPMesh scan blocks", "scan"),
+            add: build("MOPMesh scan propagate", "add"),
             layout,
         }
     }
@@ -125,38 +94,29 @@ impl ScanPipeline {
                     contents: bytemuck::cast_slice(&[level.count, level.offset, level.next_offset]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("MOPMesh scan bindings"),
-                    layout: &self.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: arena.as_entire_binding(),
-                        },
-                    ],
-                })
+                pipeline::bind_buffers(
+                    device,
+                    "MOPMesh scan bindings",
+                    &self.layout,
+                    &[&params, arena],
+                )
             })
             .collect();
-        let dispatch =
-            |encoder: &mut wgpu::CommandEncoder, index: usize, pipeline: &wgpu::ComputePipeline| {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("MOPMesh scan level"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bindings[index], &[]);
-                pass.dispatch_workgroups(plan.levels[index].count.div_ceil(WIDTH), 1, 1);
-            };
-        for i in 0..plan.levels.len() {
-            dispatch(encoder, i, &self.scan);
+        let levels: Vec<_> = plan
+            .levels
+            .iter()
+            .map(|level| level.count.div_ceil(WIDTH))
+            .zip(&bindings)
+            .collect();
+        for &(groups, bindings) in &levels {
+            let label = "MOPMesh scan blocks";
+            pipeline::dispatch(encoder, label, &self.scan, bindings, groups);
         }
-        // The top level already has global prefixes; propagate them downward.
-        for i in (0..plan.levels.len().saturating_sub(1)).rev() {
-            dispatch(encoder, i, &self.add);
+        // The highest level already includes all preceding values. Work downward,
+        // adding each block's starting offset to its locally computed prefixes.
+        for &(groups, bindings) in levels.iter().rev().skip(1) {
+            let label = "MOPMesh scan propagate";
+            pipeline::dispatch(encoder, label, &self.add, bindings, groups);
         }
     }
 }

@@ -3,8 +3,8 @@ import mopmesh::topology::directed_edge::{directed_start, directed_end};
 import mopmesh::topology::face::face_vertices;
 import mopmesh::topology::csr::{row_from_count, row_length};
 import mopmesh::geometry::triangle::triangle_centroid;
-import mopmesh::topology::edge::{other_edge_face, other_edge_vertex};
-import mopmesh::topology::face::{face_edge_slot, opposite_vertex};
+import mopmesh::topology::edge::{other_edge_face, other_edge_vertex, INVALID_FACE, INVALID_VERTEX};
+import mopmesh::topology::face::{face_edge_slot, opposite_vertex, INVALID_SLOT};
 
 // This downstream shader chooses its own bindings and entry point.
 @group(0) @binding(0) var<storage, read_write> output: array<u32>;
@@ -22,4 +22,8 @@ fn main() {
     output[7] = other_edge_vertex(vec2(2u, 7u), 7u);
     output[8] = face_edge_slot(vec3(2u, 3u, 7u), vec2(7u, 3u));
     output[9] = opposite_vertex(vec3(2u, 3u, 7u), vec2(7u, 3u));
+    // Check that missing vertices, edge slots, and boundary faces return the named sentinels.
+    output[10] = select(0u, 1u, other_edge_vertex(vec2(2u, 7u), 4u) == INVALID_VERTEX);
+    output[11] = select(0u, 1u, face_edge_slot(vec3(2u, 3u, 7u), vec2(2u, 9u)) == INVALID_SLOT);
+    output[12] = select(0u, 1u, other_edge_face(vec2(3u, INVALID_FACE), 3u) == INVALID_FACE);
 }

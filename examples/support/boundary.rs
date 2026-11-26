@@ -36,8 +36,9 @@ impl BoundaryOperator {
         }
     }
 
-    // The application supplies matching edge records and positions from one mesh.
-    // Output: [weighted boundary length, incident-face count] per canonical edge.
+    // Record one [weighted boundary length, adjoining-face count] result per edge.
+    // Edge records and positions must have the same mesh ID, and weights must
+    // contain one value per canonical edge ID. Invalid inputs panic.
     pub fn encode(
         &self,
         device: &wgpu::Device,
@@ -46,6 +47,7 @@ impl BoundaryOperator {
         positions: &GpuVertexAttribute<[f32; 4]>,
         weights: &[f32],
     ) -> wgpu::Buffer {
+        assert_eq!(edges.mesh_id(), positions.mesh_id());
         assert_eq!(weights.len(), edges.edge_count() as usize);
         let output = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("weighted boundary result"),

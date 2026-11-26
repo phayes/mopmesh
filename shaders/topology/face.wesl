@@ -1,23 +1,30 @@
 import super::directed_edge::directed_start;
+import super::edge::INVALID_VERTEX;
+
+// Marks an edge slot that was not found. Its value, 0xffffffff, is not a valid slot index.
+public const INVALID_SLOT: u32 = 0xffffffffu;
 
 public fn face_contains_edge(edges: vec3<u32>, edge: u32) -> bool {
     return any(edges == vec3(edge));
 }
 
-// Slot i corresponds to the triangle edge (vertices[i], vertices[(i+1)%3]).
-// Endpoint order is ignored. A missing edge returns 0xffffffff.
+// Returns the edge's position in the triangle: 0 for (x, y), 1 for (y, z),
+// or 2 for (z, x), using the vertex IDs in vertices. Either endpoint order
+// is accepted. Returns INVALID_SLOT if edge is not part of the triangle.
 public fn face_edge_slot(vertices: vec3<u32>, edge: vec2<u32>) -> u32 {
     for (var i = 0u; i < 3u; i++) {
         let a = vertices[i];
         let b = vertices[(i + 1u) % 3u];
         if ((a == edge.x && b == edge.y) || (a == edge.y && b == edge.x)) { return i; }
     }
-    return 0xffffffffu;
+    return INVALID_SLOT;
 }
 
+// Returns the triangle vertex that is not an endpoint of edge.
+// Returns INVALID_VERTEX if edge is not part of the triangle.
 public fn opposite_vertex(vertices: vec3<u32>, edge: vec2<u32>) -> u32 {
     let slot = face_edge_slot(vertices, edge);
-    if (slot == 0xffffffffu) { return 0xffffffffu; }
+    if (slot == INVALID_SLOT) { return INVALID_VERTEX; }
     return vertices[(slot + 2u) % 3u];
 }
 
