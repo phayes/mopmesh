@@ -37,13 +37,15 @@ cargo clippy --all-targets -- -D warnings
 # The following require a GPU adapter; missing hardware is a failure.
 cargo run --example weighted_boundary
 cargo run --example neighborhood
+# Rough timing against Alum; see docs/approximate_benchmark.md:
+cargo run --release --example bench_alum
 cargo test --test gpu_topology -- --ignored --nocapture
 # Include both GPU topology and scan tests:
 cargo test --all-targets -- --include-ignored --nocapture
 ```
 
 `cargo run` is a CPU-only construction example: it builds a two-triangle square
-with one owned face per patch. The two named examples execute GPU operators.
+with one owned face per patch. The named examples execute GPU operators.
 The ordinary test suite skips the two explicit hardware tests; use
 `--include-ignored` as shown above to run the full suite.
 
@@ -215,9 +217,10 @@ let edges = query.encode(&device, &mut encoder, &gpu_mesh)?;
 
 Each canonical edge has a 16-byte record: two global vertex IDs, followed by two
 global face IDs. Endpoints are ascending; incident-face order is unspecified.
-Boundary edges use `INVALID_ID` (`0xffffffff`) for the missing face. Edge IDs are deterministic
-constructed IDs, accessible through each patch's `edge_ids()` table; they need
-not match another library's edge numbering. The result has STORAGE and COPY_SRC
+Boundary edges use `INVALID_ID` (`0xffffffff`) for the missing face. Edge IDs run from 0 in
+ascending order of each edge's (smaller, larger) vertex ID pair, so they do not
+depend on input face order. Each patch's `edge_ids()` table maps its local edges
+to these IDs. They need not match another library's edge numbering. The result has STORAGE and COPY_SRC
 usage, and an empty mesh returns a zeroed 16-byte placeholder with zero logical
 records. Do not interpret that placeholder as an edge.
 

@@ -1,5 +1,7 @@
 use crate::{DirectedEdge, EdgeHandle, FaceHandle, Patch, VertexHandle};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
+
+mod build;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,12 +106,7 @@ impl<'a> MeshBuilder<'a> {
                 return Err(BuildError::NonFinitePosition(v as u32));
             }
         }
-        let mut edge_map = BTreeMap::<[u32; 2], u32>::new();
-        let mut edges = Vec::new();
-        let mut edge_faces: Vec<Vec<(u32, bool)>> = Vec::new();
-        let mut face_edges = Vec::new();
-        let mut vertex_faces = vec![Vec::new(); self.positions.len()];
-        let mut unique_faces = BTreeSet::new();
+        // Check each face on its own.
         for (face, &vs) in self.triangles.iter().enumerate() {
             let face = face as u32;
             for &v in &vs {
@@ -128,68 +125,38 @@ impl<'a> MeshBuilder<'a> {
             if cross == [0.0; 3] {
                 return Err(BuildError::DegenerateFace(face));
             }
-            let mut key = vs;
-            key.sort_unstable();
-            if !unique_faces.insert(key) {
-                return Err(BuildError::DuplicateFace(face));
-            }
-            let mut fe = [DirectedEdge {
-                edge: 0,
-                reversed: false,
-            }; 3];
-            for i in 0..3 {
-                vertex_faces[vs[i] as usize].push(face);
-                let (a, b) = (vs[i], vs[(i + 1) % 3]);
-                let key = [a.min(b), a.max(b)];
-                let e = *edge_map.entry(key).or_insert_with(|| {
-                    let id = edges.len() as u32;
-                    edges.push(key);
-                    edge_faces.push(Vec::new());
-                    id
-                });
-                let reversed = a > b;
-                let incident = &mut edge_faces[e as usize];
-                if incident.len() == 2 {
-                    return Err(BuildError::NonManifoldEdge(key));
-                }
-                if incident.first().is_some_and(|&(_, r)| r == reversed) {
-                    return Err(BuildError::InconsistentWinding(key));
-                }
-                incident.push((face, reversed));
-                fe[i] = DirectedEdge { edge: e, reversed };
-            }
-            face_edges.push(fe);
         }
-        // Each vertex link must be one path or one cycle, not a bow tie.
-        for (v, incident) in vertex_faces.iter().enumerate() {
-            if incident.is_empty() {
+        // Corners around each vertex in face order; corner `c` is slot `c % 3` of face `c / 3`.
+        let vertex_corners =
+            build::Rows::group(self.positions.len(), 3 * self.triangles.len(), |c| {
+                self.triangles[c / 3][c % 3]
+            });
+
+        // Find edges and report the first duplicate-face or edge error in face order.
+        let duplicate = build::find_duplicate_face(self.positions.len(), self.triangles);
+        let edges = build::connect_edges(self.positions.len(), self.triangles);
+        match (duplicate, &edges) {
+            (Some(d), Err((face, _))) if d <= *face => return Err(BuildError::DuplicateFace(d)),
+            (Some(d), Ok(_)) => return Err(BuildError::DuplicateFace(d)),
+            _ => {}
+        }
+        let edges = edges.map_err(|(_, error)| error)?;
+
+        // Every vertex must be used, and its faces must form one fan, not a bow tie.
+        for v in 0..self.positions.len() {
+            let corners = vertex_corners.row(v);
+            if corners.is_empty() {
                 return Err(BuildError::IsolatedVertex(v as u32));
             }
-            let mut link = BTreeMap::<u32, Vec<u32>>::new();
-            for &f in incident {
-                let others: Vec<_> = self.triangles[f as usize]
-                    .iter()
-                    .copied()
-                    .filter(|&x| x != v as u32)
-                    .collect();
-                link.entry(others[0]).or_default().push(others[1]);
-                link.entry(others[1]).or_default().push(others[0]);
-            }
-            let mut seen = BTreeSet::new();
-            let mut stack = vec![*link.first_key_value().unwrap().0];
-            while let Some(x) = stack.pop() {
-                if seen.insert(x) {
-                    stack.extend(&link[&x]);
-                }
-            }
-            let ends = link.values().filter(|n| n.len() == 1).count();
-            if seen.len() != link.len()
-                || link.values().any(|n| n.len() > 2)
-                || (ends != 0 && ends != 2)
-            {
+            if !build::is_single_fan(v as u32, corners, self.triangles, &edges) {
                 return Err(BuildError::NonManifoldVertex(v as u32));
             }
         }
+        let build::Edges {
+            endpoints: edges,
+            faces: edge_faces,
+            face_edges,
+        } = edges;
         // Deterministic breadth-first face partitioning across shared edges.
         let mut face_patch = vec![u32::MAX; self.triangles.len()];
         let mut groups = Vec::<Vec<u32>>::new();
@@ -203,8 +170,11 @@ impl<'a> MeshBuilder<'a> {
             face_patch[seed] = id;
             while let Some(f) = queue.pop_front() {
                 for d in face_edges[f as usize] {
-                    for &(n, _) in &edge_faces[d.edge as usize] {
-                        if group.len() < self.patch_size && face_patch[n as usize] == u32::MAX {
+                    for &n in &edge_faces[d.edge as usize] {
+                        if n != build::NO_FACE
+                            && group.len() < self.patch_size
+                            && face_patch[n as usize] == u32::MAX
+                        {
                             face_patch[n as usize] = id;
                             group.push(n);
                             queue.push_back(n);
@@ -214,55 +184,119 @@ impl<'a> MeshBuilder<'a> {
             }
             groups.push(group);
         }
-        let vertex_patch: Vec<_> = vertex_faces
-            .iter()
-            .map(|fs| fs.iter().map(|&f| face_patch[f as usize]).min().unwrap())
+        let vertex_patch: Vec<_> = (0..self.positions.len())
+            .map(|v| {
+                vertex_corners
+                    .row(v)
+                    .iter()
+                    .map(|&c| face_patch[c as usize / 3])
+                    .min()
+                    .unwrap()
+            })
             .collect();
         let edge_patch: Vec<_> = edge_faces
             .iter()
             .map(|fs| {
                 fs.iter()
-                    .map(|&(f, _)| face_patch[f as usize])
+                    .filter(|&&f| f != build::NO_FACE)
+                    .map(|&f| face_patch[f as usize])
                     .min()
                     .unwrap()
             })
             .collect();
-        let mut patches = Vec::new();
+        // Gather each patch's faces (its own plus every face touching one of
+        // its vertices), then their edges and vertices, in ascending global ID
+        // order. `seen_*` records the last patch that gathered an element, and
+        // `*_local` maps global IDs to the current patch's local IDs.
+        let (vertex_count, edge_count, face_count) =
+            (self.positions.len(), edges.len(), self.triangles.len());
+        let mut seen_face = vec![u32::MAX; face_count];
+        let mut seen_edge = vec![u32::MAX; edge_count];
+        let mut seen_vertex = vec![u32::MAX; vertex_count];
+        let mut edge_local = vec![0u32; edge_count];
+        let mut vertex_local = vec![0u32; vertex_count];
+        let mut vertex_owners = vec![VertexHandle { patch: 0, local: 0 }; vertex_count];
+        let mut edge_owners = vec![EdgeHandle { patch: 0, local: 0 }; edge_count];
+        let mut face_owners = vec![FaceHandle { patch: 0, local: 0 }; face_count];
+        let mut patches = Vec::with_capacity(groups.len());
         for (id, group) in groups.iter().enumerate() {
-            let mut fs = BTreeSet::new();
+            let id = id as u32;
+            let mut faces = Vec::new();
             for &f in group {
                 for &v in &self.triangles[f as usize] {
-                    fs.extend(&vertex_faces[v as usize]);
+                    for &c in vertex_corners.row(v as usize) {
+                        let g = c / 3;
+                        if seen_face[g as usize] != id {
+                            seen_face[g as usize] = id;
+                            faces.push(g);
+                        }
+                    }
                 }
             }
-            let faces: Vec<u32> = fs.into_iter().collect();
-            let es: BTreeSet<_> = faces
+            faces.sort_unstable();
+            let mut patch_edges = Vec::new();
+            for &f in &faces {
+                for d in face_edges[f as usize] {
+                    if seen_edge[d.edge as usize] != id {
+                        seen_edge[d.edge as usize] = id;
+                        patch_edges.push(d.edge);
+                    }
+                }
+            }
+            patch_edges.sort_unstable();
+            let mut vertices = Vec::new();
+            for &e in &patch_edges {
+                for v in edges[e as usize] {
+                    if seen_vertex[v as usize] != id {
+                        seen_vertex[v as usize] = id;
+                        vertices.push(v);
+                    }
+                }
+            }
+            vertices.sort_unstable();
+
+            // Map global IDs to local ones, and record handles for owned elements.
+            for (local, &v) in vertices.iter().enumerate() {
+                let local = local as u32;
+                vertex_local[v as usize] = local;
+                if vertex_patch[v as usize] == id {
+                    vertex_owners[v as usize] = VertexHandle { patch: id, local };
+                }
+            }
+            for (local, &e) in patch_edges.iter().enumerate() {
+                let local = local as u32;
+                edge_local[e as usize] = local;
+                if edge_patch[e as usize] == id {
+                    edge_owners[e as usize] = EdgeHandle { patch: id, local };
+                }
+            }
+            for (local, &f) in faces.iter().enumerate() {
+                if face_patch[f as usize] == id {
+                    face_owners[f as usize] = FaceHandle {
+                        patch: id,
+                        local: local as u32,
+                    };
+                }
+            }
+
+            // Store connectivity with local IDs.
+            let ev = patch_edges
                 .iter()
-                .flat_map(|&f| face_edges[f as usize].map(|d| d.edge))
-                .collect();
-            let edges_local: Vec<_> = es.into_iter().collect();
-            let vs: BTreeSet<_> = edges_local
-                .iter()
-                .flat_map(|&e| edges[e as usize])
-                .collect();
-            let vertices: Vec<_> = vs.into_iter().collect();
-            let ev = edges_local
-                .iter()
-                .map(|&e| edges[e as usize].map(|v| vertices.binary_search(&v).unwrap() as u32))
+                .map(|&e| edges[e as usize].map(|v| vertex_local[v as usize]))
                 .collect();
             let fe = faces
                 .iter()
                 .map(|&f| {
                     face_edges[f as usize].map(|d| DirectedEdge {
-                        edge: edges_local.binary_search(&d.edge).unwrap() as u32,
+                        edge: edge_local[d.edge as usize],
                         reversed: d.reversed,
                     })
                 })
                 .collect();
             patches.push(Patch {
-                id: id as u32,
+                id,
                 vertices,
-                edges: edges_local,
+                edges: patch_edges,
                 faces,
                 ev,
                 fe,
@@ -271,39 +305,6 @@ impl<'a> MeshBuilder<'a> {
                 face_owners: Vec::new(),
             });
         }
-        let vertex_owners: Vec<_> = vertex_patch
-            .iter()
-            .enumerate()
-            .map(|(v, &p)| VertexHandle {
-                patch: p,
-                local: patches[p as usize]
-                    .vertices
-                    .binary_search(&(v as u32))
-                    .unwrap() as u32,
-            })
-            .collect();
-        let edge_owners: Vec<_> = edge_patch
-            .iter()
-            .enumerate()
-            .map(|(e, &p)| EdgeHandle {
-                patch: p,
-                local: patches[p as usize]
-                    .edges
-                    .binary_search(&(e as u32))
-                    .unwrap() as u32,
-            })
-            .collect();
-        let face_owners: Vec<_> = face_patch
-            .iter()
-            .enumerate()
-            .map(|(f, &p)| FaceHandle {
-                patch: p,
-                local: patches[p as usize]
-                    .faces
-                    .binary_search(&(f as u32))
-                    .unwrap() as u32,
-            })
-            .collect();
         for p in &mut patches {
             p.vertex_owners = p
                 .vertices

@@ -164,6 +164,9 @@ local cavities. The current Cargo version does not mean that release scope is co
    report allocations, dispatches, query throughput, bytes/triangle, scratch and
    ribbon overhead. Record adapter, limits, patch size and timing method.
    Acceptance: reproducible runs and a baseline report, with no assumed speedup.
+   An [approximate comparison against Alum](docs/approximate_benchmark.md)
+   exists. Host construction was rewritten after it showed construction about
+   16x slower than Alum's; it is now about 2.4x slower.
 3. **Workgroup-local traversal experiment.** Select a bottleneck from the
    baseline; edge incidence is a candidate because it currently scans local
    faces per owned edge. Compare staged and existing paths with identical

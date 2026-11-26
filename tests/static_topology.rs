@@ -29,6 +29,15 @@ fn check_against_alum(positions: &[[f32; 3]], triangles: &[[u32; 3]]) {
         assert_eq!(mesh.positions().len(), reference.num_vertices());
         assert_eq!(mesh.edge_count(), reference.num_edges());
         assert_eq!(mesh.face_count(), reference.num_faces());
+        // Edge IDs follow ascending (smaller, larger) endpoint order.
+        let mut endpoints_by_id = vec![[0; 2]; mesh.edge_count()];
+        for p in mesh.patches() {
+            for (local, &global) in p.edge_ids().iter().enumerate() {
+                endpoints_by_id[global as usize] =
+                    p.edge_vertices()[local].map(|v| p.vertex_ids()[v as usize]);
+            }
+        }
+        assert!(endpoints_by_id.windows(2).all(|w| w[0] < w[1]));
         let mut owned_vertices = vec![0; positions.len()];
         let mut owned_edges = vec![0; mesh.edge_count()];
         let mut owned_faces = vec![0; triangles.len()];
@@ -290,6 +299,11 @@ fn invalid_inputs_are_rejected() {
         build(&p, &[[0, 1, 2], [2, 1, 0]]),
         BuildError::DuplicateFace(1)
     );
+    // A same-direction repeat also breaks winding; the duplicate is reported.
+    assert_eq!(
+        build(&p, &[[0, 1, 2], [0, 1, 2]]),
+        BuildError::DuplicateFace(1)
+    );
     assert_eq!(
         build(&p, &[[0, 1, 2], [0, 1, 4]]),
         BuildError::InconsistentWinding([0, 1])
@@ -318,6 +332,22 @@ fn invalid_inputs_are_rejected() {
         build(&p, &[[0, 1, 2], [1, 0, 3], [0, 1, 4]]),
         BuildError::NonManifoldEdge([0, 1])
     );
+    // Two closed surfaces meeting at a single vertex.
+    let p = [
+        [0., 0., 0.],
+        [1., 0., 0.],
+        [0., 1., 0.],
+        [0., 0., 1.],
+        [-1., 0., 0.],
+        [0., -1., 0.],
+        [0., 0., -1.],
+    ];
+    let tetrahedron = |[a, b, c, d]: [u32; 4]| [[a, c, b], [a, b, d], [b, c, d], [c, a, d]];
+    let faces: Vec<_> = tetrahedron([0, 1, 2, 3])
+        .into_iter()
+        .chain(tetrahedron([0, 4, 5, 6]))
+        .collect();
+    assert_eq!(build(&p, &faces), BuildError::NonManifoldVertex(0));
     // Messages name the offending input element rather than a Debug dump.
     assert_eq!(
         BuildError::InvalidVertex { face: 0, vertex: 9 }.to_string(),
