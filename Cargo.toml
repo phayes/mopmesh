@@ -1,0 +1,20 @@
+[package]
+name = "mopmesh"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Portable patch-based triangle mesh processing"
+
+[dependencies]
+wesl-core = "0.1.0"
+wgpu = "30.0.2"
+bytemuck = "1"
+
+[build-dependencies]
+wesl = { version = "0.6.0", features = ["package"] }
+
+[dev-dependencies]
+pollster = "0.4"
+naga = { version = "30.0.2", features = ["wgsl-in"] }
+alum = { version = "0.7.1", default-features = false }
+wesl = "0.6.0"
