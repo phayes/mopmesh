@@ -1,12 +1,14 @@
-Portable GPU mesh processing \| Technical design and feasibility assessment
+# MOPMesh technical design and feasibility assessment
 
 Rust / WESL / WebGPU • 26 November 2026
 
 ## Executive summary
 
-MOPMesh (Mahmoud–Owens–Porumbescu Mesh) is a proposed independent Rust/WESL port of RXMesh, the Ribbon-matriX Mesh architecture introduced in 2021 and extended to dynamic topology in 2025. Its goal is GPU-resident triangle mesh processing on multiple GPU vendors, without a CUDA dependency.
+MOPMesh (Mahmoud–Owens–Porumbescu Mesh) is an independent Rust/WESL prototype inspired by RXMesh, the Ribbon-matriX Mesh architecture introduced in 2021 and extended to dynamic topology in 2025. Its goal is GPU-resident triangle mesh processing on multiple GPU vendors, without a CUDA dependency.
 
 The project is technically plausible, but performance parity with CUDA is unproven. Preserve patch locality, ribbon ownership, connectivity queries and cavity-based editing; redesign cross-workgroup coordination around explicit dispatch phases. Establish correctness and measure locality benefits before committing to full dynamic parity.
+
+The static query families, vertex attributes, hierarchical scans and two downstream WESL examples are implemented. Geometry algorithms are partial; dynamic topology is still a design. The [maintained roadmap](ROADMAP.md) records completed work, remaining acceptance criteria, discoveries and the next execution sequence. This document describes both implemented architecture and explicitly planned extensions; the [README](README.md) is the current API and layout guide.
 
 ## Recommended initial scope
 
@@ -28,6 +30,8 @@ The project is technically plausible, but performance parity with CUDA is unprov
 | Dynamic viability    | Conflict-free local and boundary edits; bounded retries; no topology corruption.          |
 | Production viability | Cross-vendor performance, reliable capacity handling and documented topology constraints. |
 
+All three gates remain open. Query correctness has fixture coverage, but static locality benefit has not been measured. Dynamic and production viability have not been demonstrated.
+
 # 1. Upstream and licensing
 
 RXMesh is maintained in owensgroup/RXMesh. The 2021 paper introduces the patch/ribbon structure; Dynamic Mesh Processing on the GPU (2025), by Ahmed H. Mahmoud, Serban D. Porumbescu and John D. Owens, introduces dynamic cavity operations. \[1–3\]
@@ -36,7 +40,7 @@ RXMesh is maintained in owensgroup/RXMesh. The 2021 paper introduces the patch/r
 
 The upstream repository uses BSD-2-Clause. Its copyright notice is “Copyright (c) 2022, owensgroup.” The license permits modification, translation, redistribution, commercial and proprietary use, subject to preservation of the original notice, conditions and disclaimer. Binary redistributions must reproduce these in accompanying materials. \[4\]
 
-Recommend retaining BSD-2-Clause for MOPMesh, adding a copyright notice for new contributions, retaining upstream notices and documenting both papers in the README. Audit third-party dependencies and assets separately. BSD-2-Clause does not expressly grant patent rights; avoid implying author endorsement through the project name.
+MOPMesh uses BSD-2-Clause; `LICENSE`, `THIRD_PARTY_NOTICES` and the README retain project licensing and reference information. A release dependency/asset audit remains future work. BSD-2-Clause does not expressly grant patent rights; avoid implying author endorsement through the project name.
 
 ## Running the reference without CUDA
 
@@ -52,7 +56,7 @@ No official non-CUDA RXMesh backend was identified. SCALE and ZLUDA are candidat
 
 # 2. Architecture and GPU representation
 
-Rust owns device integration, mesh construction, resource lifetime, pipeline caching and command submission. WESL owns connectivity traversal, parallel geometry algorithms, topology transactions and patch maintenance. Keep intermediate data GPU-resident; expose buffers for downstream rendering and compute.
+Rust owns device integration, CPU mesh construction/partitioning, resource lifetime and pipeline objects. The application owns the device, queue, command encoder and submission; queries record commands and expose GPU-resident outputs. WESL implements connectivity traversal and current geometry/parallel primitives. Topology transactions and patch maintenance are planned responsibilities, not implemented features.
 
 ## Reusable WESL library requirement
 
@@ -69,11 +73,13 @@ Accept an operator family when its downstream example links using only the publi
 | **Layer**     | **Responsibility**                                                      |
 |---------------|-------------------------------------------------------------------------|
 | Rust host     | Builder, partitioner, handles, typed attributes, scheduler, validation. |
-| WESL core     | Packed types, buffer offsets, bitmasks, arenas, ownership resolution.   |
+| WESL core     | Native 32-bit types, buffer offsets, bitmasks, arenas, ownership resolution. |
 | WESL parallel | Scan, reduce, histogram, compaction and optional subgroup variants.     |
 | WESL topology | Patch/ribbon queries, cavity construction, claims, commit and repair.   |
 | WESL operators | Reusable geometry operations, smoothing and, in later phases, remeshing and decimation operators. |
 | Applications  | Compose public operators with application-specific data, policies and behavior. |
+
+The layer responsibilities above describe the target architecture. Bitmasks, histograms, compaction, cavity edits and scheduling are not yet implemented. Numeric packing is outside the committed roadmap.
 
 ## Patch and ribbon model
 
@@ -83,14 +89,26 @@ Use explicit patch/local handles initially; document invalidation after migratio
 
 ## Storage layout
 
-Replace CUDA pointers with offsets into storage arenas. Patch metadata holds offsets, counts, capacities, flags and ownership information. Use separate logical regions for connectivity, active/owned masks, attributes, ownership, transactions, scheduling and maintenance. Fixed-capacity patch allocations simplify the first implementation; variable-sized arenas can follow profiling.
+The initial release uses native `u32`/`i32` integer values and `f32` geometry on the GPU, with `u32` connectivity indices and word offsets. Vectors and records contain independent 32-bit fields. Do not introduce 16-bit formats or subword numeric packing, native or emulated 64-bit GPU values, or paired-float (single-single/double-single) precision schemes. Exceeding index/device limits is an error, not a reason to select a wider representation. Alternative widths or compression require a measured need and a separate design decision; they are not committed future work.
 
-\#\[repr(C)\]  
-\#\[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)\]  
-pub struct VertexHandle {  
-pub patch: u32,  
-pub local: u32,  
+This constraint does not apply to host allocation arithmetic: retain `u64`/`usize` for buffer sizes, overflow checks and wgpu interfaces. The CPU builder also retains `f64` intermediates for degeneracy validation. Neither constitutes a wider GPU representation.
+
+The implemented static arena uses u32 word offsets and unpacked connectivity, with host-generated owned-face and owned-edge tasks. CPU patches carry ownership maps; the GPU arena does not yet contain general ownership metadata, active masks, free slots or edit capacities. Canonical vertex attributes and query results live in separate buffers. See the [current layouts](README.md#gpu-usage) before writing a consumer.
+
+For dynamics, extend metadata with capacities, flags and ownership information and add separate logical regions for masks, transactions, scheduling and maintenance. Fixed-capacity patch allocations are a proposed starting point for editable storage, not a description of the current immutable upload.
+
+Current handles use this representation; they are mesh-relative and not generation-checked:
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VertexHandle {
+    pub patch: u32,
+    pub local: u32,
 }
+```
+
+The WESL handle names the patch field `patch_id` because `patch` is reserved in WGSL. Rust handles are not currently advertised as directly uploadable GPU attribute elements.
 
 # 3. CUDA-to-WebGPU adaptation
 
@@ -99,29 +117,25 @@ pub local: u32,
 | Thread blocks / threads    | Workgroups / invocations                          |
 | Dynamic shared memory      | Pipeline-specialized workgroup arrays             |
 | Warp primitives / CUB      | Portable scans and reductions; optional subgroups |
-| Pointers / 16-bit indices  | Offsets; packed u32 words or unpacked u32         |
-| 64-bit atomics             | 32-bit claims or redesigned multiword state       |
+| Pointers / 16-bit indices  | Native u32 word offsets and connectivity indices |
+| 64-bit atomics             | Redesign claims around native 32-bit atomics; no 64-bit emulation |
 | Cross-block locks          | Nonblocking claims and separate dispatch phases   |
 | Dynamic allocation         | Preallocated arenas, free lists, compaction       |
 | Device lambdas / templates | WESL imports and specialization; Rust generics    |
 
 ## Memory budget
 
-Standard wgpu defaults include 16 KiB workgroup storage, 256 invocations per workgroup, 128 MiB maximum storage-buffer binding size and eight storage buffers per shader stage. Query actual adapter limits and request supported enhanced profiles. \[7–9\]
+Select memory profiles from the actual adapter and requested device limits rather than treating a generic WebGPU limit as a guarantee. Current compute kernels use 64 invocations; the scan collective uses 256 bytes of workgroup scratch. Runtime queries use at most four storage bindings and one uniform binding; the neighborhood example uses five storage bindings. Pipeline/device profiles beyond those exercised on Metal remain to be validated. \[7–9\]
 
-| **Owned faces** | **Approx. connectivity + masks** |
-|-----------------|----------------------------------|
-| 64              | 1.5 KiB                          |
-| 128             | 3.0 KiB                          |
-| 256             | 6.0 KiB                          |
-| 512             | 12.0 KiB                         |
-| 1024            | 24.0 KiB                         |
+Budget for the actual 32-bit representation. The current static connectivity arena uses `4 + 4F + 7E + sum_p(Vp + 2Ep + 7Fp)` u32 words: a four-word header, owned face/edge tasks, and per-patch vertex IDs, EV, FE and face IDs. `F` and `E` are global counts; per-patch counts include ribbons. Multiply by four for arena bytes. This excludes attributes, result buffers, scan scratch, host storage and future edit metadata. The earlier 16-bit packing estimates do not apply and have been removed.
 
-Estimate assumes 30% ribbon overhead, 1.5× capacity, E ≈ 1.5F, V ≈ 0.5F, 16-bit connectivity and two masks per element. It excludes ownership maps, scratch, cavities, attributes and alignment. Begin with 128–256 owned faces and 64–128 invocations; measure actual memory consumption. Smaller patches increase ribbon duplication and boundary work.
+Begin experiments with 128–256 owned faces and 64–128 invocations, but measure full ribbon footprints: an owned-face limit does not bound total patch size, especially at high-valence vertices. Reduce duplication, adjust patch sizes and improve access patterns within the 32-bit representation before considering a separate format proposal.
 
-Use 16 KiB as a portable profile, 32 KiB or higher only when supported. Packed writes require atomic updates or exclusive word ownership. Never assume a fixed subgroup width or cross-workgroup forward progress.
+Target a 16 KiB workgroup budget only on devices exposing at least that amount; reduce the budget or use a fallback otherwise. Request 32 KiB or higher only when supported. Never assume a fixed subgroup width or cross-workgroup forward progress. These byte budgets do not imply support for alternative numeric widths.
 
 # 4. Dynamic topology design
+
+Everything in this section is planned. No topology edits, cavity claims, rollback, migration or slicing are implemented yet.
 
 Cavity processing removes a connected region and reconstructs its boundary. Edge flips, splits and collapses can use a common transaction model. Preserve local speculative execution where practical, but do not port CUDA spin-wait synchronization literally.
 
@@ -146,45 +160,54 @@ WGSL atomics are relaxed, and execution barriers do not synchronize all workgrou
 
 ## Primary implementation risk
 
-Cross-patch transactions, migration and patch slicing are the hardest components. Separate dispatches and smaller patches may reduce the speedup from locality. Benchmark both an unpartitioned GPU baseline and original CUDA RXMesh before optimizing.
+Cross-patch transactions, migration and patch slicing are the hardest components. Separate dispatches and smaller patches may reduce the speedup from locality. Establish a same-adapter unpartitioned GPU baseline before locality optimization; add original CUDA RXMesh measurements when compatible hardware is available. Missing CUDA execution need not block the first static experiment.
 
 # 5. Implementation roadmap
 
-| **Phase**             | **Deliverable and acceptance criterion**                        |
-|-----------------------|-----------------------------------------------------------------|
-| 0 — Reference         | Pin upstream commit; record license and benchmark fixtures.     |
-| 1 — Infrastructure    | Rust/wgpu integration, WESL compilation, scans, CPU oracle and downstream package linking. |
-| 2 — Static topology   | Patch partitioning, EV/FE, ribbons, ownership and query parity; downstream query-composition example. |
-| 3 — Static algorithms | Public normals, areas, lengths, smoothing and reductions; runnable downstream examples with validated results. |
-| 4 — Local dynamics    | Single and parallel interior edge flips; rollback tests.        |
-| 5 — Boundary dynamics | Cross-patch claims, migration and ribbon repair.                |
-| 6 — Growth            | Splits, collapses, free slots, overflow and patch slicing.      |
-| 7 — Algorithms        | Delaunay flipping, isotropic remeshing, decimation.             |
-| 8 — Optimization      | Packing, subgroups, dispatch fusion, adapter profiling.         |
-| 9 — Release           | Documentation, benchmarks, examples and crates.io.              |
+See [ROADMAP.md](ROADMAP.md) for the maintained phase checklist, acceptance gates and implementation discoveries. It preserves phases 0–9 while distinguishing completed prototype work from unproven performance and release criteria.
 
-Introduce downstream examples with each operator family, including dynamic operators as those phases arrive. Phase 9 polishes and packages those examples; it does not defer their creation until release. The initial runnable example, `examples/weighted_boundary.rs`, consumes GPU edge connectivity and imports public WESL boundary and edge-length helpers to apply application-provided weights. Its shader has independent bindings and its results are checked against Alum by the GPU suite. Downstream linking and WGSL validation also run without hardware. Other operator families still require their own examples and result checks as they are implemented.
+Current position: the reference setup is mostly complete; infrastructure and static query coverage are in place; static algorithms have begun; dynamics and measured optimization have not. Downstream examples are core acceptance work, and both boundary and neighborhood compositions now run against the public package.
 
-`examples/neighborhood.rs` extends this coverage to paired vertex-edge/vertex-neighbor CSR traversal, composing public CSR, boundary and length helpers with application weights. The runtime now also exposes face neighbors in input edge-slot order and edge diamonds with explicit boundary sentinels. These static query families are checked against Alum across patch sizes; workgroup-local execution and measured locality benefits remain outstanding acceptance work. Other operator families still need their corresponding downstream examples.
+The next sequence is **static API review → benchmark baseline → workgroup-local traversal experiment → remaining static attributes/algorithms → interior edge flips**. Baseline profiling has been moved ahead of dynamics rather than deferred to the late optimization phase. Broader cross-vendor tuning still belongs to later phases.
 
-## Proposed project layout
+## Current project layout
 
-src/ gpu, mesh, builder, partition, handle, patch,  
-attribute, connectivity, scheduler, dynamic, validation  
-shaders/ core/, parallel/, topology/, geometry/, dynamic/, algorithms/  
-runtime_shaders/ concrete bindings and dispatch entry points  
-examples/ tests/ benches/ docs/  
-LICENSE THIRD_PARTY_NOTICES Cargo.toml build.rs
+```text
+src/                       CPU construction, handles, patches, public GPU API
+src/gpu/                   Attributes, adjacency, edge queries, scan orchestration
+shaders/                   Public core, topology, geometry and parallel WESL modules
+runtime_shaders/           Concrete bindings and dispatch entry points
+examples/                  Runnable downstream applications
+examples/shaders/           Downstream WESL with application-owned bindings
+examples/support/           Example orchestration shared with GPU tests
+tests/                     Host/GPU reference tests and downstream linking
+prior_art/REFERENCES.md     Recorded upstream revisions and setup instructions
+```
 
-## Host API direction
+Dedicated scheduler/dynamic modules, benchmark infrastructure and editable storage remain planned. Public operations must remain reusable independently of runtime bindings as those modules arrive.
 
-Accept an existing wgpu Device and Queue. Record operations into caller-owned command encoders, keep readbacks explicit and cache pipelines by specialization. Expose reusable WESL modules for application-specific operators. Use Rust, wgpu, wesl-rs, bytemuck, glam and rayon as candidate dependencies; pin versions after compatibility tests.
+## Current host API and future direction
 
-let mesh = MeshBuilder::new()  
-.positions(&positions).triangles(&triangles)  
-.patch_size(128).build(&device, &queue)?;  
-mesh.compute_normals(&mut encoder)?;  
-mesh.remesh(&mut encoder, &settings)?;
+Construction is CPU-only and GPU upload is a separate step. The caller supplies the device/queue and owns submission. Cache query objects to reuse their pipelines; results remain on the GPU unless explicitly copied for readback.
+
+```rust,ignore
+use mopmesh::{MeshBuilder, gpu::{AdjacencyQuery, GpuMesh}};
+
+let mesh = MeshBuilder::new()
+    .positions(&positions)
+    .triangles(&triangles)
+    .patch_size(128)
+    .build()?;
+let gpu_mesh = GpuMesh::upload(&device, &mesh)?;
+let query = AdjacencyQuery::new(&device);
+let mut encoder = device.create_command_encoder(&Default::default());
+let adjacency = query.encode(&device, &mut encoder, &gpu_mesh)?;
+queue.submit([encoder.finish()]);
+```
+
+There are no `mesh.compute_normals()` or `mesh.remesh()` methods yet. Their eventual interfaces should follow the same explicit ownership/submission model rather than treating speculative examples as a frozen API.
+
+Current runtime dependencies are `wgpu`, `wesl-core` and `bytemuck`; WESL compilation uses `wesl` at build time. Development tools include Alum, Naga, pollster and wesl. Exact resolved versions are in `Cargo.lock`; `glam` and `rayon` have not been added and should be justified by implementation needs.
 
 # 6. Validation and performance
 
@@ -202,7 +225,7 @@ Use Alum as the independent Rust CPU oracle and development dependency, rather t
 
 - Retry queues terminate or return explicit failure.
 
-Fixtures: single triangle, quadrilateral, tetrahedron, sphere, holes, high-valence vertices, degenerate and non-manifold inputs, nearly full patches and deliberately conflicting boundary edits.
+Implemented fixtures include triangle/quadrilateral host cases, a tetrahedron, grids with and without a hole, disconnected components, high-valence vertices, invalid-input rejection and empty meshes. GPU tests cover multiple patch sizes and repeated execution. Sphere/large real-world benchmark datasets, nearly full editable patches and conflicting boundary edits remain planned. The dynamic invariants above become acceptance tests when editing is introduced; they are not currently exercised.
 
 ## Four feasibility experiments
 
@@ -235,11 +258,13 @@ Alum (https://github.com/ranjeethmahankali/alum), a Rust halfedge mesh library i
 
 ## Release scope
 
-MOPMesh 0.1: GPU-resident static mesh, patch/ribbon representation, queries, typed attributes, geometry operations and experimental local cavities. Later releases: cross-patch topology, slicing, remeshing, decimation and reusable cavity operators. Numerical solvers and automatic differentiation remain out of scope until justified.
+The initial-release GPU numeric contract is native 32-bit only, as specified under Storage layout. Numeric packing and 16/64-bit or paired-float paths are excluded from the committed roadmap.
+
+Target MOPMesh 0.1 scope: GPU-resident static mesh, patch/ribbon representation, queries, typed attributes, geometry operations and experimental local cavities. The prototype's Cargo version is not a declaration that this scope is complete. Later releases target cross-patch topology, slicing, remeshing, decimation and reusable cavity operators. Numerical solvers and automatic differentiation remain out of scope until justified.
 
 ## Feasibility conclusion
 
-Proceed with a bounded feasibility prototype. Memory constraints can be addressed by patch sizing, packing and selective storage access; synchronization requires a deliberate redesign. Prior art supports the feasibility of non-CUDA topology modification, but does not prove that RXMesh-level generality or performance can be attained in WebGPU. The first investment gate is measured static locality benefit and correct concurrent edge flips.
+Proceed with a bounded feasibility prototype using native 32-bit GPU representations. Address memory constraints through patch sizing, controlled ribbon duplication, selective storage access and resource reuse; synchronization requires a deliberate redesign. Prior art supports the feasibility of non-CUDA topology modification, but does not prove that RXMesh-level generality or performance can be attained in WebGPU. The first investment gate is measured static locality benefit and correct concurrent edge flips.
 
 # 8. References and source map
 

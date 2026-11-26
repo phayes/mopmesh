@@ -1,2 +1,3 @@
 /target
-/prior_art
+/prior_art/*
+!/prior_art/REFERENCES.md

@@ -4,13 +4,20 @@ Portable patch-based triangle mesh processing in Rust and WESL, following the
 RXMesh patch/ribbon architecture. This is an early feasibility prototype with
 static GPU connectivity queries.
 
+**Status:** the planned static query families are implemented and checked against
+Alum. Static geometry algorithms are partial; topology editing has not started.
+Execution has been verified on Metal, but locality benefits and cross-vendor
+performance are unproven. See the [maintained roadmap](ROADMAP.md) for completed
+work, acceptance criteria and next steps, and the
+[technical design](MOPMesh_Technical_Design.md) for architecture and planned dynamics.
+
 ## Implemented
 
 - Validated host construction for oriented manifold triangle meshes, including boundaries.
 - Deterministic breadth-first face partitioning, local EV/FE connectivity, vertex-star ribbons, and explicit canonical ownership.
 - Patch/local vertex, edge, and face handles; typed canonical vertex attributes.
 - Alum-backed reference tests for connectivity and ownership across multiple patch sizes.
-- A reusable WESL package with initial handle types and directed-edge helpers, tested through a downstream consumer shader.
+- A reusable WESL package with handle types, topology/geometry helpers and a scan collective, tested through downstream consumers.
 - A scalar connectivity arena, wgpu upload, and a GPU face-to-vertex query verified against Alum.
 - GPU vertex-to-face CSR adjacency derived by count, prefix, and scatter passes, verified against Alum.
 - GPU edge endpoints and incident faces, plus a downstream weighted-boundary operator verified against Alum.
@@ -25,17 +32,20 @@ OpenMesh is retained as an optional secondary reference and prior art.
 
 ```sh
 cargo run
-cargo run --example weighted_boundary
-cargo run --example neighborhood
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
-# Requires a real GPU adapter; fails if no adapter is available.
+# The following require a GPU adapter; missing hardware is a failure.
+cargo run --example weighted_boundary
+cargo run --example neighborhood
 cargo test --test gpu_topology -- --ignored --nocapture
 # Include both GPU topology and scan tests:
 cargo test --all-targets -- --include-ignored --nocapture
 ```
 
-The example builds a two-triangle square with one owned face per patch.
+`cargo run` is a CPU-only construction example: it builds a two-triangle square
+with one owned face per patch. The two named examples execute GPU operators.
+The ordinary test suite skips the two explicit hardware tests; use
+`--include-ignored` as shown above to run the full suite.
 
 ```rust
 use mopmesh::MeshBuilder;
@@ -75,7 +85,7 @@ import mopmesh::topology::edge::{EdgeRecord, is_boundary_edge, edge_face_count};
 import mopmesh::geometry::edge::edge_length;
 ```
 
-These initial modules declare no resource bindings or compute entry points.
+These public modules declare no resource bindings or compute entry points.
 Consumers choose those themselves. See `tests/shaders/consumer.wesl` and
 `tests/wesl_package.rs` for a complete linking example. Public module paths and
 types are experimental. `face_vertices` accepts three EV records in face-edge
@@ -86,11 +96,11 @@ The geometry helper computes a triangle centroid from three position values.
 `exclusive_scan_64(value, lane)` returns a u32 exclusive prefix and block total.
 It is a collective: all 64 workgroup invocations must call it in uniform control
 flow with their distinct `local_invocation_index`. Inactive lanes supply zero
-instead of returning early. It uses 256 bytes of private workgroup scratch,
+instead of returning early. It uses 256 bytes of module-owned workgroup scratch,
 includes barriers, and supports sequential calls. Arithmetic wraps at u32.
 The helper owns no resource bindings or entry points; a separate downstream
 consumer demonstrates importing it and calling it twice.
-Both the downstream shader and built-in query pass Naga validation with no
+The downstream shaders and built-in queries pass Naga validation with no
 optional capabilities. Binding and dispatch wrappers live separately in
 `runtime_shaders/`, outside the reusable package. These entry points implement
 the Rust runtime's buffer bindings and dispatch layouts.
@@ -99,8 +109,9 @@ the Rust runtime's buffer bindings and dispatch layouts.
 
 Common mesh operations will be implemented in the public WESL library, with the
 Rust runtime using those same implementations. This includes connectivity
-traversal, geometry primitives, scans/reductions, and planned operators such as
-normals, areas, edge lengths and smoothing. Allocation, concrete bindings,
+traversal, geometry primitives and parallel primitives. Centroids, edge length
+and scans exist; normals, areas, general reductions and smoothing remain planned.
+Allocation, concrete bindings,
 pipeline configuration and dispatch scheduling belong in the runtime layer.
 
 A small runnable downstream example is an acceptance criterion for each major
@@ -189,7 +200,7 @@ to owned edges times local face count per patch; workgroup staging and faster
 traversal remain to be implemented. The query checks its own output and dispatch
 limits before recording commands and uses two storage bindings.
 
-### Remaining adjacency families
+### Vertex neighborhoods, face neighbors and edge diamonds
 
 ```rust,ignore
 use mopmesh::gpu::AdjacencyQuery;
@@ -213,7 +224,7 @@ dispatch limits are checked before commands are recorded.
   pairs, not scalar words. The pair region starts at
   `vertex_entries_byte_offset()`. Each edge contributes one pair to each
   endpoint. Row order is unspecified and is not a cyclic one-ring ordering.
-- **Face-neighbor:** three tightly packed u32 face IDs per original input face.
+- **Face-neighbor:** three contiguous u32 face IDs per original input face.
   Slot `i` is across `(triangle[i], triangle[(i + 1) % 3])`, preserving input
   winding and corner order. `0xffffffff` denotes a boundary. Do not bind this
   12-byte-per-face layout as a WGSL array of vec3, whose stride would be 16 bytes.
@@ -303,19 +314,33 @@ placeholder without dispatch. The query uses three storage bindings and the
 existing FV evaluation. Finite, reasonably scaled f32 positions are expected;
 extreme coordinates remain subject to floating-point overflow and rounding.
 
-GPU reference tests cover 128-face and 8,192-face grids, a grid with a hole, a closed tetrahedron, disconnected
-triangles, a 129-face vertex fan, and empty meshes at patch sizes 1, 3, and 128,
+## Validation coverage
+
+GPU reference tests cover 128-face and 8,192-face grids, a grid with a hole,
+a closed tetrahedron, disconnected triangles, a 129-face vertex fan, and empty
+meshes at patch sizes 1, 3, and 128,
 including repeated queries, scalar/vector uploads, cross-mesh rejection, and
 centroids before and after position updates through ribbon handles, edge
 connectivity, VE/VV, FF slot order, boundary/interior diamonds, and both downstream
-operators. Repeated adjacency execution is also checked. They passed
-on Apple M1 Max / Metal; other backends
-have not yet been exercised. The ordinary test suite runs shader validation
+operators. Repeated adjacency execution is also checked. They passed on
+Apple M1 Max / Metal; other backends have not yet been exercised.
+The ordinary test suite runs shader validation
 and scan allocation/dispatch-limit checks without requiring GPU hardware.
 GPU scan tests cover empty, exact, and partial blocks, zeros, varying values,
 wrapping arithmetic, and up to four hierarchy levels (262,145 values).
+The latest recorded full run passed 13 tests (11 hardware-independent and two
+opt-in GPU tests); both examples, Clippy and formatting checks also passed.
+These are correctness results, not benchmarks or exhaustive topology coverage.
 
 ## Current constraints
+
+The initial release supports native 32-bit GPU values: `u32`/`i32` integer data
+and `f32` geometry, including vectors/records made of independent 32-bit fields.
+It excludes 16-bit formats, subword numeric packing, native or emulated 64-bit
+GPU values, and paired-float precision schemes. Packing and alternative widths
+are outside the committed roadmap. Host `u64`/`usize` size checks and the CPU
+builder's `f64` degeneracy calculations remain in use; they do not introduce
+wider GPU representations.
 
 `patch_size` limits owned faces only. Ribbons include the complete face stars
 of vertices on owned faces, so high-valence vertices can cause substantial
@@ -331,22 +356,35 @@ Geometric self-intersections are not checked.
 Handles are mesh-relative addresses and must not be used with another mesh.
 Future migration and slot reuse invalidate them. Vertex attributes verify mesh
 identity and share canonical values across ribbons. Edge/face attributes,
-active masks, edit capacities, and dynamic edits remain
-future work. The current GPU query walks EV/FE directly; it does not yet stage
-patches in workgroup memory. There are no GPU performance claims yet.
+active masks, edit capacities, and dynamic edits remain future work.
+GPU topology queries currently access storage buffers directly; the scan uses
+workgroup scratch, but topology is not yet staged in workgroup memory. Query
+objects reuse pipelines while encode calls allocate fresh output/scratch
+buffers. The batched adjacency API computes all four families together.
+Their performance and allocation tradeoffs remain to be measured.
+
+Typed attribute APIs check mesh identity; raw-buffer compositions require the
+application to supply matching mesh/device resources. Keep the caller's queue
+alive while encoding and submitting work. No automatic device selection,
+resource pooling, generation-checked handles or migration exists yet.
 
 ## Reference sources
 
-Pinned revisions, dependency roles, and OpenMesh build instructions are in
-`prior_art/REFERENCES.md`. Original upstream license notices are retained in
-`THIRD_PARTY_NOTICES`.
+Recorded revisions, dependency roles, and OpenMesh build instructions are in
+[reference setup](prior_art/REFERENCES.md). Original upstream license notices are
+retained in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES). The downloaded source
+checkouts are optional and ignored by the top-level repository; Cargo tests use
+Alum and do not require those checkouts.
 
 - [RXMesh: A GPU Mesh Data Structure (2021)](https://doi.org/10.1145/3450626.3459748)
 - [Dynamic Mesh Processing on the GPU (2025)](https://doi.org/10.1145/3731162)
 - [Alum](https://github.com/ranjeethmahankali/alum)
 - [OpenMesh](https://www.graphics.rwth-aachen.de/software/openmesh/)
 
-The planned static adjacency families are now implemented and checked against
-Alum. Next milestones: static geometry operators (normals, areas and smoothing),
-edge/face attributes, workgroup-local traversal, and locality benchmarks against
-an unpartitioned baseline. Static performance viability remains unproven.
+## Next steps
+
+Follow the [execution milestones](ROADMAP.md#next-execution-milestones): review
+the static API, establish an unpartitioned GPU benchmark baseline, then evaluate
+workgroup-local traversal. Complete remaining static attributes and geometry
+operators before starting interior edge flips. Static performance viability
+remains an open gate rather than an assumed property of the patch representation.
