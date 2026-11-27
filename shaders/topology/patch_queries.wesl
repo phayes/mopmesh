@@ -28,7 +28,7 @@ import super::patch_arena::{slot_end, slot_active, face_edge, edge_vertices};
 import super::patch_staging::staged_edge_faces;
 import super::edge::{INVALID_FACE, INVALID_VERTEX};
 import super::local_query::{
-    face_edge_index, opposite_vertex, vv_clear, vv_count_edge, vv_plan, vv_scatter_edge,
+    face_edge_index, opposite_edge, opposite_vertex, vv_clear, vv_count_edge, vv_plan, vv_scatter_edge,
     vv_oversized, vv_row, vv_entry,
 };
 
@@ -57,16 +57,9 @@ public fn edge_diamond(r: PatchRecord, first: u32, e: u32) -> vec4<u32> {
     for (var side = 0u; side < 2u; side++) {
         let f = faces[side];
         if (f == INVALID_FACE) { continue; }
-        var edges: vec3<u32>;
-        var reversed: vec3<u32>;
-        var vertices: array<vec2<u32>, 3>;
-        for (var i = 0u; i < 3u; i++) {
-            let fe = face_edge(r, f, i);
-            edges[i] = fe.x;
-            reversed[i] = fe.y;
-            vertices[i] = edge_vertices(r, fe.x);
-        }
-        opposite[side] = opposite_vertex(reversed, vertices, face_edge_index(edges, e));
+        let slots = vec3(face_edge(r, f, 0u).x, face_edge(r, f, 1u).x, face_edge(r, f, 2u).x);
+        let next = face_edge(r, f, opposite_edge(face_edge_index(slots, e)));
+        opposite[side] = opposite_vertex(edge_vertices(r, next.x), next.y);
     }
     return vec4(ends, opposite);
 }

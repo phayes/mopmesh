@@ -15,6 +15,8 @@ mod bench;
 #[cfg(test)]
 mod bench_baseline;
 #[cfg(test)]
+mod bench_flips;
+#[cfg(test)]
 mod bench_meshes;
 mod boundary;
 mod build;

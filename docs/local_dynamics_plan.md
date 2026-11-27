@@ -102,8 +102,34 @@ that it occurs.
 **Scratch per batch.** 40 B per edge of state plus 4 B per edge of status,
 and 8 B per vertex for claims and partners.
 
-**Not yet done.** Timing against the previous per-request claim, which is the
-gate for step 2. The machine was reserved for the baseline rerun.
+**Timing against the per-request claim.** This is the gate for step 2.
+- **Setup.**
+  - Benchmark: `src/gpu/bench_flips.rs`, run with `MOPMESH_BENCH=1 cargo test
+    --release --lib gpu_flip_benchmark -- --ignored --nocapture`.
+  - Workload: one batch requesting every edge, on a fresh upload at capacity
+    1.5, patch size 512.
+  - Numbers: median of 11 runs on an Apple M1 Max. GPU time is the sum of the
+    batch's compute passes.
+- **Versions compared.** The previous version is 7154bf8, with the same
+  benchmark file added.
+- **Same flips in both.** Flipped and lost-claim counts are identical on
+  every mesh. The requests are every edge in ID order, so the old
+  request-index priority equals the new edge-ID priority.
+
+| Faces | Order | Per-request claim (before) | Per-patch claim (step 1) | Speed-up |
+|---:|---|---:|---:|---:|
+| 524 K | input, four meshes | 37.9–41.9 ms | 10.2–10.8 ms | 3.6–4.1x |
+| 524 K | shuffled, four meshes | 62.5–85.9 ms | 10.2–12.5 ms | 5.6–7.9x |
+| 2.1 M | input, four meshes | 155.4–168.8 ms | 29.9–35.2 ms | 4.6–5.2x |
+| 2.1 M | shuffled, four meshes | 544.4–565.6 ms | 34.6–37.8 ms | 14.5–15.9x |
+
+- **Noise.** The step 1 runs were noisy: at 2.1 M faces, the minima were
+  24.6–32.4 ms.
+- **Wall time.** At 2.1 M faces it was 64.8–71.0 ms. Each batch allocates
+  about 126 MB of flip state, plus statuses and masks, and that time isn't in
+  the GPU sum.
+- **Not measured.** Per-pass times were not recorded, so the split between
+  the claim and the per-edge reserve and commit dispatches is not known yet.
 
 ## Bottom line
 

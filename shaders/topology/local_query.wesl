@@ -49,15 +49,18 @@ public fn face_edge_index(edges: vec3<u32>, edge: u32) -> u32 {
     return 3u;
 }
 
-// Returns the face's corner opposite its edge `i` (0, 1 or 2): the vertex of
-// the triangle that is not on that edge.
-// `reversed` holds the face's three direction flags in winding order: 0 when
-// the face runs an edge in its stored vertex order, 1 when it reverses it.
-// `vertices` holds the stored endpoints of the face's three edges, in the
-// same order.
-public fn opposite_vertex(reversed: vec3<u32>, vertices: array<vec2<u32>, 3>, i: u32) -> u32 {
-    let k = (i + 2u) % 3u;
-    return directed_start(vertices[k], reversed[k] != 0u);
+// Returns which of a face's three edges starts at the corner opposite its
+// edge `i` (0, 1 or 2). Pass that edge to opposite_vertex.
+public fn opposite_edge(i: u32) -> u32 {
+    return (i + 2u) % 3u;
+}
+
+// Returns the face's corner opposite its edge `i`: the vertex of the
+// triangle that is not on that edge. Pass the stored endpoints of the face's
+// edge `opposite_edge(i)`, and its direction flag in the face: 0 when the
+// face runs the edge in its stored vertex order, 1 when it reverses it.
+public fn opposite_vertex(endpoints: vec2<u32>, reversed: u32) -> u32 {
+    return directed_start(endpoints, reversed != 0u);
 }
 
 // Starts a VV chunk with no neighbors counted. All 64 invocations must call

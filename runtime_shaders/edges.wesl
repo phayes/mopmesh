@@ -6,7 +6,7 @@ import package::shaders::topology::patch_arena::{
 };
 import package::shaders::topology::patch_staging::{STAGED_EDGES, staged_edge_faces};
 import package::shaders::topology::patch_edge_staging::{patch_edge_end, stage_patch_edges};
-import package::shaders::topology::local_query::{face_edge_index, opposite_vertex};
+import package::shaders::topology::local_query::{face_edge_index, opposite_edge, opposite_vertex};
 import package::shaders::parallel::grid::flat_group;
 
 // One record per mesh edge, indexed by global edge ID.
@@ -82,18 +82,12 @@ fn adjacency(
             for (var side = 0u; side < 2u; side++) {
                 let f = local[side];
                 if (f == INVALID_FACE) { continue; }
-                var slots: vec3<u32>;
-                var reversed: vec3<u32>;
-                var vertices: array<vec2<u32>, 3>;
-                for (var k = 0u; k < 3u; k++) {
-                    let fe = face_edge(r, f, k);
-                    slots[k] = fe.x;
-                    reversed[k] = fe.y;
-                    vertices[k] = edge_vertices(r, fe.x);
-                }
+                let slots = vec3(face_edge(r, f, 0u).x, face_edge(r, f, 1u).x, face_edge(r, f, 2u).x);
                 let i = face_edge_index(slots, e);
                 neighbors[3u * record.faces[side] + i] = record.faces[1u - side];
-                opposite[side] = global_vertex(r, opposite_vertex(reversed, vertices, i));
+                let next = face_edge(r, f, opposite_edge(i));
+                let start = opposite_vertex(edge_vertices(r, next.x), next.y);
+                opposite[side] = global_vertex(r, start);
             }
             diamonds[global] = vec4(record.vertices, opposite);
         }

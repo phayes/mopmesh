@@ -245,8 +245,11 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   after flips (`tests/gpu_local_query.rs`). The flip claim stage runs one
   workgroup per patch and settles conflicts there; statuses are indexed by
   edge ID. See `docs/local_dynamics_plan.md`.
-- [ ] Time per-patch claims against the previous per-request claims, then
-  decide on step 2: one per-patch kernel doing select, reserve and commit.
+- [x] Time per-patch claims against the previous per-request claims. At
+  2.1 M faces and patch size 512, one all-edges batch drops from 155–169 ms
+  to 30–35 ms in input order and from 544–566 ms to 35–38 ms shuffled.
+- [ ] Decide on step 2: one per-patch kernel doing select, reserve and
+  commit, with claims in workgroup memory.
 
 ### 5 — Boundary dynamics: not started
 
