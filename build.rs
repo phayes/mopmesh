@@ -20,6 +20,7 @@ fn main() {
         "reduce",
         "smooth",
         "edge_flip",
+        "cavity_rounds",
         "scan",
         "edges",
         "vertex_neighbors",

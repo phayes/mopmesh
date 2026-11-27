@@ -13,9 +13,13 @@
 //!   default `8`.
 //! - `MOPMESH_BENCH_SIDES`: comma-separated skewed-grid sides for the
 //!   Delaunay settle, default `513`.
-//! - `MOPMESH_BENCH_ACTOR`: `majority` to make each boundary flip in the
-//!   patch owning most faces around its corners; by default the edge's owner
-//!   makes it.
+//! - `MOPMESH_BENCH_ACTOR`: which patch makes each boundary flip: `edge`
+//!   for the edge's owner, `corners` for the most common owner of its four
+//!   corner vertices, `endpoint` for whichever endpoint owner owns more
+//!   corners, or by default the patch owning most faces around them.
+//! - `MOPMESH_BENCH_BIDS`: `relay` for relayed per-flip bids with no
+//!   footprint cap; by default bounded batches capped at
+//!   `MOPMESH_BENCH_FOOTPRINT`.
 //!
 //! The model follows the Phase 5 plan:
 //! - An interior pass flips, greedily by priority, the requested edges whose
@@ -43,11 +47,14 @@ const FACE: usize = 2;
 const CAPACITY: f64 = 1.5;
 /// Rounds after which leftover flips are counted, as a candidate default.
 const ENCODED_ROUNDS: usize = 8;
+/// Face owners counted per vertex by the star-leader rule; a vertex with
+/// more is left out of the vote.
+pub(super) const STAR_LEADER_SLOTS: usize = 4;
 /// Rounds after which the simulation gives up draining a batch.
 const MAX_ROUNDS: usize = 10_000;
 
 /// The same hash as `topology::flip::flip_priority`.
-fn priority(index: u32, seed: u32) -> u32 {
+pub(super) fn priority(index: u32, seed: u32) -> u32 {
     let mut x = index ^ seed;
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb_352d);
@@ -98,7 +105,7 @@ struct Stats {
 }
 
 /// Mesh topology, ownership and per-patch copies.
-struct Sim {
+pub(super) struct Sim {
     triangles: Vec<[u32; 3]>,
     positions: Vec<[f32; 3]>,
     /// Faces around each vertex.
@@ -112,10 +119,35 @@ struct Sim {
     capacity: Vec<[usize; 3]>,
     moves: Vec<u32>,
     peak_ratio: [f64; 3],
-    /// Whether a boundary flip is made by the patch owning most faces around
-    /// its corners, instead of by the edge's owner.
-    majority: bool,
+    /// Which patch makes each boundary flip.
+    actor: Actor,
+    /// Whether rounds use relayed per-flip bids instead of bounded batches.
+    relay: bool,
 }
+
+/// Which patch makes a boundary flip.
+#[derive(Clone, Copy)]
+enum Actor {
+    /// The owner of the flipped edge, as in RXMesh.
+    Edge,
+    /// The patch owning the most faces around the four corners.
+    Majority,
+    /// The most common owner among the four corner vertices.
+    Corners,
+    /// Whichever of the edge's two endpoint owners owns more of the four
+    /// corners, the lower ID on ties. It holds both faces of the edge.
+    Endpoint,
+    /// The most common owner among the quad's two faces, five edges and four
+    /// vertices, the lower ID on ties.
+    Local,
+    /// The patch owning the most faces summed over the corners' stars,
+    /// leaving out stars with many owners (see `Sim::star_leaders`).
+    Stars,
+}
+
+/// A patch's flips for one round: the patch, the faces around their
+/// corners, their footprint, and the flips.
+type Plan = (u32, BTreeSet<u32>, BTreeSet<u32>, Vec<(u32, Quad)>);
 
 fn key(a: u32, b: u32) -> (u32, u32) {
     (a.min(b), a.max(b))
@@ -123,12 +155,12 @@ fn key(a: u32, b: u32) -> (u32, u32) {
 
 /// A flippable edge `ab`'s corners `[a, b, c, d]`, where `c` is opposite the
 /// face running a -> b and `d` the face running b -> a.
-struct Quad {
-    corners: [u32; 4],
+pub(super) struct Quad {
+    pub corners: [u32; 4],
 }
 
 impl Sim {
-    fn new(positions: &[[f32; 3]], triangles: &[[u32; 3]], patch_size: u32) -> Self {
+    pub(super) fn new(positions: &[[f32; 3]], triangles: &[[u32; 3]], patch_size: u32) -> Self {
         let mesh = MeshBuilder::new()
             .patch_size(patch_size as usize)
             .positions(positions)
@@ -190,16 +222,28 @@ impl Sim {
             capacity,
             moves: vec![0; triangles.len()],
             peak_ratio: [0.0; 3],
-            majority: std::env::var("MOPMESH_BENCH_ACTOR").is_ok_and(|a| a == "majority"),
+            actor: match std::env::var("MOPMESH_BENCH_ACTOR").as_deref() {
+                Ok("edge") => Actor::Edge,
+                Ok("corners") => Actor::Corners,
+                Ok("endpoint") => Actor::Endpoint,
+                Ok("local") => Actor::Local,
+                Ok("stars") => Actor::Stars,
+                _ => Actor::Majority,
+            },
+            relay: std::env::var("MOPMESH_BENCH_BIDS").is_ok_and(|b| b == "relay"),
         }
     }
 
-    fn patch_count(&self) -> usize {
+    pub(super) fn patch_count(&self) -> usize {
         self.held.len()
     }
 
+    pub(super) fn edge_count(&self) -> usize {
+        self.ends.len()
+    }
+
     /// Returns edge `e`'s quad, or `None` for a boundary edge.
-    fn quad(&self, e: u32) -> Option<Quad> {
+    pub(super) fn quad(&self, e: u32) -> Option<Quad> {
         let [a, b] = self.ends[e as usize];
         let runs = |f: u32, u: u32, v: u32| {
             let t = self.triangles[f as usize];
@@ -234,7 +278,7 @@ impl Sim {
     }
 
     /// Every face at any of `corners`.
-    fn cavity_faces(&self, corners: &[u32]) -> BTreeSet<u32> {
+    pub(super) fn cavity_faces(&self, corners: &[u32]) -> BTreeSet<u32> {
         corners
             .iter()
             .flat_map(|&v| self.star[v as usize].iter().copied())
@@ -242,7 +286,7 @@ impl Sim {
     }
 
     /// The owners of `faces` and of their vertices and edges.
-    fn footprint(&self, faces: &BTreeSet<u32>) -> BTreeSet<u32> {
+    pub(super) fn footprint(&self, faces: &BTreeSet<u32>) -> BTreeSet<u32> {
         let mut patches = BTreeSet::new();
         for &f in faces {
             patches.insert(self.owner[FACE][f as usize]);
@@ -271,6 +315,214 @@ impl Sim {
             }
         }
         need
+    }
+
+    /// Bounded batches: each patch takes its highest-priority flips,
+    /// vertex-disjoint, until their footprint would exceed `max_footprint`
+    /// patches, then bids one priority on every patch of that footprint.
+    /// Returns the batches that hold every bid.
+    fn batch_winners(
+        &self,
+        by_patch: HashMap<u32, Vec<(u32, Quad)>>,
+        max_footprint: usize,
+        round_seed: u32,
+        stats: &mut Stats,
+    ) -> Vec<Plan> {
+        // Prepare each patch's batch.
+        let mut plans = Vec::new();
+        for (p, cands) in by_patch {
+            let mut used = HashSet::new();
+            let (mut faces, mut fp, mut flips) = (BTreeSet::new(), BTreeSet::from([p]), Vec::new());
+            for (e, q) in cands {
+                if q.corners.iter().any(|v| used.contains(v)) {
+                    continue;
+                }
+                let mine = self.cavity_faces(&q.corners);
+                let union: BTreeSet<u32> = fp.union(&self.footprint(&mine)).copied().collect();
+                if !flips.is_empty() && union.len() > max_footprint {
+                    break;
+                }
+                used.extend(q.corners);
+                faces.extend(mine);
+                fp = union;
+                flips.push((e, q));
+            }
+            stats.batch_footprints.push(fp.len());
+            stats.batch_cavities.push(flips.len());
+            plans.push((p, faces, fp, flips));
+        }
+
+        // Bid one priority per patch and round on every footprint patch.
+        let mut best = vec![0u32; self.patch_count()];
+        for (p, _, fp, _) in &plans {
+            for &q in fp {
+                best[q as usize] = best[q as usize].max(priority(*p, round_seed));
+            }
+        }
+        let winners: Vec<_> = plans
+            .into_iter()
+            .filter(|(p, _, fp, _)| {
+                fp.iter()
+                    .all(|&q| best[q as usize] == priority(*p, round_seed))
+            })
+            .collect();
+        stats
+            .contenders
+            .push(best.iter().filter(|&&b| b != 0).count());
+        stats.winners.push(winners.len());
+        winners
+    }
+
+    /// Relayed bids, with no stored footprints and no cap: each pending flip
+    /// bids its patch's round priority on its four corners; each bid vertex
+    /// forwards its highest bid to every patch of its star's footprint; a
+    /// vertex is lost if any of those patches holds a higher bid. A flip
+    /// wins if all its corners carry its patch's bid and none is lost. Among
+    /// one patch's winners, one round of flip priorities on shared corners
+    /// picks the flips to make; the rest stay pending.
+    fn relay_winners(
+        &self,
+        by_patch: HashMap<u32, Vec<(u32, Quad)>>,
+        seed: u32,
+        round_seed: u32,
+        stats: &mut Stats,
+    ) -> Vec<Plan> {
+        // The top bit keeps every bid nonzero and distinct per patch.
+        let bid = |p: u32| priority(p, round_seed | 0x8000_0000);
+
+        // Corner bids, then the forward relay to each star's footprint.
+        let mut vbid: HashMap<u32, u32> = HashMap::new();
+        for (&p, flips) in &by_patch {
+            for (_, q) in flips {
+                for &v in &q.corners {
+                    let b = vbid.entry(v).or_default();
+                    *b = (*b).max(bid(p));
+                }
+            }
+        }
+        let star_footprint: HashMap<u32, BTreeSet<u32>> = vbid
+            .keys()
+            .map(|&v| (v, self.footprint(&self.cavity_faces(&[v]))))
+            .collect();
+        let mut lock: HashMap<u32, u32> = HashMap::new();
+        for (&v, &b) in &vbid {
+            for &q in &star_footprint[&v] {
+                let l = lock.entry(q).or_default();
+                *l = (*l).max(b);
+            }
+        }
+
+        // Back relay and win check, then one round among each patch's winners.
+        let lost = |v: u32| star_footprint[&v].iter().any(|q| lock[q] != vbid[&v]);
+        stats.contenders.push(by_patch.len());
+        let mut plans = Vec::new();
+        let mut claimed = BTreeSet::new();
+        for (p, flips) in by_patch {
+            let won: Vec<_> = flips
+                .into_iter()
+                .filter(|(_, q)| q.corners.iter().all(|&v| vbid[&v] == bid(p) && !lost(v)))
+                .collect();
+            if won.is_empty() {
+                continue;
+            }
+            let mut best: HashMap<u32, u32> = HashMap::new();
+            for (e, q) in &won {
+                for &v in &q.corners {
+                    let b = best.entry(v).or_default();
+                    *b = (*b).max(priority(*e, seed));
+                }
+            }
+            let flips: Vec<_> = won
+                .into_iter()
+                .filter(|(e, q)| q.corners.iter().all(|v| best[v] == priority(*e, seed)))
+                .collect();
+            let mut faces = BTreeSet::new();
+            for (_, q) in &flips {
+                faces.extend(self.cavity_faces(&q.corners));
+            }
+            let fp = self.footprint(&faces);
+            assert!(fp.contains(&p), "a flip's patch is in its footprint");
+            assert!(
+                claimed.is_disjoint(&fp),
+                "winning patches share a footprint patch"
+            );
+            claimed.extend(fp.iter().copied());
+            stats.batch_footprints.push(fp.len());
+            stats.batch_cavities.push(flips.len());
+            plans.push((p, faces, fp, flips));
+        }
+        stats.winners.push(plans.len());
+        plans
+    }
+
+    /// The most common owner among `corners`, the lowest ID on ties.
+    fn corner_majority(&self, corners: [u32; 4]) -> u32 {
+        let owners = corners.map(|v| self.owner[VERTEX][v as usize]);
+        let count = |p: u32| owners.iter().filter(|&&o| o == p).count();
+        *owners
+            .iter()
+            .max_by_key(|&&p| (count(p), std::cmp::Reverse(p)))
+            .unwrap()
+    }
+
+    /// Whichever owner of corners `a` and `b` owns more of the four corners,
+    /// the lower ID on ties.
+    /// Sums, over the four corners, how many faces of each corner's star
+    /// each patch owns, and returns the patch with the highest sum, the
+    /// lower ID on ties. A corner whose star has more than
+    /// `STAR_LEADER_SLOTS` face owners is left out; if every corner is,
+    /// returns [`endpoint_owner`](Self::endpoint_owner). Matches
+    /// `cavity_actor` in `topology::cavity_rounds`.
+    pub(super) fn star_leaders(&self, corners: [u32; 4]) -> u32 {
+        let mut score: HashMap<u32, usize> = HashMap::new();
+        for v in corners {
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for &f in &self.star[v as usize] {
+                *counts.entry(self.owner[FACE][f as usize]).or_default() += 1;
+            }
+            if counts.len() > STAR_LEADER_SLOTS {
+                continue;
+            }
+            for (p, n) in counts {
+                *score.entry(p).or_default() += n;
+            }
+        }
+        score
+            .into_iter()
+            .max_by_key(|&(p, n)| (n, std::cmp::Reverse(p)))
+            .map_or_else(|| self.endpoint_owner(corners), |(p, _)| p)
+    }
+
+    /// The most common owner among the quad's two faces, five edges and four
+    /// vertices, the lower ID on ties.
+    pub(super) fn local_plurality(&self, [a, b, c, d]: [u32; 4]) -> u32 {
+        let mut votes = Vec::with_capacity(11);
+        for v in [a, b, c, d] {
+            votes.push(self.owner[VERTEX][v as usize]);
+        }
+        for (u, w) in [(a, b), (a, c), (b, c), (a, d), (b, d)] {
+            votes.push(self.owner[EDGE][self.edge_of[&key(u, w)] as usize]);
+        }
+        for f in self.cavity_faces(&[a]) {
+            let t = self.triangles[f as usize];
+            if t.contains(&b) {
+                votes.push(self.owner[FACE][f as usize]);
+            }
+        }
+        let count = |p: u32| votes.iter().filter(|&&o| o == p).count();
+        *votes
+            .iter()
+            .max_by_key(|&&p| (count(p), std::cmp::Reverse(p)))
+            .unwrap()
+    }
+
+    pub(super) fn endpoint_owner(&self, corners: [u32; 4]) -> u32 {
+        let owners = corners.map(|v| self.owner[VERTEX][v as usize]);
+        let count = |p: u32| owners.iter().filter(|&&o| o == p).count();
+        *owners[..2]
+            .iter()
+            .max_by_key(|&&p| (count(p), std::cmp::Reverse(p)))
+            .unwrap()
     }
 
     /// The patch owning the most of `faces`, the lowest ID on ties.
@@ -407,60 +659,25 @@ impl Sim {
                 break;
             }
 
-            // Prepare: each patch's highest-priority flips, vertex-disjoint,
-            // until their footprint would exceed the cap.
+            // Group the pending flips by the patch that would make them.
             let mut by_patch: HashMap<u32, Vec<(u32, Quad)>> = HashMap::new();
             for (e, q) in pending {
-                let actor = if self.majority {
-                    self.majority_owner(&self.cavity_faces(&q.corners))
-                } else {
-                    self.owner[EDGE][e as usize]
+                let actor = match self.actor {
+                    Actor::Edge => self.owner[EDGE][e as usize],
+                    Actor::Majority => self.majority_owner(&self.cavity_faces(&q.corners)),
+                    Actor::Corners => self.corner_majority(q.corners),
+                    Actor::Endpoint => self.endpoint_owner(q.corners),
+                    Actor::Local => self.local_plurality(q.corners),
+                    Actor::Stars => self.star_leaders(q.corners),
                 };
                 by_patch.entry(actor).or_default().push((e, q));
             }
-            let mut plans = Vec::new();
-            for (p, cands) in by_patch {
-                let mut used = HashSet::new();
-                let (mut faces, mut fp, mut flips) =
-                    (BTreeSet::new(), BTreeSet::from([p]), Vec::new());
-                for (e, q) in cands {
-                    if q.corners.iter().any(|v| used.contains(v)) {
-                        continue;
-                    }
-                    let mine = self.cavity_faces(&q.corners);
-                    let union: BTreeSet<u32> = fp.union(&self.footprint(&mine)).copied().collect();
-                    if !flips.is_empty() && union.len() > max_footprint {
-                        break;
-                    }
-                    used.extend(q.corners);
-                    faces.extend(mine);
-                    fp = union;
-                    flips.push((e, q));
-                }
-                stats.batch_footprints.push(fp.len());
-                stats.batch_cavities.push(flips.len());
-                plans.push((p, faces, fp, flips));
-            }
-
-            // Bid: one priority per patch and round on every footprint patch.
             let round_seed = seed ^ (round as u32 + 1).wrapping_mul(0x9e37_79b9);
-            let mut best = vec![0u32; self.patch_count()];
-            for (p, _, fp, _) in &plans {
-                for &q in fp {
-                    best[q as usize] = best[q as usize].max(priority(*p, round_seed));
-                }
-            }
-            let winners: Vec<_> = plans
-                .into_iter()
-                .filter(|(p, _, fp, _)| {
-                    fp.iter()
-                        .all(|&q| best[q as usize] == priority(*p, round_seed))
-                })
-                .collect();
-            stats
-                .contenders
-                .push(best.iter().filter(|&&b| b != 0).count());
-            stats.winners.push(winners.len());
+            let winners = if self.relay {
+                self.relay_winners(by_patch, seed, round_seed, stats)
+            } else {
+                self.batch_winners(by_patch, max_footprint, round_seed, stats)
+            };
 
             // Act, then clean up every footprint patch.
             let mut dirty = BTreeSet::new();
