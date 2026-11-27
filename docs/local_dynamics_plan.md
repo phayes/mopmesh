@@ -176,7 +176,30 @@ Rust. So edit logic lives in public, value-based modules under `shaders/`
 (`topology/flip.wesl` for the flip). Runtime kernels and Rust wrappers are
 thin layers over those modules.
 
-Open decision: the commit step (writing the arena and masks) can't yet be a
+Decided (user, 26 November 2026): **value-based commit.** The library
+returns the words to write, and the consumer's kernel stores them itself.
+Concretely, `flip.wesl` will offer a function that takes the decoded patch
+record (from `topology/patch.wesl`), the flip's quad and its old and new
+slots. It returns a fixed-size list of arena writes, each an offset and a
+value, plus a list of mask updates (offset, bits, and whether to set or
+clear them). A consumer applies them with plain stores and
+`atomicOr`/`atomicAnd` on its own bindings. The runtime flip kernel becomes
+a loop over that list. Helpers for picking free slots from mask words are
+value-based too.
+
+**This API needs good documentation** (user, 26 November 2026). Applying a
+list of writes correctly is easy to get wrong, so the docs must cover:
+- a worked example kernel that tests a condition, flips, and applies the
+  writes;
+- which mask updates must be atomic, and why plain stores are safe for the
+  arena words;
+- what the caller must check first: the flip's status, slot availability,
+  and claims once flips run in parallel;
+- what happens if the writes are applied partially or twice.
+The example should run in a test, not only compile, and the docs should be
+reviewed before the step is called done.
+
+Background: the commit step (writing the arena and masks) can't yet be a
 library function. Naga 30 doesn't implement WGSL's
 `unrestricted_pointer_parameters`, so a library function can't take a
 caller's storage buffer as a parameter. Any library function that writes

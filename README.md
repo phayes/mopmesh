@@ -26,6 +26,7 @@ work, acceptance criteria and next steps, and the
 - Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
 - GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
 - GPU boundary flags, whole-attribute reductions (sum, min, max, dot) and uniform Laplacian smoothing with optional fixed vertices, plus a downstream smoothing example.
+- An editable GPU mesh with spare per-patch slots and masks, single edge flips inside a patch verified against Alum, and a value-based WESL flip API that downstream kernels can apply themselves.
 - GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
@@ -497,6 +498,89 @@ vertices, open boundaries too. Neighbors are summed in an unspecified order,
 so results may differ in the last bits between runs. Tests compare against an
 f64 host reference after up to four steps, with and without fixed boundaries.
 
+### Editing: edge flips
+
+Topology edits work on a `GpuEditableMesh`, a separate upload whose patches
+have spare slots for new edges and faces. `GpuMesh` stays read-only.
+
+```rust,ignore
+use mopmesh::gpu::{EdgeFlipQuery, EditCapacity, FlipStatus, GpuEditableMesh};
+
+// Each patch gets 1.5 times as many slots as it has elements.
+let mut editable = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default())?;
+let flips = EdgeFlipQuery::new(&device);
+let status = flips.encode(&device, &mut encoder, &mut editable, edge_id);
+// After submitting, read status.buffer() and decode it:
+// FlipStatus::from_word(word) == Some(FlipStatus::Flipped)
+```
+
+Flipping an edge shared by two triangles replaces it with the other diagonal
+of the four-sided region they form: triangles `a -> b -> c` and `b -> a -> d`
+become `a -> d -> c` and `d -> b -> c`. The flipped edge keeps its edge ID,
+and the two new faces take the two old faces' IDs, so edge and face
+attributes keep their slots. Their values are left as they were; recompute
+them if they depend on the changed connectivity. Edge IDs on an edited mesh
+no longer follow the ascending vertex-pair order of a freshly built mesh.
+
+A flip is rejected, and the mesh left exactly as it was, when:
+- the edge is on the boundary (`Boundary`);
+- any face around its four corners is owned by another patch (`NotInterior`);
+  flips across patch borders aren't supported yet;
+- the two new corners are already joined by an edge (`Connected`);
+- the two faces don't form a proper four-sided region (`Degenerate`);
+- the patch has no free edge slot or two free face slots (`OutOfCapacity`);
+- the edge ID is out of range (`NotAnEdge`).
+
+Slots freed by a flip are reused by later flips, so capacity only has to
+cover the flips in flight. Flips recorded one after another apply in order.
+Each `encode` call increases `GpuEditableMesh::version()`, even for a flip the
+GPU then rejects. Results computed before an edit are not updated; recompute
+them afterwards. Static queries don't accept a `GpuEditableMesh` yet.
+
+**Flipping from your own WESL kernel.** `topology::flip` exposes the flip as
+plain functions, so a pipeline can test its own condition and flip in the same
+dispatch, using its own bindings. Bind `GpuEditableMesh::arena()` as
+`array<u32>` (read-write) and `GpuEditableMesh::masks()` as
+`array<atomic<u32>>`, decode records with `topology::patch`, then:
+
+1. Look up the edge's patch and local slot in the edge owner table
+   (`owner_offset(arena[OWNERS_WORD + EDGE], edge)`), and decode that patch's
+   record.
+2. Find the edge's two active faces in that patch and call `flip_quad`.
+   Continue only if its `status` is `FLIP_DONE`.
+3. Apply your own condition, for example "the new edge is shorter".
+4. Check the library's preconditions: all four corners set in the patch's
+   interior mask, no active edge already joining `c` and `d`, and one free edge
+   slot and two free face slots (`free_bit` on active-mask words, below the
+   record's capacity).
+5. Call `flip_writes` and apply every entry: store each `ArenaWrite`, and
+   apply each `MaskUpdate` with `atomicOr` (`MASK_SET`), `atomicAnd` of the
+   complement (`MASK_CLEAR`) or `atomicMax` (`MASK_MAX`).
+
+Rules for step 5:
+- **All or nothing.** Nothing on the GPU checks the list, so do every check
+  before the first write. A partial commit leaves the patch inconsistent.
+- **Once only.** Applying a list twice corrupts the patch.
+- **Order doesn't matter.** No two entries touch the same word.
+- **Arena writes can be plain stores, but mask updates must be atomic.** A
+  flip writes only its own slots, while several slots share each mask word.
+- **One flip per patch per dispatch, for now.** Two concurrent flips in one
+  patch could share a corner or pick the same free slot. A claim step that
+  makes this safe is planned.
+
+[`runtime_shaders/edge_flip.wesl`](runtime_shaders/edge_flip.wesl) is the
+library's own kernel, written this way. The downstream example
+[`tests/shaders/flip_consumer.wesl`](tests/shaders/flip_consumer.wesl) adds a
+shorter-diagonal rule, and its test checks that it edits the mesh word for word
+like `EdgeFlipQuery`.
+
+The editable arena is one `u32` buffer: a header, a 16-word record per patch,
+owner tables mapping each global ID to its owning patch and local slot, and
+per-patch rows sized by capacity, with `INVALID_ID` in unused slots. The mask
+buffer holds per-patch active, owned and interior bitmasks and used-slot
+counts. `GpuEditableMesh::arena` and `masks` document the word layout. It is
+experimental and may change.
+
 ## Validation coverage
 
 GPU reference tests cover 128-face and 8,192-face grids, a grid with a hole,
@@ -548,7 +632,9 @@ self-intersections are not checked.
 Handles are mesh-relative addresses and must not be used with another mesh.
 Future migration and slot reuse invalidate them. Vertex attributes verify mesh
 identity and share canonical values across ribbons, as do edge and face
-attributes. Active masks, edit capacities, and dynamic edits remain future work.
+attributes. Edits are limited to single edge flips inside one patch on a
+`GpuEditableMesh`; parallel flips, cross-patch edits, splits and collapses
+remain future work.
 GPU topology queries currently access storage buffers directly; the scan uses
 workgroup scratch, but topology is not yet staged in workgroup memory. Query
 objects reuse pipelines while encode calls allocate fresh output/scratch

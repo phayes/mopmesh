@@ -1,19 +1,20 @@
+import package::shaders::topology::patch::{
+    PatchRecord, VERTEX, EDGE, FACE, VERTEX_COUNT_WORD, RECORDS_WORD, OWNERS_WORD,
+    record_offset, decode_record, owner_offset, used_offset, mask_word, mask_test,
+    face_edge_offset, edge_vertices_offset, global_face_offset,
+};
 import package::shaders::topology::flip::{
-    FaceEdges, FlipQuad, flip_quad, flipped_faces,
+    FaceEdges, FlipSlots, flip_quad, flip_writes, free_bit,
+    MASK_SET, MASK_CLEAR, FLIP_ARENA_WRITES, FLIP_MASK_UPDATES,
     FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR, FLIP_CONNECTED,
     FLIP_OUT_OF_CAPACITY, FLIP_NOT_AN_EDGE,
 };
 
 // Flips one edge of an editable mesh, or leaves the mesh untouched and
-// reports why not. Must match the layout in src/gpu/editable.rs.
+// reports why not. This kernel only uses the public topology::patch and
+// topology::flip modules, the same way a downstream kernel would.
 
 const INVALID: u32 = 0xffffffffu;
-// Header word positions.
-const EDGE_COUNT: u32 = 1u;
-const RECORDS: u32 = 4u;
-const EDGE_OWNERS: u32 = 6u;
-const FACE_OWNERS: u32 = 7u;
-const RECORD_WORDS: u32 = 16u;
 
 struct Params { edge: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 @group(0) @binding(0) var<uniform> params: Params;
@@ -21,81 +22,43 @@ struct Params { edge: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 @group(0) @binding(2) var<storage, read_write> masks: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> status: array<u32>;
 
-// One patch record, read word by word. Index 0, 1, 2 is vertex, edge, face.
-struct Record {
-    capacity: array<u32, 3>,
-    vertex_ids: u32,
-    ev: u32,
-    fe: u32,
-    edge_ids: u32,
-    face_ids: u32,
-    active_mask: array<u32, 3>,
-    owned_mask: array<u32, 3>,
-    interior: u32,
-    used: u32,
+fn record(patch_id: u32) -> PatchRecord {
+    let at = record_offset(arena[RECORDS_WORD], patch_id);
+    var words: array<u32, 16>;
+    for (var i = 0u; i < 16u; i++) { words[i] = arena[at + i]; }
+    return decode_record(words);
 }
-
-fn record(patch_id: u32) -> Record {
-    let at = arena[RECORDS] + RECORD_WORDS * patch_id;
-    var r: Record;
-    for (var k = 0u; k < 3u; k++) {
-        r.capacity[k] = arena[at + k];
-        r.active_mask[k] = arena[at + 8u + k];
-        r.owned_mask[k] = arena[at + 11u + k];
+fn bit(mask: u32, slot: u32) -> bool {
+    return mask_test(atomicLoad(&masks[mask_word(mask, slot)]), slot);
+}
+fn face_edges(r: PatchRecord, slot: u32) -> FaceEdges {
+    var face: FaceEdges;
+    for (var i = 0u; i < 3u; i++) {
+        let at = face_edge_offset(r, slot, i);
+        face.edges[i] = arena[at];
+        face.reversed[i] = arena[at + 1u];
     }
-    r.vertex_ids = arena[at + 3u];
-    r.ev = arena[at + 4u];
-    r.fe = arena[at + 5u];
-    r.edge_ids = arena[at + 6u];
-    r.face_ids = arena[at + 7u];
-    r.interior = arena[at + 14u];
-    r.used = arena[at + 15u];
-    return r;
+    return face;
 }
-
-fn bit(offset: u32, slot: u32) -> bool {
-    return (atomicLoad(&masks[offset + slot / 32u]) & (1u << (slot % 32u))) != 0u;
-}
-fn set_bit(offset: u32, slot: u32) {
-    atomicOr(&masks[offset + slot / 32u], 1u << (slot % 32u));
-}
-fn clear_bit(offset: u32, slot: u32) {
-    atomicAnd(&masks[offset + slot / 32u], ~(1u << (slot % 32u)));
-}
-fn used(r: Record, kind: u32) -> u32 {
-    return atomicLoad(&masks[r.used + kind]);
-}
-
-fn face_edges(r: Record, slot: u32) -> FaceEdges {
-    let at = r.fe + 6u * slot;
-    return FaceEdges(
-        vec3(arena[at], arena[at + 2u], arena[at + 4u]),
-        vec3(arena[at + 1u], arena[at + 3u], arena[at + 5u]),
-    );
-}
-fn edge_vertices(r: Record, slot: u32) -> vec2<u32> {
-    let at = r.ev + 2u * slot;
+fn edge_vertices(r: PatchRecord, slot: u32) -> vec2<u32> {
+    let at = edge_vertices_offset(r, slot);
     return vec2(arena[at], arena[at + 1u]);
 }
-fn face_edge_vertices(r: Record, face: FaceEdges) -> array<vec2<u32>, 3> {
+fn face_edge_vertices(r: PatchRecord, face: FaceEdges) -> array<vec2<u32>, 3> {
     return array(
         edge_vertices(r, face.edges.x),
         edge_vertices(r, face.edges.y),
         edge_vertices(r, face.edges.z),
     );
 }
-fn write_face(r: Record, slot: u32, face: FaceEdges) {
-    let at = r.fe + 6u * slot;
-    for (var i = 0u; i < 3u; i++) {
-        arena[at + 2u * i] = face.edges[i];
-        arena[at + 2u * i + 1u] = face.reversed[i];
-    }
-}
-
-// Returns the first inactive slot of `kind` that isn't `skip`, or INVALID.
-fn free_slot(r: Record, kind: u32, skip: u32) -> u32 {
-    for (var slot = 0u; slot < r.capacity[kind]; slot++) {
-        if (slot != skip && !bit(r.active_mask[kind], slot)) { return slot; }
+// Returns the lowest inactive slot of `kind` other than `skip`, or INVALID.
+fn free_slot(r: PatchRecord, kind: u32, skip: u32) -> u32 {
+    let capacity = r.capacity[kind];
+    for (var base = 0u; base < capacity; base += 32u) {
+        var word = atomicLoad(&masks[mask_word(r.active_masks[kind], base)]);
+        if (skip != INVALID && skip / 32u == base / 32u) { word |= 1u << (skip % 32u); }
+        let slot = base + free_bit(word);
+        if (slot < min(capacity, base + 32u)) { return slot; }
     }
     return INVALID;
 }
@@ -106,87 +69,70 @@ fn main() {
 }
 
 fn flip(global_edge: u32) -> u32 {
-    if (global_edge >= arena[EDGE_COUNT]) { return FLIP_NOT_AN_EDGE; }
+    if (global_edge >= arena[VERTEX_COUNT_WORD + EDGE]) { return FLIP_NOT_AN_EDGE; }
 
-    // Find the edge's owning patch and the two active faces on it there.
-    let owner = arena[EDGE_OWNERS] + 2u * global_edge;
-    let patch_id = arena[owner];
+    // 1. The edge's owning patch and local slot.
+    let edge_owners = arena[OWNERS_WORD + EDGE];
+    let face_owners = arena[OWNERS_WORD + FACE];
+    let owner = owner_offset(edge_owners, global_edge);
+    let r = record(arena[owner]);
     let edge = arena[owner + 1u];
-    let r = record(patch_id);
+
+    // 2. The two active faces on the edge, and the region they form.
     var faces = array(INVALID, INVALID);
     var found = 0u;
-    for (var f = 0u; f < used(r, 2u); f++) {
-        if (bit(r.active_mask[2], f) && any(face_edges(r, f).edges == vec3(edge))) {
+    let used_faces = atomicLoad(&masks[used_offset(r, FACE)]);
+    for (var f = 0u; f < used_faces; f++) {
+        if (bit(r.active_masks[FACE], f) && any(face_edges(r, f).edges == vec3(edge))) {
             if (found < 2u) { faces[found] = f; }
             found++;
         }
     }
     if (found < 2u) { return FLIP_BOUNDARY; }
-
-    // Find the four corners, then check that the flip stays inside this patch
-    // and wouldn't duplicate an edge.
     let first = face_edges(r, faces[0]);
     let second = face_edges(r, faces[1]);
     let quad = flip_quad(edge, first, face_edge_vertices(r, first), second, face_edge_vertices(r, second));
     if (quad.status != FLIP_DONE) { return quad.status; }
+
+    // 3. All four corners interior to this patch, and c-d not already an edge.
     let corners = array(quad.a, quad.b, quad.c, quad.d);
     for (var i = 0u; i < 4u; i++) {
-        if (!bit(r.interior, corners[i])) { return FLIP_NOT_INTERIOR; }
+        if (!bit(r.interior_mask, corners[i])) { return FLIP_NOT_INTERIOR; }
     }
-    for (var e = 0u; e < used(r, 1u); e++) {
+    let used_edges = atomicLoad(&masks[used_offset(r, EDGE)]);
+    for (var e = 0u; e < used_edges; e++) {
         let v = edge_vertices(r, e);
-        if (bit(r.active_mask[1], e) && ((v.x == quad.c && v.y == quad.d) || (v.x == quad.d && v.y == quad.c))) {
-            return FLIP_CONNECTED;
-        }
+        let joins = (v.x == quad.c && v.y == quad.d) || (v.x == quad.d && v.y == quad.c);
+        if (joins && bit(r.active_masks[EDGE], e)) { return FLIP_CONNECTED; }
     }
 
-    // Pick free slots for the new edge and faces. Slots freed by this flip
-    // aren't reused until a later flip.
-    let new_edge = free_slot(r, 1u, INVALID);
-    let new_first = free_slot(r, 2u, INVALID);
-    let new_second = free_slot(r, 2u, new_first);
+    // 4. Free slots for the new edge and faces.
+    let new_edge = free_slot(r, EDGE, INVALID);
+    let new_first = free_slot(r, FACE, INVALID);
+    let new_second = free_slot(r, FACE, new_first);
     if (new_edge == INVALID || new_first == INVALID || new_second == INVALID) {
         return FLIP_OUT_OF_CAPACITY;
     }
 
-    // Commit. Nothing above wrote to the mesh.
-    let global_first = arena[r.face_ids + faces[0]];
-    let global_second = arena[r.face_ids + faces[1]];
-    let new_faces = flipped_faces(quad, first, second, new_edge);
-
-    // Remove the old edge and faces.
-    arena[r.ev + 2u * edge] = INVALID;
-    arena[r.ev + 2u * edge + 1u] = INVALID;
-    arena[r.edge_ids + edge] = INVALID;
-    clear_bit(r.active_mask[1], edge);
-    clear_bit(r.owned_mask[1], edge);
-    for (var i = 0u; i < 2u; i++) {
-        write_face(r, faces[i], FaceEdges(vec3(INVALID), vec3(INVALID)));
-        arena[r.face_ids + faces[i]] = INVALID;
-        clear_bit(r.active_mask[2], faces[i]);
-        clear_bit(r.owned_mask[2], faces[i]);
+    // 5. Commit: apply every write. Nothing above wrote to the mesh.
+    let slots = FlipSlots(
+        edge, faces[0], faces[1], new_edge, new_first, new_second, global_edge,
+        arena[global_face_offset(r, faces[0])], arena[global_face_offset(r, faces[1])],
+    );
+    let writes = flip_writes(r, edge_owners, face_owners, quad, first, second, slots);
+    for (var i = 0u; i < FLIP_ARENA_WRITES; i++) {
+        let w = writes.arena[i];
+        arena[w.offset] = w.value;
     }
-
-    // Add the new edge c-d with the old edge's global ID.
-    arena[r.ev + 2u * new_edge] = quad.c;
-    arena[r.ev + 2u * new_edge + 1u] = quad.d;
-    arena[r.edge_ids + new_edge] = global_edge;
-    arena[owner + 1u] = new_edge;
-    set_bit(r.active_mask[1], new_edge);
-    set_bit(r.owned_mask[1], new_edge);
-    atomicMax(&masks[r.used + 1u], new_edge + 1u);
-
-    // Add the new faces with the old faces' global IDs.
-    let slots = array(new_first, new_second);
-    let globals = array(global_first, global_second);
-    for (var i = 0u; i < 2u; i++) {
-        write_face(r, slots[i], new_faces[i]);
-        arena[r.face_ids + slots[i]] = globals[i];
-        let face_owner = arena[FACE_OWNERS] + 2u * globals[i];
-        arena[face_owner + 1u] = slots[i];
-        set_bit(r.active_mask[2], slots[i]);
-        set_bit(r.owned_mask[2], slots[i]);
-        atomicMax(&masks[r.used + 2u], slots[i] + 1u);
+    for (var i = 0u; i < FLIP_MASK_UPDATES; i++) {
+        let m = writes.masks[i];
+        if (m.op == MASK_SET) {
+            atomicOr(&masks[m.offset], m.bits);
+        } else if (m.op == MASK_CLEAR) {
+            atomicAnd(&masks[m.offset], ~m.bits);
+        } else {
+            atomicMax(&masks[m.offset], m.bits);
+        }
     }
     return FLIP_DONE;
 }
