@@ -134,23 +134,26 @@ overhead and query times against today's breadth-first patches.
 
 ## API shape
 
-Proposed; to be confirmed before step 7 below:
+As implemented in step 7 (agreed 2026-11-26):
 
 ```rust
-// Records a GPU build. Inputs are caller-owned buffers of [f32; 4] positions and
-// [u32; 4] triangles (fourth lane ignored, so WGSL vec4 layout works).
-let pending = GpuMeshBuilder::new(&device)
-    .patch_size(128)
-    .encode(&device, &mut encoder, &positions, &triangles, vertex_count, face_count)?;
-queue.submit([encoder.finish()]);
-// Reads back the error buffer; Ok gives a GpuMesh identical to GpuMesh::upload.
-let gpu_mesh: GpuMesh = pending.finish(&device)?;
+// Cached per device; compiles the build shaders once.
+let builder = GpuMeshBuilder::new(&device).patch_size(128);
+// Caller-owned STORAGE buffers of [f32; 4] positions and [u32; 4] triangles.
+let input = GpuMeshInput { positions: &p, triangles: &t, vertex_count, face_count };
+// Submits both phases itself; blocks only on the phase-1 summary readback.
+let gpu_mesh: GpuMesh = builder.build(&device, &queue, &input)?;
+let positions = GpuVertexAttribute::<[f32; 4]>::from_buffer(&gpu_mesh, &p)?;
 ```
 
 - `GpuMesh` already contains no CPU connectivity, so queries don't change.
-- A GPU-built mesh has no CPU `Mesh`, so `MeshId` must be created by the GPU
-  build itself; vertex attributes then need a constructor that takes a
-  `GpuMesh` instead of a `Mesh`.
+- The build creates its own `MeshId`. Attributes come from
+  `GpuAttribute::from_buffer` (wraps a buffer, no copy) or
+  `GpuAttribute::new` (uploads a slice).
+- Errors: `GpuBuildError { Input(BuildError), Gpu(GpuError), Device(String) }`.
+  Undersized or non-`STORAGE` buffers give `GpuError::InvalidBuffer`; patch
+  size 0 and more than `u32::MAX / 3` faces give the CPU's `BuildError`s.
+- The split is always Morton; input order stays crate-internal.
 - Optional later: `GpuMesh::read_back(&device) -> Mesh`, for callers who need
   CPU patches or handles.
 
@@ -245,6 +248,12 @@ let gpu_mesh: GpuMesh = pending.finish(&device)?;
    64 workgroups per dimension.
 7. **Public API + docs + benchmark.** Add the GPU build row to
    `examples/bench_alum.rs` and the approximate benchmark doc.
+   **Done:** `GpuMeshBuilder`, `GpuMeshInput` and `GpuBuildError` in
+   `src/gpu/build.rs`, shaped as in [API shape](#api-shape). Every query in
+   `tests/gpu_topology.rs` now runs against Alum on GPU-built meshes too, with
+   edge IDs checked against ascending pair order. A second test checks the
+   public errors against `MeshBuilder` on every invalid fixture.
+   `bench_alum` has a "build (GPU, + input)" row.
 
 Follow-ups and to-dos from this work are tracked in the
 [ROADMAP](../ROADMAP.md#gpu-construction-follow-ups).
@@ -259,9 +268,9 @@ Follow-ups and to-dos from this work are tracked in the
 - **Memory.** Temporary buffers (corner records, sort scratch) are several
   times the arena size. On devices with a 128 MB binding limit, the largest
   mesh a GPU build can handle may be smaller than what the CPU path can upload.
-- **Readback latency.** `finish` blocks on the GPU to learn whether the input
+- **Readback latency.** `build` blocks on the GPU to learn whether the input
   was valid. Callers who trust their input may want a no-validation option
-  later.
+  later (tracked in the ROADMAP).
 
 ## Decisions (agreed 2026-11-26)
 
@@ -300,5 +309,5 @@ Follow-ups and to-dos from this work are tracked in the
    device. Order within a patch and task order become unspecified in the
    documented API.
 
-Steps 0–6 are done (option B deferred). Next: speed up the patch-contents
-and arena stages, then step 7 (public API).
+Steps 0–7 are done (option B deferred). Remaining work is tracked in the
+[ROADMAP](../ROADMAP.md#gpu-construction-follow-ups).

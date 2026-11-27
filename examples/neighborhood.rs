@@ -2,7 +2,7 @@
 #[path = "support/neighborhood.rs"]
 mod neighborhood;
 use mopmesh::{
-    MeshBuilder,
+    MeshBuilder, VertexAttribute,
     gpu::{AdjacencyQuery, GpuMesh},
 };
 
@@ -24,10 +24,10 @@ async fn run() {
         .unwrap();
     let gpu = GpuMesh::upload(&device, &mesh).unwrap();
     let positions = gpu
-        .upload_vertex_attribute(&device, &mesh.position_attribute())
+        .upload_attribute(&device, &mesh.position_attribute())
         .unwrap();
     let weights = gpu
-        .upload_vertex_attribute(&device, &mesh.vertex_attribute(1f32))
+        .upload_attribute(&device, &VertexAttribute::new(&mesh, 1f32))
         .unwrap();
     let query = AdjacencyQuery::new(&device);
     let operator = neighborhood::NeighborhoodOperator::new(&device);

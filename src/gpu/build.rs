@@ -68,9 +68,9 @@ impl GpuMeshBuilder {
     /// too small or lacks `STORAGE` usage or the mesh exceeds device limits, or
     /// [`GpuBuildError::Device`] if waiting for the GPU fails.
     ///
-    /// The new mesh has its own [`MeshId`] and no CPU attributes. Create vertex
-    /// attributes for it with [`GpuMesh::vertex_attribute_from_buffer`], for
-    /// example from `input.positions`, or [`GpuMesh::create_vertex_attribute`].
+    /// The new mesh has its own [`MeshId`] and no CPU attributes. Create
+    /// attributes for it with [`GpuAttribute::from_buffer`](super::GpuAttribute::from_buffer),
+    /// for example from `input.positions`, or [`GpuAttribute::new`](super::GpuAttribute::new).
     pub fn build(
         &self,
         device: &wgpu::Device,

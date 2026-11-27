@@ -1,6 +1,6 @@
 #[test]
 fn downstream_shader_can_link_packaged_library() {
-    for name in ["consumer", "scan_consumer"] {
+    for name in ["consumer", "scan_consumer", "geometry_consumer"] {
         validate(&compile_consumer(name));
     }
     for name in ["weighted_boundary", "neighborhood"] {
@@ -64,6 +64,14 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         env!("OUT_DIR"),
         "/face_vertices.wgsl"
     )));
+    for wgsl in [
+        include_str!(concat!(env!("OUT_DIR"), "/face_normals.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/face_areas.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/vertex_normals.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/boundary.wgsl")),
+    ] {
+        validate(wgsl);
+    }
     validate(include_str!(concat!(env!("OUT_DIR"), "/vertex_faces.wgsl")));
     validate(include_str!(concat!(
         env!("OUT_DIR"),

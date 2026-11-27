@@ -1,5 +1,5 @@
 use alum::{Handle, HasIterators, HasTopology, PolyMeshF32, Vec3};
-use mopmesh::{BuildError, EdgeHandle, FaceHandle, MeshBuilder, VertexHandle};
+use mopmesh::{BuildError, EdgeHandle, FaceHandle, MeshBuilder, VertexAttribute, VertexHandle};
 use std::collections::BTreeSet;
 
 fn check_against_alum(positions: &[[f32; 3]], triangles: &[[u32; 3]]) {
@@ -227,7 +227,7 @@ fn ribbon_attributes_share_canonical_values() {
             .unwrap()
     };
     let mesh = build();
-    let mut attr = mesh.vertex_attribute(0u32);
+    let mut attr = VertexAttribute::new(&mesh, 0u32);
     let ribbon = VertexHandle { patch: 1, local: 0 };
     let owner = mesh.vertex_owner(ribbon).unwrap();
     assert_ne!(ribbon, owner);
@@ -239,7 +239,7 @@ fn ribbon_attributes_share_canonical_values() {
     assert_eq!(attr.mesh_id(), mesh.id());
 
     // Per-vertex construction uses input vertex order and requires one value each.
-    let ramp = mesh.vertex_attribute_from(vec![10u32, 11, 12, 13]).unwrap();
+    let ramp = VertexAttribute::from_values(&mesh, vec![10u32, 11, 12, 13]).unwrap();
     assert_eq!(ramp.as_slice(), [10, 11, 12, 13]);
     assert_eq!(ramp.len(), 4);
     assert!(!ramp.is_empty());
@@ -252,8 +252,8 @@ fn ribbon_attributes_share_canonical_values() {
             assert_eq!(ramp.get(&mesh, h), Some(&(10 + global)));
         }
     }
-    assert!(mesh.vertex_attribute_from(vec![0u32; 3]).is_none());
-    assert!(mesh.vertex_attribute_from(vec![0u32; 5]).is_none());
+    assert!(VertexAttribute::from_values(&mesh, vec![0u32; 3]).is_none());
+    assert!(VertexAttribute::from_values(&mesh, vec![0u32; 5]).is_none());
     assert_eq!(
         mesh.vertex_owner(VertexHandle {
             patch: u32::MAX,

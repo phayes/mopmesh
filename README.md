@@ -15,7 +15,7 @@ work, acceptance criteria and next steps, and the
 
 - Validated host construction for oriented manifold triangle meshes, including boundaries.
 - Deterministic breadth-first face partitioning, local EV/FE connectivity, vertex-star ribbons, and explicit canonical ownership.
-- Patch/local vertex, edge, and face handles; typed canonical vertex attributes.
+- Patch/local vertex, edge, and face handles; typed canonical vertex, edge and face attributes.
 - Alum-backed reference tests for connectivity and ownership across multiple patch sizes.
 - A reusable WESL package with handle types, topology/geometry helpers and a scan collective, tested through downstream consumers.
 - A scalar connectivity arena, wgpu upload, and a GPU face-to-vertex query verified against Alum.
@@ -23,7 +23,9 @@ work, acceptance criteria and next steps, and the
 - GPU edge endpoints and incident faces, plus a downstream weighted-boundary operator verified against Alum.
 - GPU vertex-edge/vertex-neighbor, face-neighbor and edge-diamond adjacency, plus a downstream neighborhood operator verified against Alum.
 - A hierarchical GPU prefix scan and an importable 64-lane WESL scan collective.
-- Typed canonical GPU vertex attributes with explicit updates, and GPU face centroids verified against Alum.
+- Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
+- GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
+- GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
 OpenMesh is retained as an optional secondary reference and prior art.
@@ -185,12 +187,54 @@ meshes dispatch no work and return a four-byte placeholder; `face_count()` gives
 the logical record count. The query uses baseline compute limits: two storage
 bindings and 64 invocations per workgroup.
 
+### Building on the GPU
+
+When positions and triangles are already on the GPU, build the mesh there
+instead of with `MeshBuilder`:
+
+```rust,ignore
+use mopmesh::gpu::{GpuMeshBuilder, GpuMeshInput};
+
+let builder = GpuMeshBuilder::new(&device).patch_size(128); // Cache once per device.
+let input = GpuMeshInput {
+    positions: &positions,  // STORAGE buffer of [f32; 4], fourth lane ignored
+    triangles: &triangles,  // STORAGE buffer of [u32; 4], fourth lane ignored
+    vertex_count,
+    face_count,
+};
+let gpu_mesh = builder.build(&device, &queue, &input)?;
+let positions = GpuVertexAttribute::<[f32; 4]>::from_buffer(&gpu_mesh, &positions)?;
+```
+
+`build` submits its own work. It blocks until the input has been validated,
+then submits the rest without waiting. It rejects exactly what `MeshBuilder`
+rejects, returning `GpuBuildError::Input` with the same `BuildError`.
+`GpuBuildError::Gpu` covers undersized buffers, missing `STORAGE` usage and
+device limits, and `GpuBuildError::Device` covers a failed wait. Each buffer
+must hold at least 16 bytes, even for an empty mesh.
+
+The result is an ordinary `GpuMesh` with its own `MeshId` and no CPU `Mesh`.
+Global vertex, face and edge IDs match a CPU build of the same input. Patches
+come from a Morton-order split, so ownership and order within patches differ
+from `GpuMesh::upload`. Create its attributes on the GPU:
+
+- `GpuAttribute::from_buffer(&gpu_mesh, &buffer)` wraps an existing buffer
+  without copying it.
+- `GpuAttribute::new(&device, &gpu_mesh, &values)` uploads one value per
+  vertex, edge or face.
+
+Replace an attribute's values with `GpuAttribute::write_values`; `write` takes
+a host attribute, which only CPU meshes have.
+
 ### Shared contracts
 
 - **Errors.** Uploads and queries return `GpuError`. `LimitsExceeded { resource }`
   means a buffer, u32 index range or dispatch would exceed u32 addressing or the
   device limits; `resource` names it. `MeshMismatch` means typed inputs came from
-  different meshes. On error nothing has been allocated or recorded.
+  different meshes. `InvalidBuffer { resource }` means a buffer or slice you
+  passed in is too small, has the wrong length, or lacks a required usage.
+  On error nothing has been allocated or recorded. The GPU build wraps these
+  in `GpuBuildError`.
 - **Mesh identity.** `Mesh::id()` returns a `MeshId`. Host and GPU attributes,
   `GpuMesh` and every query result report it through `mesh_id()`. Separately
   built meshes never share an ID, even with identical input. Built-in queries
@@ -317,13 +361,13 @@ scan level; no host readback or serial per-vertex prefix loop is needed. This
 implementation has correctness coverage but has not been performance-tuned.
 The transpose is global rather than staged per patch.
 
-### Vertex attributes and face centroids
+### Attributes and geometry queries
 
 ```rust,ignore
 use mopmesh::gpu::FaceCentroidQuery;
 
 let mut host_positions = mesh.position_attribute(); // [x, y, z, 0]
-let mut positions = gpu_mesh.upload_vertex_attribute(&device, &host_positions)?;
+let mut positions = gpu_mesh.upload_attribute(&device, &host_positions)?;
 let query = FaceCentroidQuery::new(&device);
 let mut encoder = device.create_command_encoder(&Default::default());
 let centroids = query.encode(&device, &mut encoder, &gpu_mesh, &positions)?;
@@ -333,19 +377,36 @@ queue.submit([encoder.finish()]);
 positions.write(&queue, &host_positions)?;
 
 // Per-vertex application data, in input vertex order:
-let weights = mesh.vertex_attribute_from(vec![1.0f32; mesh.positions().len()]).unwrap();
-let weights = gpu_mesh.upload_vertex_attribute(&device, &weights)?;
+let weights = VertexAttribute::from_values(&mesh, vec![1.0f32; mesh.positions().len()]).unwrap();
+let weights = gpu_mesh.upload_attribute(&device, &weights)?;
+
+// Per-face and per-edge data work the same way:
+let labels = FaceAttribute::new(&mesh, 0u32);
+let labels = gpu_mesh.upload_attribute(&device, &labels)?;
 ```
 
-Host attributes come from `Mesh::vertex_attribute(value)`,
-`Mesh::position_attribute()` or `Mesh::vertex_attribute_from(values)`, which
-returns `None` unless there is exactly one value per input vertex.
-`VertexAttribute::as_slice()` exposes the values in input vertex order.
-GPU attributes store one value per original input vertex. Resolve patch-local
-vertices through the arena's global vertex-ID table; ribbon references share
-the same canonical slot. Uploads, updates, and centroid queries reject attributes
-from another mesh, even if the meshes have identical topology. The buffer is
-exposed for downstream shaders and has STORAGE, COPY_SRC, and COPY_DST usage.
+`Attribute<E, T>` holds one value per element of kind `E`, which is a handle
+type: `VertexAttribute<T>`, `EdgeAttribute<T>` and `FaceAttribute<T>` are
+aliases for `Attribute<VertexHandle, T>`, `Attribute<EdgeHandle, T>` and
+`Attribute<FaceHandle, T>`. Values are in canonical order: input order for
+vertices and faces, canonical edge ID order for edges. Create one with
+`Attribute::new(&mesh, value)` or `Attribute::from_values(&mesh, values)`,
+which returns `None` unless there is exactly one value per element;
+`Mesh::position_attribute()` gives the positions as vec4 values. `get` and
+`get_mut` take a handle; every ribbon copy of an element reads and writes the
+same value.
+
+`GpuAttribute<E, T>` (aliases `GpuVertexAttribute`, `GpuEdgeAttribute`,
+`GpuFaceAttribute`) stores the same canonical order on the GPU. Create one
+with `GpuMesh::upload_attribute`, with `GpuAttribute::new(&device, &gpu_mesh,
+&values)` (for meshes built with `GpuMeshBuilder`, which have no host
+attributes), or around an existing buffer with `GpuAttribute::from_buffer`.
+Replace its contents with `write(&queue, &host_attribute)` or
+`write_values(&queue, &values)`. Uploads, updates, and queries reject
+attributes from another mesh, even if the meshes have identical topology.
+Buffers this crate creates have STORAGE, COPY_SRC, and COPY_DST usage.
+Query results such as centroids and normals are GPU attributes too, so they
+can be passed straight to later queries.
 
 Supported element types are `f32`, `u32`, `i32`, and arrays of two or four of
 those scalars, matching WGSL scalar/vec2/vec4 storage-array strides. Three-element
@@ -358,11 +419,26 @@ writes also affect commands already encoded but not submitted. Updating a
 position attribute does not change `Mesh::positions()` or revalidate geometry.
 GPU writes are not automatically copied back to host attributes.
 
-The `FaceCentroids` result contains one `vec4<f32>` per original face ID, with
-centroid xyz and zero w; input w lanes are ignored. Empty meshes return a zero
-vec4 placeholder without dispatch. The query uses three storage bindings and the
-existing FV evaluation. Finite, reasonably scaled f32 positions are expected;
+Geometry queries read a `GpuVertexAttribute<[f32; 4]>` of positions (the w
+lane is ignored) and return GPU attributes:
+
+| Query | Result | Value |
+|---|---|---|
+| `FaceCentroidQuery` | `GpuFaceAttribute<[f32; 4]>` | average of the three corners, `[x, y, z, 0]` |
+| `FaceNormalQuery` | `GpuFaceAttribute<[f32; 4]>` | unit normal, `[x, y, z, 0]`; corners appear counter-clockwise from the side it points to |
+| `FaceAreaQuery` | `GpuFaceAttribute<f32>` | triangle area, never negative |
+| `VertexNormalQuery` | `GpuVertexAttribute<[f32; 4]>` | normalized sum of the incident faces' normals, each scaled by twice its face's area, `[x, y, z, 0]` |
+
+Faces with zero area (collinear corners) get a zero normal and zero area,
+not NaN, and add nothing to vertex normals. A vertex whose weighted face
+normals cancel gets a zero normal. Vertex normals sum each vertex's faces in
+an unspecified order, so they may differ in the last bits between runs.
+Results are checked against Alum (face normals and areas) and an f64
+reference (vertex normals) to 1e-5. Empty meshes return a zero placeholder
+without dispatch. Finite, reasonably scaled f32 positions are expected;
 extreme coordinates remain subject to floating-point overflow and rounding.
+The matching WESL helpers are `triangle_area_vector`, `triangle_normal`,
+`triangle_area` and `normalize_or_zero` in `mopmesh::geometry::triangle`.
 
 ## Validation coverage
 
@@ -395,8 +471,9 @@ use; they do not introduce wider GPU representations.
 
 The order of elements within a patch (its local IDs), the order of the arena's
 face and edge tasks, and which patch owns which faces are unspecified. They
-are the same on every build of the same input, but may change between
-releases. Global vertex, face and edge IDs do not depend on them.
+are the same on every build of the same input on the same device, but may
+change between releases and differ between `GpuMesh::upload` and
+`GpuMeshBuilder`. Global vertex, face and edge IDs do not depend on them.
 
 `patch_size` limits owned faces only. Ribbons include the complete face stars
 of vertices on owned faces, so high-valence vertices can cause substantial
@@ -413,8 +490,8 @@ self-intersections are not checked.
 
 Handles are mesh-relative addresses and must not be used with another mesh.
 Future migration and slot reuse invalidate them. Vertex attributes verify mesh
-identity and share canonical values across ribbons. Edge/face attributes,
-active masks, edit capacities, and dynamic edits remain future work.
+identity and share canonical values across ribbons, as do edge and face
+attributes. Active masks, edit capacities, and dynamic edits remain future work.
 GPU topology queries currently access storage buffers directly; the scan uses
 workgroup scratch, but topology is not yet staged in workgroup memory. Query
 objects reuse pipelines while encode calls allocate fresh output/scratch

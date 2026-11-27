@@ -2,13 +2,17 @@
 //!
 //! Alum is the independent test oracle. Static GPU connectivity queries are
 //! available; dynamic topology is not implemented yet.
+mod attribute;
 pub mod gpu;
 mod handle;
 mod mesh;
 mod patch;
 
+pub use attribute::{
+    Attribute, EdgeAttribute, Element, ElementKind, FaceAttribute, VertexAttribute,
+};
 pub use handle::{EdgeHandle, FaceHandle, VertexHandle};
-pub use mesh::{BuildError, Mesh, MeshBuilder, MeshId, VertexAttribute};
+pub use mesh::{BuildError, Mesh, MeshBuilder, MeshId};
 pub use patch::{DirectedEdge, Patch};
 
 // Packaged sources can be linked by downstream WESL compilers independently

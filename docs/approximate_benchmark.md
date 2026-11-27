@@ -47,9 +47,10 @@ by MOPMesh time; above 1 means MOPMesh is faster.
 
 ## GPU build
 
-The GPU build (in progress, crate-internal; see the
-[strategy](gpu_build_strategy.md)) against the CPU build plus upload, on the
-same grids. Run with:
+The GPU build (`GpuMeshBuilder`; see the [strategy](gpu_build_strategy.md))
+against the CPU build plus upload, on the same grids. `bench_alum` also
+prints it as "build (GPU, + input)". The stage breakdown and split comparison
+below come from the internal benchmark:
 
 ```sh
 MOPMESH_BENCH=1 cargo test --release --lib gpu_build_benchmark -- --ignored --nocapture
@@ -108,6 +109,10 @@ Alum builds a half-edge mesh on one CPU thread (no patches or ribbons).
 At 522 K faces: build 37.4 against 51.9 ms (1.4x), and build plus all three
 queries 47 against 109 ms (2.3x). At 32 K faces Alum is ahead: its build
 takes 3.2 ms against the GPU build's 12.2 ms (6.8 ms with input order).
+
+The public `GpuMeshBuilder` in `bench_alum`, a later run the same day (same
+machine state): 9.7 ms against Alum's 3.2 ms at 32 K faces, 39.6 against
+51.6 ms (1.3x) at 522 K, and 153 against 210 ms (1.4x) at 2.1 M.
 
 ## Takeaways
 

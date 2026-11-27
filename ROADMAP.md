@@ -13,16 +13,17 @@ contracts in the README alongside the code.
 
 The prototype has the planned static adjacency families, canonical vertex
 attributes, hierarchical scans, and two runnable downstream WESL examples.
-Geometry algorithms have begun; topology editing has not. The public API
-builds and partitions on the CPU; a GPU build producing the same arena format
-works internally and awaits its public API. Uploaded topology is immutable.
+Geometry algorithms have begun; topology editing has not. Meshes can be built
+and partitioned on the CPU (`MeshBuilder`, then `GpuMesh::upload`) or entirely
+on the GPU (`GpuMeshBuilder`); both run the same query suite against Alum.
+Uploaded topology is immutable.
 
 The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run passed 28 tests: 18 hardware-independent tests
-and ten opt-in GPU tests (one is the GPU build benchmark, which returns at
+The last full verification run passed 29 tests: 18 hardware-independent tests
+and 11 opt-in GPU tests (one is the GPU build benchmark, which returns at
 once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
 checks passed, and both examples ran. GPU execution has only been verified on
@@ -101,15 +102,24 @@ evidence of production readiness.
 - [x] Document canonical IDs, ordering, strides, sentinels and empty-buffer behavior.
 - [x] Verify query results across patch sizes against Alum, including repeated execution.
 - [x] Run downstream boundary and neighborhood compositions using the public WESL package.
-- [ ] Add canonical edge and face attributes with identity checks and reference tests.
+- [x] Add canonical edge and face attributes with identity checks and reference tests.
+  One generic `Attribute<E, T>` / `GpuAttribute<E, T>` keyed by handle type,
+  as in RXMesh; query results are GPU attributes.
 - [x] Review the static API and buffer contracts before expanding them further.
 - [ ] Stage topology in workgroup memory and evaluate patch-local traversal.
 - [ ] Demonstrate locality benefits against an unpartitioned GPU baseline.
 
 ### GPU construction follow-ups
 
-Building the arena on the GPU is in progress; see the
-[strategy](docs/gpu_build_strategy.md).
+The GPU build is public as `GpuMeshBuilder` (see the
+[strategy](docs/gpu_build_strategy.md) for how it works and is tested).
+
+- [ ] **Return the GPU build's validation result without blocking.** `build`
+  waits for the first phase to learn whether the input is valid. Callers who
+  trust their input, or who want to overlap other work, may want a
+  non-blocking or no-validation variant.
+- [x] **Host writes for GPU-built attributes.** `GpuAttribute::write_values`
+  replaces an attribute from a slice, for meshes with no CPU attributes.
 
 - [ ] **Port more build logic into `shaders/`** (corner grouping, the fan walk,
   patch membership, local-ID lookup) when editing shows the interfaces it
@@ -176,7 +186,12 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 
 - [x] Implement face centroids and a reusable edge-length helper.
 - [x] Validate weighted boundary lengths and neighborhood statistics in downstream examples.
-- [ ] Add face/vertex normals and face areas with documented numerical behavior.
+- [x] Add face/vertex normals and face areas with documented numerical behavior.
+  Vertex normals are area-weighted (Alum's "accurate" weighting), gathered
+  over VF rows because WGSL has no float atomics; RXMesh scatters with
+  edge-length weights instead. Their sum order follows the unordered VF row,
+  so results may differ in the last bits between runs; measure the cost of
+  a fixed order before promising more. Measured costs are still open.
 - [ ] Add reductions and smoothing, including boundary policies and reference checks.
 - [ ] Decide whether a standalone edge-length batch API is useful; the WESL primitive already exists.
 - [ ] Add runnable downstream examples alongside each new operator family.

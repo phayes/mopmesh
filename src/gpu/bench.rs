@@ -106,7 +106,7 @@ fn gpu_build_benchmark() {
         let upload_time = median(|| {
             let gpu = GpuMesh::upload(&device, &mesh).unwrap();
             black_box(
-                gpu.upload_vertex_attribute(&device, &mesh.position_attribute())
+                gpu.upload_attribute(&device, &mesh.position_attribute())
                     .unwrap(),
             );
             wait(&device);
@@ -165,7 +165,7 @@ fn gpu_build_benchmark() {
             let held: usize = mesh.patches().iter().map(|p| p.face_ids().len()).sum();
             let gpu = GpuMesh::upload(&device, mesh).unwrap();
             let positions = gpu
-                .upload_vertex_attribute(&device, &mesh.position_attribute())
+                .upload_attribute(&device, &mesh.position_attribute())
                 .unwrap();
             let query = |encode: &dyn Fn(&mut wgpu::CommandEncoder)| {
                 median(|| {

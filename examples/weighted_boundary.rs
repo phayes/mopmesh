@@ -25,7 +25,7 @@ async fn run() {
         .unwrap();
     let gpu = GpuMesh::upload(&device, &mesh).unwrap();
     let positions = gpu
-        .upload_vertex_attribute(&device, &mesh.position_attribute())
+        .upload_attribute(&device, &mesh.position_attribute())
         .unwrap();
     let query = EdgeQuery::new(&device);
     let operator = boundary::BoundaryOperator::new(&device);

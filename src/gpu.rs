@@ -10,8 +10,10 @@ mod adjacency;
 mod attribute;
 #[cfg(test)]
 mod bench;
+mod boundary;
 mod build;
 mod edge;
+mod geometry;
 mod pipeline;
 mod scan;
 #[cfg(test)]
@@ -19,9 +21,14 @@ mod test_support;
 #[cfg(test)]
 mod validate;
 pub use adjacency::{AdjacencyQuery, MeshAdjacency};
-pub use attribute::{FaceCentroidQuery, FaceCentroids, GpuValue, GpuVertexAttribute};
+pub use attribute::{
+    FaceCentroidQuery, GpuAttribute, GpuEdgeAttribute, GpuFaceAttribute, GpuValue,
+    GpuVertexAttribute,
+};
 pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
+pub use boundary::{BoundaryQuery, MeshBoundary};
 pub use edge::{EdgeConnectivity, EdgeQuery};
+pub use geometry::{FaceAreaQuery, FaceNormalQuery, VertexNormalQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 
 /// Marks a missing element in GPU results, with the value `u32::MAX`.
@@ -151,8 +158,8 @@ fn arena_contents(mesh: &Mesh, limits: &wgpu::Limits) -> Result<Vec<u32>, GpuErr
 
 impl GpuMesh {
     /// Uploads `mesh`'s fixed connectivity for use by GPU queries.
-    /// Upload vertex attributes, such as positions, separately with
-    /// [`GpuMesh::upload_vertex_attribute`]. Returns [`GpuError::LimitsExceeded`]
+    /// Upload attributes, such as positions, separately with
+    /// [`GpuMesh::upload_attribute`]. Returns [`GpuError::LimitsExceeded`]
     /// before allocating GPU buffers if the connectivity is too large.
     pub fn upload(device: &wgpu::Device, mesh: &Mesh) -> Result<Self, GpuError> {
         let words = arena_contents(mesh, &device.limits())?;

@@ -10,10 +10,13 @@
 use alum::{Handle, HasIterators, HasTopology, PolyMeshF32, Vec3};
 use mopmesh::{
     Mesh, MeshBuilder,
-    gpu::{AdjacencyQuery, FaceCentroidQuery, GpuMesh, VertexFaceQuery},
+    gpu::{
+        AdjacencyQuery, FaceCentroidQuery, GpuMesh, GpuMeshBuilder, GpuMeshInput, VertexFaceQuery,
+    },
 };
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use wgpu::util::DeviceExt;
 
 const WARMUP: usize = 2;
 const RUNS: usize = 7;
@@ -46,6 +49,7 @@ fn main() {
     let centroid_query = FaceCentroidQuery::new(&device);
     let vf_query = VertexFaceQuery::new(&device);
     let adjacency_query = AdjacencyQuery::new(&device);
+    let gpu_builder = GpuMeshBuilder::new(&device);
 
     for n in sizes {
         let (positions, triangles) = grid(n);
@@ -65,12 +69,25 @@ fn main() {
         });
         compare("build (CPU)", build, alum_build);
 
+        // GPU construction, including uploading the raw positions and triangles.
+        let gpu_build = median(|| {
+            black_box(build_on_gpu(
+                &device,
+                &queue,
+                &gpu_builder,
+                &positions,
+                &triangles,
+            ));
+            wait(&device, &queue);
+        });
+        compare("build (GPU, + input)", gpu_build, alum_build);
+
         // GPU upload has no Alum counterpart.
         let mesh = build_mopmesh(&positions, &triangles);
         let upload = median(|| {
             let gpu = GpuMesh::upload(&device, &mesh).unwrap();
             black_box(
-                gpu.upload_vertex_attribute(&device, &mesh.position_attribute())
+                gpu.upload_attribute(&device, &mesh.position_attribute())
                     .unwrap(),
             );
             wait(&device, &queue);
@@ -79,7 +96,7 @@ fn main() {
 
         let gpu = GpuMesh::upload(&device, &mesh).unwrap();
         let gpu_positions = gpu
-            .upload_vertex_attribute(&device, &mesh.position_attribute())
+            .upload_attribute(&device, &mesh.position_attribute())
             .unwrap();
         let reference = build_alum(&positions, &triangles);
 
@@ -139,6 +156,35 @@ fn build_mopmesh(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Mesh {
         .triangles(triangles)
         .build()
         .unwrap()
+}
+
+/// Uploads the grid in the vec4 layout [`GpuMeshBuilder`] reads and builds it
+/// on the GPU. Grids are never empty, so the buffers need no padding.
+fn build_on_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    builder: &GpuMeshBuilder,
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+) -> GpuMesh {
+    let positions4: Vec<[f32; 4]> = positions.iter().map(|&[x, y, z]| [x, y, z, 0.]).collect();
+    let triangles4: Vec<[u32; 4]> = triangles.iter().map(|&[a, b, c]| [a, b, c, 0]).collect();
+    let create = |label, contents| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let position_buffer = create("bench positions", bytemuck::cast_slice(&positions4));
+    let triangle_buffer = create("bench triangles", bytemuck::cast_slice(&triangles4));
+    let input = GpuMeshInput {
+        positions: &position_buffer,
+        triangles: &triangle_buffer,
+        vertex_count: positions.len() as u32,
+        face_count: triangles.len() as u32,
+    };
+    builder.build(device, queue, &input).unwrap()
 }
 
 fn build_alum(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> PolyMeshF32 {

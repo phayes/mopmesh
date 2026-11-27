@@ -1,4 +1,6 @@
-use crate::{DirectedEdge, EdgeHandle, FaceHandle, Patch, VertexHandle};
+use crate::{
+    DirectedEdge, EdgeHandle, ElementKind, FaceHandle, Patch, VertexAttribute, VertexHandle,
+};
 
 pub(crate) mod build;
 use std::fmt;
@@ -368,74 +370,21 @@ impl Mesh {
             .get(h.local as usize)
             .copied()
     }
-    /// Creates an attribute with a clone of `value` for each input vertex.
-    pub fn vertex_attribute<T: Clone>(&self, value: T) -> VertexAttribute<T> {
-        VertexAttribute {
-            values: vec![value; self.positions.len()],
-            mesh: self.id,
+    /// Returns the number of vertices, edges or faces.
+    pub fn element_count(&self, kind: ElementKind) -> usize {
+        match kind {
+            ElementKind::Vertex => self.positions.len(),
+            ElementKind::Edge => self.edge_count,
+            ElementKind::Face => self.face_count,
         }
-    }
-    /// Creates an attribute from values in the original input vertex order.
-    /// Returns `None` unless `values` contains exactly one value per vertex.
-    pub fn vertex_attribute_from<T>(&self, values: Vec<T>) -> Option<VertexAttribute<T>> {
-        (values.len() == self.positions.len()).then_some(VertexAttribute {
-            values,
-            mesh: self.id,
-        })
     }
     /// Original positions as WGSL-compatible vec4 values; the fourth lane is zero.
     pub fn position_attribute(&self) -> VertexAttribute<[f32; 4]> {
-        VertexAttribute {
-            values: self
-                .positions
-                .iter()
-                .map(|&[x, y, z]| [x, y, z, 0.])
-                .collect(),
-            mesh: self.id,
-        }
-    }
-}
-
-/// Canonical vertex values: ribbon reads/writes access the same value.
-/// Attributes reject access through a different mesh. Handles themselves are
-/// mesh-relative addresses, not globally unique or generation-checked IDs.
-#[derive(Debug)]
-pub struct VertexAttribute<T> {
-    pub(crate) values: Vec<T>,
-    pub(crate) mesh: MeshId,
-}
-impl<T> VertexAttribute<T> {
-    /// Returns the ID of the mesh that created this attribute.
-    pub fn mesh_id(&self) -> MeshId {
-        self.mesh
-    }
-    /// Borrows the attribute values in the original input vertex order.
-    pub fn as_slice(&self) -> &[T] {
-        &self.values
-    }
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-    fn index(&self, mesh: &Mesh, h: VertexHandle) -> Option<usize> {
-        if self.mesh != mesh.id {
-            return None;
-        }
-        Some(
-            *mesh
-                .patches
-                .get(h.patch as usize)?
-                .vertices
-                .get(h.local as usize)? as usize,
-        )
-    }
-    pub fn get(&self, mesh: &Mesh, h: VertexHandle) -> Option<&T> {
-        self.values.get(self.index(mesh, h)?)
-    }
-    pub fn get_mut(&mut self, mesh: &Mesh, h: VertexHandle) -> Option<&mut T> {
-        let index = self.index(mesh, h)?;
-        self.values.get_mut(index)
+        let values = self
+            .positions
+            .iter()
+            .map(|&[x, y, z]| [x, y, z, 0.])
+            .collect();
+        VertexAttribute::wrap(self, values)
     }
 }
