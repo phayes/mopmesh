@@ -51,7 +51,19 @@ pub(super) fn workgroup_grid(
     count: u32,
     resource: &'static str,
 ) -> Result<[u32; 2], GpuError> {
-    let groups = count.div_ceil(WORKGROUP_SIZE);
+    group_grid(limits, count.div_ceil(WORKGROUP_SIZE), resource)
+}
+
+/// Arranges enough workgroups to cover `groups` in a two-dimensional grid
+/// within the device limits. Returns `[0, 0]` for no work, or a limit error
+/// labeled with `resource` if the grid would be too large.
+/// Shaders use `shaders::parallel::grid::flat_group` to recover a workgroup's
+/// index and must skip indices at or above `groups` in a partially filled row.
+pub(super) fn group_grid(
+    limits: &wgpu::Limits,
+    groups: u32,
+    resource: &'static str,
+) -> Result<[u32; 2], GpuError> {
     let width = groups.min(limits.max_compute_workgroups_per_dimension);
     if groups == 0 {
         return Ok([0, 0]);
@@ -126,11 +138,26 @@ pub(super) fn dispatch_grid(
     label: &str,
     pipeline: &wgpu::ComputePipeline,
     bindings: &wgpu::BindGroup,
+    grid: [u32; 2],
+) {
+    dispatch_grid_groups(encoder, label, pipeline, &[bindings], grid);
+}
+
+/// Records a compute dispatch over a two-dimensional workgroup grid.
+/// Assigns each entry in `bindings` to the matching shader group number,
+/// starting at group 0. Submit the encoder to execute the recorded work.
+pub(super) fn dispatch_grid_groups(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    bindings: &[&wgpu::BindGroup],
     [x, y]: [u32; 2],
 ) {
     let mut pass = begin_pass(encoder, label);
     pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bindings, &[]);
+    for (group, b) in bindings.iter().enumerate() {
+        pass.set_bind_group(group as u32, *b, &[]);
+    }
     pass.dispatch_workgroups(x, y, 1);
 }
 

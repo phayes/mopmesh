@@ -27,6 +27,8 @@ mod reduce;
 mod scan;
 mod smooth;
 #[cfg(test)]
+mod staged;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod validate;

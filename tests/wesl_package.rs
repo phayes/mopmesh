@@ -4,6 +4,7 @@ fn downstream_shader_can_link_packaged_library() {
         "consumer",
         "scan_consumer",
         "geometry_consumer",
+        "patch_consumer",
         "flip_consumer",
     ] {
         validate(&compile_consumer(name));
@@ -98,6 +99,7 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         include_str!(concat!(env!("OUT_DIR"), "/radix_sort.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/baseline_face_vertices.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/baseline_edges.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/staged_edges.wgsl")),
     ] {
         validate(wgsl);
     }

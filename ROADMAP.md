@@ -290,11 +290,10 @@ local cavities. The current Cargo version does not mean that release scope is co
    each owned edge, cost grows linearly with patch size, and boundary flags
    share the same scan. The order-sensitive global VV/FF kernels are the
    second target. Editing is a headline feature and the design follows
-   RXMesh, so the staging should also serve editing kernels. Proposed, not
-   yet decided: WESL library functions that consumer kernels call, handling
-   per-patch capacity, tombstoned slots and active masks (see
-   [the local dynamics plan](docs/local_dynamics_plan.md)). Settle the
-   accessor layer with the Milestone 5 work before writing it. Compare staged and existing paths with identical
+   RXMesh, so the staging should also serve editing kernels. The
+   [staging plan](docs/workgroup_staging_plan.md) has the design and the
+   step 1 prototype results; the static arena adopts the editable header and
+   patch records (decided 26 November 2026). Compare staged and existing paths with identical
    outputs. Acceptance: Alum parity and measured tradeoffs across mesh/patch
    sizes; retain or revise the approach based on evidence.
 4. **Complete useful static functionality — done.** Edge/face attributes,

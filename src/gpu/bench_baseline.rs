@@ -30,7 +30,7 @@ use crate::{Mesh, MeshBuilder};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-const WARMUP: usize = 2;
+pub(super) const WARMUP: usize = 2;
 const SETUP_RUNS: usize = 3;
 const SMOOTHING: Smoothing = Smoothing {
     step: 0.5,
@@ -47,7 +47,7 @@ type Step<'a> = Box<dyn FnMut() + 'a>;
 const MAX_PASSES: u32 = wgpu::QUERY_SET_MAX_QUERIES / 2;
 
 /// Start and end timestamps for every compute pass of a timed run.
-struct Timer {
+pub(super) struct Timer {
     set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
     readback: wgpu::Buffer,
@@ -56,7 +56,7 @@ struct Timer {
 
 impl Timer {
     /// Returns a timer, or `None` if the device lacks timestamp queries.
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+    pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
@@ -104,7 +104,7 @@ impl Timer {
 /// Times one run of `record`: wall clock, and if `timer` is given, the
 /// summed GPU time of its compute passes. That sum leaves out gaps between
 /// passes, and is `None` if the run recorded no passes or too many to time.
-fn sample(
+pub(super) fn sample(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     timer: Option<&Timer>,
@@ -160,7 +160,7 @@ fn counts(
 }
 
 /// Minimum, median and maximum of `times`, in milliseconds.
-fn spread(times: &mut [Duration]) -> String {
+pub(super) fn spread(times: &mut [Duration]) -> String {
     times.sort();
     format!(
         "{} / {} / {}",
