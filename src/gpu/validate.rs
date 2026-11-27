@@ -1,6 +1,8 @@
-//! A test-only checker for connectivity arenas, independent of how they were
-//! built. It accepts any arena that meets the contract for the given input
-//! triangles, whatever patch split or order within patches the builder chose.
+//! Test helpers that check static GPU connectivity against input triangles.
+//! Checks storage, connections and ownership without requiring the builder to
+//! choose a particular grouping of faces or order of elements within a patch.
+use super::INVALID_ID;
+use super::patch_layout::{self as layout, PatchRecord, mask_words};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The sizes of one patch's region: vertices, edges and faces, including ribbons.
@@ -13,23 +15,14 @@ pub struct PatchSizes {
 
 /// One decoded patch region.
 struct Region<'a> {
-    start: usize,
     vertex_ids: &'a [u32],
     ev: &'a [u32],
     fe: &'a [u32],
+    edge_ids: &'a [u32],
     face_ids: &'a [u32],
 }
 
 impl Region<'_> {
-    fn ev_offset(&self) -> usize {
-        self.start + self.vertex_ids.len()
-    }
-    fn fe_offset(&self) -> usize {
-        self.ev_offset() + self.ev.len()
-    }
-    fn face_ids_offset(&self) -> usize {
-        self.fe_offset() + self.fe.len()
-    }
     /// The global endpoints of local edge `e`, in stored order.
     fn edge_vertices(&self, e: usize) -> [u32; 2] {
         [0, 1].map(|i| self.vertex_ids[self.ev[2 * e + i] as usize])
@@ -55,26 +48,39 @@ impl Region<'_> {
     }
 }
 
-/// Checks `arena` against `triangles` (over `vertex_count` vertices) and the
-/// claimed per-patch sizes, in arena order. Returns a description of the first
-/// violation. Checks:
-/// - the header, region layout and total length;
-/// - every patch's IDs are in range and distinct, and its local EV/FE map back
-///   to the input faces' vertices in winding order;
-/// - every patch holds the full vertex star of each vertex of its owned faces;
-/// - each face and each edge has exactly one task, and edge IDs follow
-///   ascending (smaller, larger) vertex pairs;
-/// - each edge is owned by the lowest patch owning one of its faces, which
-///   holds all of its faces;
-/// - no patch owns more than `patch_size` faces.
+/// Reads one boolean per slot from a packed bitmask. `mask` is an offset in
+/// `u32` words; returns `None` if the requested words are outside the buffer.
+fn bits(masks: &[u32], mask: u32, slots: u32) -> Option<Vec<bool>> {
+    let words = masks.get(mask as usize..(mask + mask_words(slots)) as usize)?;
+    Some(
+        (0..slots)
+            .map(|s| words[s as usize / 32] & (1 << (s % 32)) != 0)
+            .collect(),
+    )
+}
+
+/// Checks a static mesh's connectivity and masks against its input triangles.
+/// Pass per-patch sizes in arena order and the maximum owned-face count as
+/// `patch_size`. Input triangle indices must be valid for `vertex_count`.
+/// Returns `Ok(())` on success or a description of the first failed check.
+///
+/// Checks buffer layout and lengths, valid element IDs, edge endpoints and
+/// face vertex order. All slots must be active, and every element must have
+/// exactly one owning patch. Edges and vertices belong to the lowest-numbered
+/// patch owning an adjoining face. Each patch must include all faces touching
+/// the vertices of its owned faces, so local queries can see their neighbors.
+/// No patch may own more than `patch_size` faces. Extra mask words are allowed
+/// only if they are zero.
 pub fn validate_arena(
     arena: &[u32],
+    masks: &[u32],
     vertex_count: usize,
     triangles: &[[u32; 3]],
     patches: &[PatchSizes],
     patch_size: usize,
 ) -> Result<(), String> {
-    // The expected edges, numbered in ascending pair order, and their faces.
+    // Reconstruct edges from the input triangles. Sort endpoint pairs to
+    // assign global edge IDs, and retain the faces touching each edge.
     let mut edge_faces = BTreeMap::<[u32; 2], Vec<u32>>::new();
     for (f, t) in triangles.iter().enumerate() {
         for i in 0..3 {
@@ -86,6 +92,11 @@ pub fn validate_arena(
         }
     }
     let edges: Vec<[u32; 2]> = edge_faces.keys().copied().collect();
+    let edge_index: BTreeMap<[u32; 2], u32> = edges
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i as u32))
+        .collect();
     let mut vertex_faces = vec![BTreeSet::new(); vertex_count];
     for (f, t) in triangles.iter().enumerate() {
         for &v in t {
@@ -93,89 +104,146 @@ pub fn validate_arena(
         }
     }
 
-    // Header and layout.
+    // Check mesh counts and the offsets required by the static layout.
     let face_count = triangles.len();
-    let regions_end = 4 + patches
-        .iter()
-        .map(|p| (p.vertices + 2 * p.edges + 7 * p.faces) as usize)
-        .sum::<usize>();
-    let face_tasks = regions_end;
-    let edge_tasks = face_tasks + 4 * face_count;
-    let expected_header = [face_count, face_tasks, edges.len(), edge_tasks].map(|x| x as u32);
-    if arena.get(..4) != Some(&expected_header[..]) {
+    let expected_header = [
+        vertex_count as u32,
+        edges.len() as u32,
+        face_count as u32,
+        patches.len() as u32,
+        layout::HEADER_WORDS as u32,
+        INVALID_ID,
+        INVALID_ID,
+        INVALID_ID,
+    ];
+    if arena.get(..layout::HEADER_WORDS) != Some(&expected_header[..]) {
         return Err(format!(
             "header {:?}, expected {expected_header:?}",
-            arena.get(..4)
-        ));
-    }
-    if arena.len() != edge_tasks + 7 * edges.len() {
-        return Err(format!(
-            "length {}, expected {}",
-            arena.len(),
-            edge_tasks + 7 * edges.len()
+            arena.get(..layout::HEADER_WORDS)
         ));
     }
 
-    // Decode and check each region on its own.
+    // Check each patch record and its data. Regions must follow one another
+    // in patch order, with no gaps or overlap.
     let mut regions = Vec::new();
-    let mut start = 4;
+    let mut records = Vec::new();
+    let mut start = layout::HEADER_WORDS + layout::RECORD_WORDS * patches.len();
+    let mut mask_start = 0u32;
     for (p, sizes) in patches.iter().enumerate() {
-        let take = |from: usize, len: u32| &arena[from..from + len as usize];
-        let vertex_ids = take(start, sizes.vertices);
-        let ev = take(start + vertex_ids.len(), 2 * sizes.edges);
-        let fe = take(start + vertex_ids.len() + ev.len(), 6 * sizes.faces);
-        let face_ids = take(start + vertex_ids.len() + ev.len() + fe.len(), sizes.faces);
-        let region = Region {
-            start,
-            vertex_ids,
-            ev,
-            fe,
-            face_ids,
+        let at = layout::HEADER_WORDS + layout::RECORD_WORDS * p;
+        let record = PatchRecord::from_words(
+            arena
+                .get(at..at + layout::RECORD_WORDS)
+                .ok_or("arena too short for its records")?,
+        );
+        let n = [sizes.vertices, sizes.edges, sizes.faces];
+        let w = n.map(mask_words);
+        let o = mask_start + 3 + w[0] + w[1] + w[2];
+        let mut expected = PatchRecord {
+            capacity: n,
+            vertex_ids: start as u32,
+            ev: 0,
+            fe: 0,
+            edge_ids: 0,
+            face_ids: 0,
+            active: [
+                mask_start + 3,
+                mask_start + 3 + w[0],
+                mask_start + 3 + w[0] + w[1],
+            ],
+            owned: [o, o + w[0], o + w[0] + w[1]],
+            interior: INVALID_ID,
+            used: mask_start,
         };
-        check_region(p, &region, vertex_count, triangles, &edge_faces)?;
-        start = region.face_ids_offset() + face_ids.len();
+        expected.ev = expected.vertex_ids + n[0];
+        expected.fe = expected.ev + layout::EV_WORDS * n[1];
+        expected.edge_ids = expected.fe + layout::FE_WORDS * n[2];
+        expected.face_ids = expected.edge_ids + n[1];
+        if record != expected {
+            return Err(format!(
+                "patch {p} record {record:?}, expected {expected:?}"
+            ));
+        }
+        let end = (expected.face_ids + n[2]) as usize;
+        let take = |from: u32, len: u32| arena.get(from as usize..(from + len) as usize);
+        let region = (|| {
+            Some(Region {
+                vertex_ids: take(record.vertex_ids, n[0])?,
+                ev: take(record.ev, 2 * n[1])?,
+                fe: take(record.fe, 6 * n[2])?,
+                edge_ids: take(record.edge_ids, n[1])?,
+                face_ids: take(record.face_ids, n[2])?,
+            })
+        })()
+        .ok_or(format!("arena too short for patch {p}"))?;
+        check_region(p, &region, vertex_count, triangles, &edge_index)?;
         regions.push(region);
+        records.push(record);
+        start = end;
+        mask_start = o + w[0] + w[1] + w[2];
+    }
+    if arena.len() != start {
+        return Err(format!("arena length {}, expected {start}", arena.len()));
+    }
+    let tail = masks.get(mask_start as usize..).ok_or(format!(
+        "masks have {} words, expected at least {mask_start}",
+        masks.len()
+    ))?;
+    if tail.iter().any(|&w| w != 0) {
+        return Err("masks have a nonzero word past the last patch".into());
     }
 
-    // Face tasks: one per face (there are exactly as many tasks as faces, so
-    // rejecting repeats covers every face), pointing at a patch that holds it.
-    let by_start: BTreeMap<usize, usize> = regions
-        .iter()
-        .enumerate()
-        .map(|(p, r)| (r.start, p))
-        .collect();
-    let mut face_patch = vec![u32::MAX; face_count];
-    let mut owned = vec![0usize; patches.len()];
-    for task in arena[face_tasks..edge_tasks].chunks(4) {
-        let &[ev, fe, vertices, face] = task else {
-            unreachable!()
+    // Static meshes have no spare slots: slot bounds equal capacities,
+    // and every slot must be marked active.
+    let mut owned = Vec::new();
+    for (p, (record, sizes)) in records.iter().zip(patches).enumerate() {
+        let n = [sizes.vertices, sizes.edges, sizes.faces];
+        if masks[record.used as usize..record.used as usize + 3] != n {
+            return Err(format!("patch {p} used counts differ from its slot counts"));
+        }
+        // Unused bits in the final mask word must be zero.
+        let padding = |mask: u32, slots: u32| match slots % 32 {
+            0 => 0,
+            used => masks[(mask + slots / 32) as usize] >> used,
         };
-        let p = *by_start
-            .get(&(vertices as usize))
-            .ok_or(format!("face task {task:?} has no patch"))?;
-        let region = &regions[p];
-        let local = (fe as usize)
-            .checked_sub(region.fe_offset())
-            .filter(|x| x.is_multiple_of(6) && x / 6 < region.face_ids.len())
-            .map(|x| x / 6)
-            .ok_or(format!("face task {task:?} FE offset outside patch {p}"))?;
-        if ev as usize != region.ev_offset() || region.face_ids[local] != face {
-            return Err(format!("face task {task:?} does not match patch {p}"));
+        for k in 0..3 {
+            let all = bits(masks, record.active[k], n[k]).unwrap();
+            if all.contains(&false) || padding(record.active[k], n[k]) != 0 {
+                return Err(format!(
+                    "patch {p} active mask {k} is not exactly the used slots"
+                ));
+            }
+            if padding(record.owned[k], n[k]) != 0 {
+                return Err(format!("patch {p} owned mask {k} has bits past its slots"));
+            }
+            owned.push(bits(masks, record.owned[k], n[k]).unwrap());
         }
-        let owner = face_patch
-            .get_mut(face as usize)
-            .ok_or(format!("face task for missing face {face}"))?;
-        if *owner != u32::MAX {
-            return Err(format!("face {face} has two tasks"));
-        }
-        *owner = p as u32;
-        owned[p] += 1;
     }
-    if let Some(p) = owned.iter().position(|&n| n > patch_size) {
-        return Err(format!("patch {p} owns {} faces", owned[p]));
+    let owned = |p: usize, kind: usize| &owned[3 * p + kind];
+
+    // Require exactly one owner per face and enforce the per-patch face limit.
+    let mut face_patch = vec![u32::MAX; face_count];
+    for (p, region) in regions.iter().enumerate() {
+        let mut count = 0;
+        for (local, &face) in region.face_ids.iter().enumerate() {
+            if owned(p, 2)[local] {
+                if face_patch[face as usize] != u32::MAX {
+                    return Err(format!("face {face} is owned twice"));
+                }
+                face_patch[face as usize] = p as u32;
+                count += 1;
+            }
+        }
+        if count > patch_size {
+            return Err(format!("patch {p} owns {count} faces"));
+        }
+    }
+    if let Some(f) = face_patch.iter().position(|&p| p == u32::MAX) {
+        return Err(format!("face {f} has no owner"));
     }
 
-    // Ribbons: each owned face's vertex stars are present in its patch.
+    // Require all faces touching each vertex of an owned face to be present
+    // in the same patch. These neighboring copies support local queries.
     let held: Vec<BTreeSet<u32>> = regions
         .iter()
         .map(|r| r.face_ids.iter().copied().collect())
@@ -190,52 +258,70 @@ pub fn validate_arena(
         }
     }
 
-    // Edge tasks: one per edge ID, owned by the lowest patch owning a face of
-    // the edge, which holds all of the edge's faces.
-    let local_edge_faces: Vec<_> = regions.iter().map(Region::edge_faces).collect();
-    let mut seen = vec![false; edges.len()];
-    for task in arena[edge_tasks..].chunks(7) {
-        let &[local, faces, fe, face_ids, edge, vertices, ev] = task else {
-            unreachable!()
-        };
-        let pair = *edges
-            .get(edge as usize)
-            .ok_or(format!("edge task for missing edge {edge}"))?;
-        if std::mem::replace(&mut seen[edge as usize], true) {
-            return Err(format!("edge {edge} has two tasks"));
+    // Each edge must belong to the lowest-numbered patch owning an adjoining
+    // face. That patch must contain every face touching the edge.
+    let mut edge_seen = vec![false; edges.len()];
+    for (p, region) in regions.iter().enumerate() {
+        let local_faces = region.edge_faces();
+        for (local, &edge) in region.edge_ids.iter().enumerate() {
+            if !owned(p, 1)[local] {
+                continue;
+            }
+            if std::mem::replace(&mut edge_seen[edge as usize], true) {
+                return Err(format!("edge {edge} is owned twice"));
+            }
+            let pair = edges[edge as usize];
+            let expected_owner = edge_faces[&pair]
+                .iter()
+                .map(|&f| face_patch[f as usize])
+                .min()
+                .unwrap() as usize;
+            if p != expected_owner {
+                return Err(format!(
+                    "edge {edge} is owned by patch {p}, expected {expected_owner}"
+                ));
+            }
+            let mut faces_held: Vec<u32> = local_faces[local]
+                .iter()
+                .map(|&f| region.face_ids[f])
+                .collect();
+            faces_held.sort_unstable();
+            if faces_held != edge_faces[&pair] {
+                return Err(format!(
+                    "owner patch {p} of edge {edge} holds faces {faces_held:?}"
+                ));
+            }
         }
-        let expected_owner = edge_faces[&pair]
-            .iter()
-            .map(|&f| face_patch[f as usize])
-            .min()
-            .unwrap() as usize;
-        let region = &regions[expected_owner];
-        let layout = [
-            faces as usize == region.face_ids.len(),
-            fe as usize == region.fe_offset(),
-            face_ids as usize == region.face_ids_offset(),
-            vertices as usize == region.start,
-            ev as usize == region.ev_offset(),
-            (local as usize) < region.ev.len() / 2,
-        ];
-        if layout.contains(&false) {
-            return Err(format!(
-                "edge task {task:?} does not match owner patch {expected_owner}"
-            ));
+    }
+    if let Some(e) = edge_seen.iter().position(|&s| !s) {
+        return Err(format!("edge {e} has no owner"));
+    }
+
+    // Each vertex must have one owner: the lowest-numbered patch owning
+    // any face that touches it.
+    let mut vertex_seen = vec![false; vertex_count];
+    for (p, region) in regions.iter().enumerate() {
+        for (local, &v) in region.vertex_ids.iter().enumerate() {
+            if !owned(p, 0)[local] {
+                continue;
+            }
+            if std::mem::replace(&mut vertex_seen[v as usize], true) {
+                return Err(format!("vertex {v} is owned twice"));
+            }
+            let expected_owner = vertex_faces[v as usize]
+                .iter()
+                .map(|&f| face_patch[f as usize])
+                .min()
+                .unwrap() as usize;
+            if p != expected_owner {
+                return Err(format!(
+                    "vertex {v} is owned by patch {p}, expected {expected_owner}"
+                ));
+            }
         }
-        if region.edge_vertices(local as usize) != pair {
-            return Err(format!("edge {edge} task names the wrong local edge"));
-        }
-        let mut faces_held: Vec<u32> = local_edge_faces[expected_owner][local as usize]
-            .iter()
-            .map(|&f| region.face_ids[f])
-            .collect();
-        faces_held.sort_unstable();
-        if faces_held != edge_faces[&pair] {
-            return Err(format!(
-                "owner patch {expected_owner} of edge {edge} holds faces {faces_held:?}"
-            ));
-        }
+    }
+    if let Some(v) = vertex_seen.iter().position(|&s| !s) {
+        return Err(format!("vertex {v} has no owner"));
     }
     Ok(())
 }
@@ -246,7 +332,7 @@ fn check_region(
     region: &Region,
     vertex_count: usize,
     triangles: &[[u32; 3]],
-    edge_faces: &BTreeMap<[u32; 2], Vec<u32>>,
+    edge_index: &BTreeMap<[u32; 2], u32>,
 ) -> Result<(), String> {
     let distinct = |ids: &[u32], limit: usize, what: &str| {
         let set: BTreeSet<_> = ids.iter().collect();
@@ -258,7 +344,8 @@ fn check_region(
     distinct(region.vertex_ids, vertex_count, "vertex")?;
     distinct(region.face_ids, triangles.len(), "face")?;
 
-    // Local edges are input edges with ascending global endpoints.
+    // Check that each local edge connects valid vertices, stores the smaller
+    // global vertex ID first, and matches the input edge's global ID.
     let (vertices, edges) = (region.vertex_ids.len(), region.ev.len() / 2);
     if region.ev.iter().any(|&v| v as usize >= vertices) {
         return Err(format!("patch {p} EV names a missing local vertex"));
@@ -266,12 +353,18 @@ fn check_region(
     let mut pairs = BTreeSet::new();
     for e in 0..edges {
         let [a, b] = region.edge_vertices(e);
-        if a >= b || !edge_faces.contains_key(&[a, b]) || !pairs.insert([a, b]) {
+        if a >= b || !pairs.insert([a, b]) {
             return Err(format!("patch {p} local edge {e} ({a}, {b}) is invalid"));
+        }
+        if edge_index.get(&[a, b]) != Some(&region.edge_ids[e]) {
+            return Err(format!(
+                "patch {p} local edge {e} ({a}, {b}) has the wrong global ID"
+            ));
         }
     }
 
-    // Local faces name local edges, and map back to the input faces in winding order.
+    // Check face references and directions, then verify that their vertices
+    // reproduce the input triangle order.
     for f in 0..region.face_ids.len() {
         let record = &region.fe[6 * f..6 * f + 6];
         if record.chunks(2).any(|d| d[0] as usize >= edges || d[1] > 1) {

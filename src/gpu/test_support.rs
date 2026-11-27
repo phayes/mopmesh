@@ -1,5 +1,6 @@
 //! Test helpers for comparing GPU-produced connectivity with the CPU reference.
-use super::arena_contents;
+pub(crate) use super::ArenaWords;
+use super::{arena_contents, patch_layout as layout};
 use crate::{BuildError, Mesh, MeshBuilder};
 use wgpu::util::DeviceExt;
 
@@ -20,24 +21,25 @@ pub fn device(limits: wgpu::Limits) -> (wgpu::Device, wgpu::Queue) {
     .unwrap()
 }
 
-/// Builds `fixture` on the CPU with `patch_size`, returning the mesh and its
-/// arena words, or the error the CPU builder reports. Panics if the arena
-/// exceeds `limits`.
+/// Builds a CPU reference mesh from `fixture` using the requested patch size.
+/// Returns the mesh and its connectivity and mask words for comparison with
+/// GPU results. Propagates mesh build errors; panics if storage exceeds `limits`.
 pub fn reference(
     fixture: &fixtures::Fixture,
     patch_size: usize,
     limits: &wgpu::Limits,
-) -> Result<(Mesh, Vec<u32>), BuildError> {
+) -> Result<(Mesh, ArenaWords), BuildError> {
     let builder = MeshBuilder::new().patch_size(patch_size);
     reference_with(fixture, builder, limits)
 }
 
-/// Like [`reference`], with a builder that already has its patch settings.
+/// Builds the same reference data as [`reference`] using a configured builder.
+/// Preserves its patch settings and supplies positions and triangles from `fixture`.
 pub fn reference_with(
     fixture: &fixtures::Fixture,
     builder: MeshBuilder,
     limits: &wgpu::Limits,
-) -> Result<(Mesh, Vec<u32>), BuildError> {
+) -> Result<(Mesh, ArenaWords), BuildError> {
     let mesh = builder
         .positions(&fixture.positions)
         .triangles(&fixture.triangles)
@@ -113,38 +115,77 @@ pub fn read_words(
     words
 }
 
-/// Panics unless `actual` equals `expected`, the arena of `mesh`. The message
-/// names the first differing word and the arena region it falls in, for example
-/// "patch 3 FE" or "edge tasks".
-pub fn assert_arena_eq(context: &str, mesh: &Mesh, actual: &[u32], expected: &[u32]) {
-    let Some(index) =
+/// Checks GPU connectivity and masks against CPU reference words for `mesh`.
+/// Panics on a difference, naming the word and the patch region that contains it.
+/// For example, "FE" in the message identifies face-edge data.
+/// The arena must match exactly; masks may have extra trailing zero words.
+pub fn assert_arena_eq(
+    context: &str,
+    mesh: &Mesh,
+    actual_arena: &[u32],
+    actual_masks: &[u32],
+    expected: &ArenaWords,
+) {
+    // Find the first differing or missing connectivity word.
+    let first_difference = |actual: &[u32], expected: &[u32]| {
         (0..actual.len().max(expected.len())).find(|&i| actual.get(i) != expected.get(i))
-    else {
-        return;
     };
-    panic!(
-        "{context}: arena differs at word {index} ({}): GPU {:?}, CPU {:?}; lengths GPU {}, CPU {}",
-        arena_region(mesh, expected, index),
-        actual.get(index),
-        expected.get(index),
-        actual.len(),
-        expected.len(),
+    if let Some(index) = first_difference(actual_arena, &expected.arena) {
+        panic!(
+            "{context}: arena word {index} differs ({}): GPU {:?}, CPU {:?}; \
+             lengths GPU {}, CPU {}",
+            arena_region(mesh, index),
+            actual_arena.get(index),
+            expected.arena.get(index),
+            actual_arena.len(),
+            expected.arena.len(),
+        );
+    }
+
+    // Compare all expected mask words and allow only zero padding after them.
+    let len = expected.masks.len().min(actual_masks.len());
+    let padded =
+        actual_masks.len() >= expected.masks.len() && actual_masks[len..].iter().all(|&w| w == 0);
+    if let Some(index) = first_difference(&actual_masks[..len], &expected.masks) {
+        panic!(
+            "{context}: mask word {index} differs ({}): GPU {:?}, CPU {:?}",
+            mask_region(mesh, index),
+            actual_masks.get(index),
+            expected.masks.get(index),
+        );
+    }
+    assert!(
+        padded,
+        "{context}: masks have {} words, CPU {}, or a nonzero word past the CPU length",
+        actual_masks.len(),
+        expected.masks.len()
     );
 }
 
-/// Names the region of `mesh`'s arena `words` that contains word `index`.
-fn arena_region(mesh: &Mesh, words: &[u32], index: usize) -> String {
-    if index < 4 {
+/// Describes where a word falls in `mesh`'s static connectivity buffer,
+/// so a failed comparison identifies the affected patch and kind of data.
+fn arena_region(mesh: &Mesh, index: usize) -> String {
+    let records = layout::HEADER_WORDS + layout::RECORD_WORDS * mesh.patches().len();
+    if index < layout::HEADER_WORDS {
         return "header".into();
     }
+    if index < records {
+        let at = index - layout::HEADER_WORDS;
+        return format!(
+            "patch {} record, word {}",
+            at / layout::RECORD_WORDS,
+            at % layout::RECORD_WORDS
+        );
+    }
 
-    // Walk the per-patch regions in arena order.
-    let mut start = 4;
+    // Locate the word by following the stored order of each patch's data.
+    let mut start = records;
     for p in mesh.patches() {
         let sections = [
             ("vertex IDs", p.vertex_ids().len()),
             ("EV", 2 * p.edge_vertices().len()),
             ("FE", 6 * p.face_edges().len()),
+            ("edge IDs", p.edge_ids().len()),
             ("face IDs", p.face_ids().len()),
         ];
         for (name, len) in sections {
@@ -154,14 +195,28 @@ fn arena_region(mesh: &Mesh, words: &[u32], index: usize) -> String {
             start += len;
         }
     }
+    "past the end".into()
+}
 
-    // Then the task lists, whose offsets the header records.
-    let edge_tasks = words[3] as usize;
-    if index < edge_tasks {
-        format!("face task {}", (index - words[1] as usize) / 4)
-    } else if index < words.len() {
-        format!("edge task {}", (index - edge_tasks) / 7)
-    } else {
-        "past the end".into()
+/// Describes where a word falls in `mesh`'s static mask buffer, including
+/// the patch, element kind and whether it tracks active or owned slots.
+fn mask_region(mesh: &Mesh, index: usize) -> String {
+    let mut start = 0;
+    for p in mesh.patches() {
+        let words = [p.vertex_ids().len(), p.edge_ids().len(), p.face_ids().len()]
+            .map(|n| layout::mask_words(n as u32) as usize);
+        let mut sections = vec![("used counts".to_owned(), 3)];
+        for mask in ["active", "owned"] {
+            for (kind, len) in ["vertex", "edge", "face"].into_iter().zip(words) {
+                sections.push((format!("{mask} {kind} mask"), len));
+            }
+        }
+        for (name, len) in sections {
+            if index < start + len {
+                return format!("patch {} {name}, word {}", p.id(), index - start);
+            }
+            start += len;
+        }
     }
+    "past the end".into()
 }

@@ -263,19 +263,21 @@ a host attribute, which only CPU meshes have.
   buffers, logical counts and `mesh_id()`. Empty results hold zeroed placeholders
   so the buffer is always bindable; use the counts, never the buffer size.
 
-`GpuMesh::arena()` exposes immutable scalar connectivity, with STORAGE and
-COPY_SRC usage. All offsets are u32
-word offsets, with no struct padding. The four-word header holds face count,
-face-task offset, edge count, and edge-task offset. Patch regions contain global
-vertex IDs, EV endpoint pairs, FE triples of `(local edge ID, reversed 0/1)`
-pairs, and global face IDs. Each four-word face task stores EV offset, face
-record offset, vertex offset, and global face ID. Each seven-word edge task stores
-local edge ID, local face count, FE base, face-ID base, global edge ID,
-vertex-ID base, and EV base.
-This static ABI is experimental; it contains no edit capacities or active masks.
-Upload checks the arena against u32 addressing and the device buffer and
-binding-size limits before allocation. Each query checks its own outputs and
-dispatches.
+`GpuMesh::arena()` and `GpuMesh::masks()` expose immutable scalar
+connectivity in the same patch layout as `GpuEditableMesh`, with STORAGE and
+COPY_SRC usage. All offsets are u32 word offsets, with no struct padding. The
+eight-word header holds the vertex, edge, face and patch counts, the offset of
+the patch records, and three owner-table offsets, which are `INVALID_ID` on a
+static mesh. Each 16-word patch record gives the patch's slot counts and the
+offsets of its global vertex IDs, EV endpoint pairs, FE triples of
+`(local edge slot, reversed 0/1)` pairs, global edge IDs and global face IDs,
+and of its used-slot counts and active and owned masks in the mask buffer. A
+static mesh has no spare slots: every slot is active, and it has no interior
+masks. Read the layout from WESL with `topology::patch` (value-based) or
+`topology::patch_arena` (read-only bindings in group 1).
+This static ABI is experimental. Upload checks the arena and masks against u32
+addressing and the device buffer and binding-size limits before allocation.
+Each query checks its own outputs and dispatches.
 
 ### Edge endpoints and incident faces
 
@@ -647,8 +649,8 @@ GPU values, and paired-float precision schemes. Packing and alternative widths
 are outside the committed roadmap. Host `u64`/`usize` size checks remain in
 use; they do not introduce wider GPU representations.
 
-The order of elements within a patch (its local IDs), the order of the arena's
-face and edge tasks, and which patch owns which faces are unspecified. They
+The order of elements within a patch (its local IDs) and which patch owns
+which faces are unspecified. They
 are the same on every build of the same input on the same device, but may
 change between releases and differ between `GpuMesh::upload` and
 `GpuMeshBuilder`. Global vertex, face and edge IDs do not depend on them.

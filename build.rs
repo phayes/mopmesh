@@ -34,7 +34,6 @@ fn main() {
         "radix_sort",
         "baseline_face_vertices",
         "baseline_edges",
-        "staged_edges",
     ] {
         let resolver = wesl::resolver::StandardResolver::new(".");
         let compiled = wesl::Compiler::default()

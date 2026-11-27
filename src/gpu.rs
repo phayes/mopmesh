@@ -22,6 +22,7 @@ mod edge;
 mod editable;
 mod flip;
 mod geometry;
+mod patch_layout;
 mod pipeline;
 mod reduce;
 mod scan;
@@ -82,94 +83,111 @@ impl std::fmt::Display for GpuError {
 }
 impl std::error::Error for GpuError {}
 
-/// Static connectivity, including ribbons, uploaded to one read-only arena.
+/// Mesh connectivity uploaded for GPU queries. The mesh is divided into patches,
+/// groups of faces that also include neighboring elements needed by queries.
+/// Connectivity is fixed after upload; upload positions and other attributes separately.
 ///
-/// The caller owns the device, queue, submission, and optional readback.
+/// Record queries with your command encoder, then submit them on your queue.
+/// Results remain on the GPU unless you copy them back to the CPU.
 pub struct GpuMesh {
     arena: wgpu::Buffer,
+    masks: wgpu::Buffer,
     face_count: u32,
     vertex_count: u32,
     edge_count: u32,
+    patch_count: u32,
     mesh: MeshId,
 }
 
-/// Returns the connectivity buffer size in `u32` words, or an error if it exceeds
-/// the device's buffer limits or the supported index range.
-fn arena_words(mesh: &Mesh, limits: &wgpu::Limits) -> Result<u64, GpuError> {
-    const RESOURCE: &str = "connectivity arena";
-    let too_large = GpuError::LimitsExceeded { resource: RESOURCE };
-    let mut words = 4 + 4 * mesh.face_count() as u64 + 7 * mesh.edge_count() as u64;
-    for p in mesh.patches() {
-        words = words
-            .checked_add(p.vertex_ids().len() as u64)
-            .and_then(|n| n.checked_add(2 * p.edge_vertices().len() as u64))
-            .and_then(|n| n.checked_add(7 * p.face_edges().len() as u64))
-            .ok_or(too_large)?;
-    }
-    check_binding(limits, words.checked_mul(4).ok_or(too_large)?, RESOURCE)?;
-    Ok(words)
+/// Borrows connectivity buffers and mesh counts for queries that process one
+/// patch at a time. Static and editable meshes use the same buffer layout.
+#[derive(Clone, Copy)]
+pub(crate) struct PatchBuffers<'a> {
+    pub arena: &'a wgpu::Buffer,
+    pub masks: &'a wgpu::Buffer,
+    pub patch_count: u32,
+    pub face_count: u32,
+    pub edge_count: u32,
+    pub mesh: MeshId,
 }
 
-/// Returns the connectivity arena for `mesh`, word for word as [`GpuMesh::upload`]
-/// stores it (layout documented on [`GpuMesh::arena`]), or an error if it exceeds
-/// the device's buffer limits.
-fn arena_contents(mesh: &Mesh, limits: &wgpu::Limits) -> Result<Vec<u32>, GpuError> {
-    let word_count = arena_words(mesh, limits)?;
-    // Counts fit u32: the builder allows at most u32::MAX / 3 faces,
-    // each contributing at most three edges, and at most u32::MAX vertices.
-    let count = mesh.face_count() as u32;
-    let edge_count = mesh.edge_count() as u32;
+/// CPU-side `u32` data for a static mesh's connectivity and slot masks.
+pub(crate) struct ArenaWords {
+    pub arena: Vec<u32>,
+    pub masks: Vec<u32>,
+}
 
-    // Store each patch's vertex IDs, edge endpoints, face edges, and face IDs.
-    // Collect one query task per owned face or edge to avoid duplicate results.
-    let mut words = Vec::with_capacity(word_count as usize);
-    words.extend([count, 0, edge_count, 0]);
-    let mut tasks = Vec::with_capacity(count as usize);
-    let mut edge_tasks = Vec::with_capacity(edge_count as usize);
-    for p in mesh.patches() {
-        let vertex_offset = words.len() as u32;
-        words.extend_from_slice(p.vertex_ids());
-        let ev_offset = words.len() as u32;
-        for edge in p.edge_vertices() {
-            words.extend_from_slice(edge);
-        }
-        let faces_offset = words.len() as u32;
-        for (local, face) in p.face_edges().iter().enumerate() {
-            let face_offset = words.len() as u32;
-            for edge in face {
-                words.extend([edge.edge, u32::from(edge.reversed)]);
-            }
-            if p.face_owners()[local].patch == p.id() {
-                tasks.push([ev_offset, face_offset, vertex_offset, p.face_ids()[local]]);
-            }
-        }
-        let face_ids_offset = words.len() as u32;
-        words.extend_from_slice(p.face_ids());
-        for (local, owner) in p.edge_owners().iter().enumerate() {
-            if owner.patch == p.id() {
-                edge_tasks.push([
-                    local as u32,
-                    p.face_ids().len() as u32,
-                    faces_offset,
-                    face_ids_offset,
-                    p.edge_ids()[local],
-                    vertex_offset,
-                    ev_offset,
-                ]);
-            }
-        }
-    }
+/// Identifies the connectivity buffer in [`GpuError::LimitsExceeded`].
+const ARENA_RESOURCE: &str = "connectivity arena";
+/// Identifies the slot-state buffer in [`GpuError::LimitsExceeded`].
+const MASKS_RESOURCE: &str = "connectivity masks";
 
-    // Append the face and edge tasks, and store their starting word offsets in the header.
-    words[1] = words.len() as u32;
-    for task in tasks {
-        words.extend(task);
+/// Returns each patch's `[vertices, edges, faces]` slot counts, including
+/// copies of neighboring elements. The mesh builder's size limits ensure
+/// these counts fit in `u32`.
+fn patch_counts(mesh: &Mesh) -> impl Iterator<Item = [u32; 3]> + '_ {
+    mesh.patches()
+        .iter()
+        .map(|p| [p.vertex_ids().len(), p.edge_ids().len(), p.face_ids().len()].map(|n| n as u32))
+}
+
+/// Returns `[arena, masks]` storage sizes in `u32` words. Fails if either
+/// buffer would exceed device limits or the supported index range. An empty
+/// mask buffer is checked as a one-word allocation but reported as zero words.
+fn arena_words(mesh: &Mesh, limits: &wgpu::Limits) -> Result<[u64; 2], GpuError> {
+    let mut arena =
+        (patch_layout::HEADER_WORDS + patch_layout::RECORD_WORDS * mesh.patches().len()) as u64;
+    let mut masks = 0u64;
+    for counts in patch_counts(mesh) {
+        arena = arena
+            .checked_add(patch_layout::patch_region_words(counts))
+            .ok_or(GpuError::LimitsExceeded {
+                resource: ARENA_RESOURCE,
+            })?;
+        masks += patch_layout::patch_mask_words(counts, false);
     }
-    words[3] = words.len() as u32;
-    for task in edge_tasks {
-        words.extend(task);
+    check_binding(limits, arena.saturating_mul(4), ARENA_RESOURCE)?;
+    check_binding(limits, masks.max(1).saturating_mul(4), MASKS_RESOURCE)?;
+    Ok([arena, masks])
+}
+
+/// Builds the CPU-side words used by [`GpuMesh::upload`], following the layout
+/// on [`GpuMesh::arena`]. Returns an error if the required buffers exceed limits.
+/// An empty mask buffer receives one zero word so it can be bound to a shader.
+fn arena_contents(mesh: &Mesh, limits: &wgpu::Limits) -> Result<ArenaWords, GpuError> {
+    use patch_layout as layout;
+    let [arena_len, masks_len] = arena_words(mesh, limits)?;
+
+    // Write mesh counts and reserve space for patch records. Mark the
+    // owner-table offsets as absent; static queries use ownership masks.
+    let mut arena = vec![0u32; layout::HEADER_WORDS];
+    arena[layout::VERTEX_COUNT] = mesh.positions().len() as u32;
+    arena[layout::EDGE_COUNT] = mesh.edge_count() as u32;
+    arena[layout::FACE_COUNT] = mesh.face_count() as u32;
+    arena[layout::PATCH_COUNT] = mesh.patches().len() as u32;
+    arena[layout::RECORDS] = layout::HEADER_WORDS as u32;
+    for owners in layout::OWNERS {
+        arena[owners] = INVALID_ID;
     }
-    Ok(words)
+    arena.resize(
+        layout::HEADER_WORDS + layout::RECORD_WORDS * mesh.patches().len(),
+        0,
+    );
+    arena.reserve(arena_len as usize - arena.len());
+
+    // Store each patch's connectivity and masks without reserving spare slots.
+    let mut masks = Vec::with_capacity(masks_len as usize);
+    for (p, counts) in mesh.patches().iter().zip(patch_counts(mesh)) {
+        let record = layout::append_patch(&mut arena, &mut masks, p, counts, None);
+        let start = layout::HEADER_WORDS + layout::RECORD_WORDS * p.id() as usize;
+        arena[start..start + layout::RECORD_WORDS].copy_from_slice(&record.to_words());
+    }
+    debug_assert_eq!(arena.len() as u64, arena_len);
+    debug_assert_eq!(masks.len() as u64, masks_len);
+    if masks.is_empty() {
+        masks.push(0);
+    }
+    Ok(ArenaWords { arena, masks })
 }
 
 impl GpuMesh {
@@ -179,30 +197,73 @@ impl GpuMesh {
     /// before allocating GPU buffers if the connectivity is too large.
     pub fn upload(device: &wgpu::Device, mesh: &Mesh) -> Result<Self, GpuError> {
         let words = arena_contents(mesh, &device.limits())?;
-        let arena = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh static connectivity"),
-            contents: bytemuck::cast_slice(&words),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let buffer = |label, words: &[u32]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(words),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+        };
         Ok(Self {
-            arena,
-            face_count: words[0],
+            arena: buffer("MOPMesh static connectivity", &words.arena),
+            masks: buffer("MOPMesh static connectivity masks", &words.masks),
+            face_count: mesh.face_count() as u32,
             vertex_count: mesh.positions().len() as u32,
-            edge_count: words[2],
+            edge_count: mesh.edge_count() as u32,
+            patch_count: mesh.patches().len() as u32,
             mesh: mesh.id(),
         })
     }
 
-    /// Scalar arena header: [face count, face task offset, edge count, edge task offset].
-    /// Face tasks: [EV word offset, FE word offset, vertex word offset, global face ID].
-    /// Edge tasks: [local edge, local face count, FE base, face-ID base,
-    /// global edge ID, vertex-ID base, EV base]. Patch data also stores global face IDs.
-    /// EV stores two local vertex IDs per edge; FE stores three pairs of
-    /// (local edge ID, reversed 0/1) per face; vertices stores global IDs.
-    /// All offsets are measured in u32 words. This ABI is experimental.
+    /// Returns the buffer describing which vertices, edges and faces are connected.
+    /// Use WESL `topology::patch` or `topology::patch_arena` to read it in a shader.
+    /// The layout is experimental; offsets count `u32` words, not bytes.
     /// The buffer supports `STORAGE | COPY_SRC`.
+    ///
+    /// The eight-word header contains vertex, edge, face and patch counts, the
+    /// patch-record offset, and three absent owner-table offsets ([`INVALID_ID`]).
+    /// Each 16-word patch record contains, in order:
+    ///
+    /// - vertex, edge and face slot counts;
+    /// - arena offsets for global vertex IDs, edge endpoints, face edges, global
+    ///   edge IDs and global face IDs;
+    /// - mask-buffer offsets for active vertex, edge and face masks, then owned masks;
+    /// - [`INVALID_ID`] for the absent interior-vertex mask;
+    /// - the mask-buffer offset for three used-slot counts.
+    ///
+    /// Edge endpoints are two local vertex slots. Each face stores three pairs of
+    /// local edge slot and direction: 0 follows the edge, 1 reverses it.
+    /// The layout matches [`GpuEditableMesh::arena`], with no spare slots,
+    /// owner tables or interior-vertex masks.
     pub fn arena(&self) -> &wgpu::Buffer {
         &self.arena
+    }
+    /// Returns the buffer tracking active slots and element ownership in each patch.
+    /// A slot is a position reserved for a vertex, edge or face. Every slot in this
+    /// static mesh is active. Elements may appear in several patches, but exactly
+    /// one copy is marked owned, allowing queries to process each element once.
+    ///
+    /// Each patch stores three used-slot counts, then active and owned bitmasks
+    /// in vertex, edge and face order, as in [`GpuEditableMesh::masks`]. Used-slot
+    /// counts equal capacities. Trailing zero words may be unused.
+    /// The buffer supports `STORAGE | COPY_SRC`.
+    pub fn masks(&self) -> &wgpu::Buffer {
+        &self.masks
+    }
+    /// Returns the number of face groups used to process this mesh on the GPU.
+    pub fn patch_count(&self) -> u32 {
+        self.patch_count
+    }
+    /// Borrows the connectivity buffers and counts needed by per-patch queries.
+    pub(crate) fn buffers(&self) -> PatchBuffers<'_> {
+        PatchBuffers {
+            arena: &self.arena,
+            masks: &self.masks,
+            patch_count: self.patch_count,
+            face_count: self.face_count,
+            edge_count: self.edge_count,
+            mesh: self.mesh,
+        }
     }
     /// Returns the ID of the CPU mesh used for this upload.
     pub fn mesh_id(&self) -> MeshId {
@@ -273,29 +334,36 @@ impl FaceVertexQuery {
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
     ) -> Result<FaceVertices, GpuError> {
+        self.encode_patches(device, encoder, mesh.buffers())
+    }
+
+    /// Records the same face-vertex query as [`encode`](Self::encode), using
+    /// the shared buffer layout of static and editable meshes.
+    pub(crate) fn encode_patches(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: PatchBuffers,
+    ) -> Result<FaceVertices, GpuError> {
         const RESOURCE: &str = "face vertices";
         let limits = device.limits();
         let bytes = (u64::from(mesh.face_count) * 12).max(4);
         check_binding(&limits, bytes, RESOURCE)?;
-        let groups = workgroups(&limits, mesh.face_count, RESOURCE)?;
+        let grid = pipeline::group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = FaceVertices {
             buffer: pipeline::output_buffer(device, "MOPMesh face vertices result", bytes),
             face_count: mesh.face_count,
             mesh: mesh.mesh,
         };
         if mesh.face_count != 0 {
-            let bindings = pipeline::bind_buffers(
+            pipeline::dispatch_patches(
                 device,
-                "MOPMesh face vertices bindings",
-                &self.pipeline.get_bind_group_layout(0),
-                &[&mesh.arena, &result.buffer],
-            );
-            pipeline::dispatch(
                 encoder,
                 "MOPMesh face vertices",
                 &self.pipeline,
-                &bindings,
-                groups,
+                &[&result.buffer],
+                mesh,
+                grid,
             );
         }
         Ok(result)
@@ -468,14 +536,16 @@ mod tests {
             .patch_size(1)
             .build()
             .unwrap();
-        // Count u32 words: 4 for the header, 4 per face task, 7 per edge task,
-        // and (vertices + 2 * edges + 7 * faces) per patch. Each patch owns one
-        // face and includes the other as a neighbor, so both store the whole square.
-        let expected = 4 + 4 * 2 + 7 * 5 + 2 * (4 + 2 * 5 + 7 * 2);
+        // Both patches store the whole square: one owned face and its neighbor.
+        // Storage needs 8 header words, 16 per patch record, then 1 per vertex,
+        // 3 per edge and 7 per face in each patch. Each patch also needs
+        // 3 slot counts and 6 mask words (active and owned for each element kind).
+        let expected = 8 + 2 * 16 + 2 * (4 + 3 * 5 + 7 * 2);
+        let masks = 2 * (3 + 2 * 3);
         let mut limits = wgpu::Limits::default();
-        assert_eq!(arena_words(&mesh, &limits), Ok(expected));
+        assert_eq!(arena_words(&mesh, &limits), Ok([expected, masks]));
         limits.max_storage_buffer_binding_size = 4 * expected;
-        assert_eq!(arena_words(&mesh, &limits), Ok(expected));
+        assert_eq!(arena_words(&mesh, &limits), Ok([expected, masks]));
         limits.max_storage_buffer_binding_size = 4 * expected - 4;
         assert_eq!(
             arena_words(&mesh, &limits),
@@ -491,12 +561,10 @@ mod tests {
         for fixture in test_support::fixtures::valid() {
             for patch_size in test_support::fixtures::PATCH_SIZES {
                 let (mesh, words) = test_support::reference(&fixture, patch_size, &limits).unwrap();
-                assert_eq!(
-                    words.len() as u64,
-                    arena_words(&mesh, &limits).unwrap(),
-                    "{}, patch size {patch_size}",
-                    fixture.name
-                );
+                let [arena, masks] = arena_words(&mesh, &limits).unwrap();
+                let context = format!("{}, patch size {patch_size}", fixture.name);
+                assert_eq!(words.arena.len() as u64, arena, "{context}");
+                assert_eq!(words.masks.len() as u64, masks.max(1), "{context}");
             }
         }
     }
@@ -514,9 +582,12 @@ mod tests {
                 let (mesh, expected) =
                     test_support::reference(&fixture, patch_size, &limits).unwrap();
                 let gpu = GpuMesh::upload(&device, &mesh).unwrap();
-                let encoder = device.create_command_encoder(&Default::default());
-                let actual = test_support::read_words(&device, &queue, encoder, gpu.arena());
-                test_support::assert_arena_eq(&context, &mesh, &actual, &expected);
+                let read = |buffer| {
+                    let encoder = device.create_command_encoder(&Default::default());
+                    test_support::read_words(&device, &queue, encoder, buffer)
+                };
+                let (arena, masks) = (read(gpu.arena()), read(gpu.masks()));
+                test_support::assert_arena_eq(&context, &mesh, &arena, &masks, &expected);
             }
         }
         // Every invalid fixture is rejected by the CPU reference.
@@ -559,52 +630,79 @@ mod tests {
                 let (mesh, words) =
                     test_support::reference_with(&fixture, builder, &limits).unwrap();
                 let sizes = patch_sizes(&mesh);
-                let check = |words: &[u32]| {
+                let check = |arena: &[u32], masks: &[u32]| {
                     validate::validate_arena(
-                        words,
+                        arena,
+                        masks,
                         fixture.positions.len(),
                         &fixture.triangles,
                         &sizes,
                         patch_size,
                     )
                 };
-                assert_eq!(check(&words), Ok(()), "{name}");
+                assert_eq!(check(&words.arena, &words.masks), Ok(()), "{name}");
 
-                // Changing words in each region must be caught; small meshes
-                // are enough, and keep the test fast.
+                // Check that corrupting representative arena words produces an error.
+                // Limit these checks to small meshes to keep the test quick.
                 if method != crate::mesh::Partition::BreadthFirst
                     || mesh.face_count() == 0
                     || mesh.face_count() > 1000
                 {
                     continue;
                 }
+                let records =
+                    patch_layout::HEADER_WORDS + patch_layout::RECORD_WORDS * mesh.patches().len();
                 for index in [
-                    4,
-                    words[1] as usize - 1,
-                    words[1] as usize + 3,
-                    words.len() - 1,
+                    3,
+                    patch_layout::HEADER_WORDS + 5,
+                    records,
+                    words.arena.len() - 1,
                 ] {
-                    let mut corrupted = words.clone();
+                    let mut corrupted = words.arena.clone();
                     corrupted[index] ^= 1;
-                    assert!(check(&corrupted).is_err(), "{name}: word {index}");
+                    assert!(
+                        check(&corrupted, &words.masks).is_err(),
+                        "{name}: arena word {index}"
+                    );
+                }
+                // Zero padding is allowed. Corrupted slot counts, active or owned
+                // bits, and nonzero padding must all be rejected.
+                let first = patch_layout::PatchRecord::from_words(
+                    &words.arena[patch_layout::HEADER_WORDS..records],
+                );
+                let mut extended = words.masks.clone();
+                extended.push(0);
+                assert_eq!(check(&words.arena, &extended), Ok(()), "{name}: zero tail");
+                for index in [
+                    first.used as usize,
+                    first.active[2] as usize,
+                    first.owned[2] as usize,
+                    extended.len() - 1,
+                ] {
+                    let mut corrupted = extended.clone();
+                    corrupted[index] ^= 1;
+                    assert!(
+                        check(&words.arena, &corrupted).is_err(),
+                        "{name}: mask word {index}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    #[should_panic(expected = "arena differs at word 20 (patch 0 FE, word 0)")]
+    #[should_panic(expected = "arena word 40 differs (patch 0 FE, word 0)")]
     fn arena_comparison_names_the_first_differing_region() {
-        // The tetrahedron in one patch: 4 header words, 4 vertex IDs and 12 EV
-        // words come before the FE records.
+        // Face-edge data starts at word 40: 8 header words, a 16-word patch
+        // record, 4 vertex IDs and 12 words describing edge endpoints.
         let fixture = test_support::fixtures::valid()
             .into_iter()
             .find(|f| f.name == "tetrahedron")
             .unwrap();
         let (mesh, expected) =
             test_support::reference(&fixture, 128, &wgpu::Limits::default()).unwrap();
-        let mut actual = expected.clone();
-        actual[20] ^= 1;
-        test_support::assert_arena_eq("tetrahedron", &mesh, &actual, &expected);
+        let mut actual = expected.arena.clone();
+        actual[40] ^= 1;
+        test_support::assert_arena_eq("tetrahedron", &mesh, &actual, &expected.masks, &expected);
     }
 }

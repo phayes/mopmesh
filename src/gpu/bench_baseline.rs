@@ -345,9 +345,9 @@ impl Bench {
         let held =
             |count: fn(&crate::Patch) -> usize| -> usize { mesh.patches().iter().map(count).sum() };
         println!(
-            "memory: arena {:.1} B/face, flat {:.1} B/face; per patch-held element: \
+            "memory: arena and masks {:.1} B/face, flat {:.1} B/face; per patch-held element: \
              faces {:.3}, vertices {:.3}, edges {:.3}; {} patches",
-            gpu.arena().size() as f64 / faces,
+            (gpu.arena().size() + gpu.masks().size()) as f64 / faces,
             flat.bytes() as f64 / faces,
             held(|p| p.face_ids().len()) as f64 / faces,
             held(|p| p.vertex_ids().len()) as f64 / input.positions.len() as f64,

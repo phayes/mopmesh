@@ -1,5 +1,5 @@
-use super::pipeline::{self, check_binding, workgroups};
-use super::{GpuError, GpuMesh};
+use super::pipeline::{self, check_binding, group_grid};
+use super::{GpuError, GpuMesh, PatchBuffers};
 use crate::MeshId;
 
 /// Edge endpoints and the faces that touch each edge.
@@ -24,9 +24,8 @@ impl EdgeConnectivity {
     }
 }
 
-/// Evaluate EV and EF for each owned edge, including faces across patch borders.
-/// The current kernel scans each owner patch's local faces. This is a correctness
-/// baseline; it does not yet stage topology in workgroup memory.
+/// Queries each edge's two endpoints and adjoining faces, including faces
+/// across patch boundaries. Create once per device and reuse for its meshes.
 pub struct EdgeQuery {
     pipeline: wgpu::ComputePipeline,
 }
@@ -58,29 +57,36 @@ impl EdgeQuery {
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
     ) -> Result<EdgeConnectivity, GpuError> {
+        self.encode_patches(device, encoder, mesh.buffers())
+    }
+
+    /// Records the same edge query as [`encode`](Self::encode), using the
+    /// shared buffer layout of static and editable meshes.
+    pub(crate) fn encode_patches(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: PatchBuffers,
+    ) -> Result<EdgeConnectivity, GpuError> {
         const RESOURCE: &str = "edge connectivity";
         let limits = device.limits();
         let bytes = (u64::from(mesh.edge_count) * 16).max(16);
         check_binding(&limits, bytes, RESOURCE)?;
-        let groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
+        let grid = group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, "MOPMesh edge records", bytes),
             edge_count: mesh.edge_count,
             mesh: mesh.mesh,
         };
         if mesh.edge_count != 0 {
-            let bindings = pipeline::bind_buffers(
+            pipeline::dispatch_patches(
                 device,
-                "MOPMesh edge bindings",
-                &self.pipeline.get_bind_group_layout(0),
-                &[&mesh.arena, &result.buffer],
-            );
-            pipeline::dispatch(
                 encoder,
                 "MOPMesh edge connectivity",
                 &self.pipeline,
-                &bindings,
-                groups,
+                &[&result.buffer],
+                mesh,
+                grid,
             );
         }
         Ok(result)

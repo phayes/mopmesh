@@ -143,6 +143,30 @@ pub(super) fn dispatch_grid(
     dispatch_grid_groups(encoder, label, pipeline, &[bindings], grid);
 }
 
+/// Records a query that processes patches in workgroups. Pass a `grid` from
+/// [`group_grid`] using the mesh's patch count.
+///
+/// Binds `outputs` to group 0 in slice order and the arena and masks to group 1.
+/// The pipeline must use the group 1 bindings from `topology::patch_arena`.
+pub(super) fn dispatch_patches(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    outputs: &[&wgpu::Buffer],
+    mesh: super::PatchBuffers,
+    grid: [u32; 2],
+) {
+    let output = bind_buffers(device, label, &pipeline.get_bind_group_layout(0), outputs);
+    let topology = bind_buffers(
+        device,
+        label,
+        &pipeline.get_bind_group_layout(1),
+        &[mesh.arena, mesh.masks],
+    );
+    dispatch_grid_groups(encoder, label, pipeline, &[&output, &topology], grid);
+}
+
 /// Records a compute dispatch over a two-dimensional workgroup grid.
 /// Assigns each entry in `bindings` to the matching shader group number,
 /// starting at group 0. Submit the encoder to execute the recorded work.

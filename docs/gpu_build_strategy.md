@@ -35,9 +35,11 @@ we'd need eventually anyway.
    from ranks with an explicit sort key. The result may differ between the
    CPU and the GPU, and between devices.
 3. **The arena layout doesn't change.** GPU construction writes the same arena
-   that `GpuMesh::upload` writes today: header, then per-patch vertex IDs, EV,
-   FE and face IDs, then face tasks, then edge tasks. Every existing query then
-   works unchanged.
+   that `GpuMesh::upload` writes. Every existing query then works unchanged.
+   (Milestone 3 replaced the face and edge task lists with patch records and a
+   mask buffer, shared with editable meshes; see the
+   [staging plan](workgroup_staging_plan.md). The GPU build's mask buffer may
+   end with unused zero words, because it is sized before the patch rows exist.)
 4. **Portable WebGPU only.** No 64-bit atomics, no subgroups, and no
    push-constant or other optional features. Workgroup size is 64, as in the
    existing queries. Check buffer and dispatch limits up front with the

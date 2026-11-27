@@ -1,7 +1,7 @@
 //! Editable connectivity: patch storage with spare local slots and bitmasks.
 use super::pipeline::check_binding;
 use super::{GpuError, INVALID_ID};
-use crate::{Mesh, MeshId, Patch};
+use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
 
 /// How much spare room each patch gets for edits.
@@ -36,95 +36,9 @@ impl Default for EditCapacity {
     }
 }
 
-/// Word layout of the editable arena and mask buffer, shared by the builder
-/// and the test decoder. All offsets are in `u32` words.
-pub(super) mod layout {
-    /// Header words: vertex, edge, face and patch counts, then the offsets of
-    /// the patch records and of the vertex, edge and face owner tables.
-    pub const HEADER_WORDS: usize = 8;
-    pub const VERTEX_COUNT: usize = 0;
-    pub const EDGE_COUNT: usize = 1;
-    pub const FACE_COUNT: usize = 2;
-    pub const PATCH_COUNT: usize = 3;
-    pub const RECORDS: usize = 4;
-    pub const OWNERS: [usize; 3] = [5, 6, 7];
+pub(super) use super::patch_layout as layout;
 
-    /// Words in each patch record.
-    pub const RECORD_WORDS: usize = 16;
-    /// Words per local slot in each patch region.
-    pub const EV_WORDS: u32 = 2;
-    pub const FE_WORDS: u32 = 6;
-    /// Words per owner-table entry: patch, then local slot.
-    pub const OWNER_WORDS: u32 = 2;
-
-    /// One patch's capacities and the offsets of its regions.
-    ///
-    /// `capacity`, `active` and `owned` are indexed vertex, edge, face. Region
-    /// offsets point into the arena; mask offsets point into the mask buffer.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct PatchRecord {
-        pub capacity: [u32; 3],
-        pub vertex_ids: u32,
-        pub ev: u32,
-        pub fe: u32,
-        pub edge_ids: u32,
-        pub face_ids: u32,
-        pub active: [u32; 3],
-        pub owned: [u32; 3],
-        pub interior: u32,
-        /// Mask-buffer offset of three words: one past the highest vertex,
-        /// edge and face slot that may be active.
-        pub used: u32,
-    }
-
-    impl PatchRecord {
-        pub fn to_words(self) -> [u32; RECORD_WORDS] {
-            let [cv, ce, cf] = self.capacity;
-            let [av, ae, af] = self.active;
-            let [ov, oe, of] = self.owned;
-            [
-                cv,
-                ce,
-                cf,
-                self.vertex_ids,
-                self.ev,
-                self.fe,
-                self.edge_ids,
-                self.face_ids,
-                av,
-                ae,
-                af,
-                ov,
-                oe,
-                of,
-                self.interior,
-                self.used,
-            ]
-        }
-        #[cfg(test)]
-        pub fn from_words(w: &[u32]) -> Self {
-            Self {
-                capacity: [w[0], w[1], w[2]],
-                vertex_ids: w[3],
-                ev: w[4],
-                fe: w[5],
-                edge_ids: w[6],
-                face_ids: w[7],
-                active: [w[8], w[9], w[10]],
-                owned: [w[11], w[12], w[13]],
-                interior: w[14],
-                used: w[15],
-            }
-        }
-    }
-
-    /// Words in a bitmask with one bit per slot.
-    pub fn mask_words(slots: u32) -> u32 {
-        slots.div_ceil(32)
-    }
-}
-
-use layout::{PatchRecord, mask_words};
+use layout::{append_patch, owner_patches};
 
 /// Arena and mask-buffer contents for an editable upload.
 pub(super) struct EditableWords {
@@ -153,17 +67,8 @@ fn sizes(mesh: &Mesh, capacity: EditCapacity) -> Option<Sizes> {
             capacity.slots(p.edge_ids().len())?,
             capacity.slots(p.face_ids().len())?,
         ];
-        let words = u64::from(v)
-            + u64::from(layout::EV_WORDS + 1) * u64::from(e)
-            + u64::from(layout::FE_WORDS + 1) * u64::from(f);
-        arena = arena.checked_add(words)?;
-        // Used-slot counts, active and owned masks for each kind, and the
-        // interior-vertex mask.
-        let mask = 3
-            + 3 * u64::from(mask_words(v))
-            + 2 * u64::from(mask_words(e))
-            + 2 * u64::from(mask_words(f));
-        masks = masks.checked_add(mask)?;
+        arena = arena.checked_add(layout::patch_region_words([v, e, f]))?;
+        masks = masks.checked_add(layout::patch_mask_words([v, e, f], true))?;
         capacities.push([v, e, f]);
     }
     Some(Sizes {
@@ -221,7 +126,7 @@ pub(super) fn editable_contents(
     // Store each patch's regions and masks, and its owned elements in the owner tables.
     let mut masks = Vec::with_capacity(sizes.masks as usize);
     for (p, &capacities) in mesh.patches().iter().zip(&sizes.capacities) {
-        let record = append_patch(&mut arena, &mut masks, p, capacities, &interior_patch);
+        let record = append_patch(&mut arena, &mut masks, p, capacities, Some(&interior_patch));
         let start = layout::HEADER_WORDS + layout::RECORD_WORDS * p.id() as usize;
         arena[start..start + layout::RECORD_WORDS].copy_from_slice(&record.to_words());
         let globals = [p.vertex_ids(), p.edge_ids(), p.face_ids()];
@@ -263,87 +168,6 @@ fn interior_patches(mesh: &Mesh) -> Vec<u32> {
         }
     }
     patch_of
-}
-
-/// Returns the owner patch of each local vertex, edge and face of `p`.
-fn owner_patches(p: &Patch) -> [Vec<u32>; 3] {
-    [
-        p.vertex_owners().iter().map(|h| h.patch).collect(),
-        p.edge_owners().iter().map(|h| h.patch).collect(),
-        p.face_owners().iter().map(|h| h.patch).collect(),
-    ]
-}
-
-/// Appends one patch's regions to `arena` and its masks to `masks`, and
-/// returns its record. Slots past the element count hold `INVALID_ID`.
-fn append_patch(
-    arena: &mut Vec<u32>,
-    masks: &mut Vec<u32>,
-    p: &Patch,
-    [cv, ce, cf]: [u32; 3],
-    interior_patch: &[u32],
-) -> PatchRecord {
-    fn region(arena: &mut Vec<u32>, words: impl IntoIterator<Item = u32>, len: u32) -> u32 {
-        let start = arena.len();
-        arena.extend(words);
-        arena.resize(start + len as usize, INVALID_ID);
-        start as u32
-    }
-    fn mask(masks: &mut Vec<u32>, bits: impl Iterator<Item = bool>, slots: u32) -> u32 {
-        let start = masks.len();
-        masks.resize(start + mask_words(slots) as usize, 0);
-        for (slot, set) in bits.enumerate() {
-            if set {
-                masks[start + slot / 32] |= 1 << (slot % 32);
-            }
-        }
-        start as u32
-    }
-
-    // Connectivity regions, padded to capacity.
-    let vertex_ids = region(arena, p.vertex_ids().iter().copied(), cv);
-    let ev = region(
-        arena,
-        p.edge_vertices().iter().flatten().copied(),
-        layout::EV_WORDS * ce,
-    );
-    let fe_words = p
-        .face_edges()
-        .iter()
-        .flatten()
-        .flat_map(|d| [d.edge, u32::from(d.reversed)]);
-    let fe = region(arena, fe_words, layout::FE_WORDS * cf);
-    let edge_ids = region(arena, p.edge_ids().iter().copied(), ce);
-    let face_ids = region(arena, p.face_ids().iter().copied(), cf);
-
-    // Active slots are the first `count` of each kind; owned and interior bits follow ownership.
-    let id = p.id();
-    let lens = [p.vertex_ids().len(), p.edge_ids().len(), p.face_ids().len()];
-    let caps = [cv, ce, cf];
-    let used = masks.len() as u32;
-    masks.extend(lens.map(|n| n as u32));
-    let active = [0, 1, 2].map(|k| mask(masks, (0..lens[k]).map(|_| true), caps[k]));
-    let owners = owner_patches(p);
-    let owned = [0, 1, 2].map(|k| mask(masks, owners[k].iter().map(|&o| o == id), caps[k]));
-    let interior = mask(
-        masks,
-        p.vertex_ids()
-            .iter()
-            .map(|&v| interior_patch[v as usize] == id),
-        cv,
-    );
-    PatchRecord {
-        capacity: caps,
-        vertex_ids,
-        ev,
-        fe,
-        edge_ids,
-        face_ids,
-        active,
-        owned,
-        interior,
-        used,
-    }
 }
 
 /// Mesh connectivity uploaded with spare room for topology edits.

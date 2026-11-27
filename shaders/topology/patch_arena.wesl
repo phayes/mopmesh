@@ -6,7 +6,7 @@
 import super::patch::{
     PatchRecord, PATCH_COUNT_WORD, RECORDS_WORD, record_offset, decode_record, used_offset,
     mask_word, mask_test, face_edge_offset, edge_vertices_offset, global_vertex_offset,
-    global_edge_offset, global_face_offset,
+    global_edge_offset, global_face_offset, VERTEX_COUNT_WORD, OWNERS_WORD, owner_offset,
 };
 
 @group(1) @binding(0) var<storage, read> arena: array<u32>;
@@ -68,4 +68,19 @@ public fn global_edge(r: PatchRecord, slot: u32) -> u32 {
 }
 public fn global_face(r: PatchRecord, slot: u32) -> u32 {
     return arena[global_face_offset(r, slot)];
+}
+
+// Returns the total number of vertices, edges or faces in the mesh.
+// Pass VERTEX, EDGE or FACE as `kind`; copies in neighboring patches are not counted.
+public fn element_count(kind: u32) -> u32 {
+    return arena[VERTEX_COUNT_WORD + kind];
+}
+
+// Finds the unique owning copy of an element identified by its mesh-wide ID.
+// Returns (patch ID, slot within that patch). Pass VERTEX, EDGE or FACE as `kind`
+// and an ID below element_count(kind). Use only with editable arenas; static
+// arenas do not store the owner tables this lookup requires.
+public fn owner(kind: u32, global: u32) -> vec2<u32> {
+    let at = owner_offset(arena[OWNERS_WORD + kind], global);
+    return vec2(arena[at], arena[at + 1u]);
 }

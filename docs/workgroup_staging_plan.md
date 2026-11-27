@@ -45,8 +45,14 @@ are defaults taken for the prototype and still need confirming; see
   - Editing kernels use `patch` and `patch_staging` with their own
     read-write bindings, so no `@if` variants are needed.
 - **Static meshes get the full mask buffer.** Every active bit is set and the
-  used counts equal the counts, so one reader works for both mesh types. This
-  costs about 0.2 words per face.
+  used counts equal the counts, so one reader works for both mesh types.
+  Measured on the benchmark meshes, with no interior mask: 0.56–0.67 B/face at
+  patch size 512, 0.82–1.09 at 128 and 1.6–2.4 at 32. The owned masks alone,
+  which a static mesh needs in any case, are 0.53–0.62, 0.70–0.91 and 1.2–1.7.
+  Skipping the active and used checks in the staged edge kernel saved about
+  3% of GPU time at patch size 32, 5–6% at 128 and 7–15% at 512. Decided 26
+  November 2026: static meshes get the full mask buffer. An opt-in
+  all-active reader for static meshes could recover that time later.
 - **Outputs unchanged.** Staged edge records, boundary flags and FF must match
   the current kernels word for word. Existing tests then hold as they are.
 
@@ -195,35 +201,100 @@ the kernel in `runtime_shaders/staged_edges.wesl`. It runs on
 
 The gate in step 1 is met at the default patch size of 128 and above.
 
+### Face vertices without face tasks
+
+Removing the face task list means `FaceVertexQuery`, which every per-face
+query uses, can no longer dispatch one invocation per face task. The
+prototype `StagedFaceVertexQuery` (test-only, `src/gpu/staged.rs`, kernel
+`runtime_shaders/staged_face_vertices.wesl`) tries two replacements on the
+editable layout at capacity 1. Both match `FaceVertexQuery` word for word on
+the fixtures and generated meshes, and the benchmark checks every mesh it
+times.
+
+- **Per patch:** one workgroup per patch, over its owned face slots.
+- **Per face:** one invocation per global face, through the face owner table.
+
+GPU time at 2.1 M faces, medians of 11 runs on the M1 Max, over grid, sphere,
+torus and irregular meshes, against today's face-task kernel:
+
+| Patch size | Order | Per patch | Per face (owner table) | Flat |
+|---:|---|---:|---:|---:|
+| 32 | input | 2.1–2.5x slower | 1.3–1.4x slower | 2.0–2.2x faster |
+| 32 | shuffled | 1.8–2.1x slower | 20x slower | 1.3x faster |
+| 128 | input | 1.12–1.25x slower | 1.17–1.19x slower | 1.7x faster |
+| 128 | shuffled | 1.15–1.19x slower | 20x slower | 1.2x faster |
+| 512 | input | 2–6% faster | 1.1x slower | 1.6x faster |
+| 512 | shuffled | 8–11% slower | 17x slower | 1.3x faster |
+
+- At patch size 128 the per-patch kernel costs 0.07–0.20 ms more per call at
+  2.1 M faces, against 3.6–5 ms saved on edge records.
+- Per-face dispatch through the owner table is unusable on shuffled meshes.
+  The table is in global face order, so neighbouring invocations read
+  unrelated patches.
+- Keeping a face task list for this alone would cost 16 B/face, raising the
+  static estimate from about 83 to 99 B/face.
+
+## Step 2 results
+
+- **Layout.** `GpuMesh` stores the editable header and patch records, with
+  capacity equal to count, and a mask buffer of used counts, all-set active
+  masks and owned masks. Owner-table offsets and the record's interior offset
+  hold `INVALID_ID`. `GpuMesh::upload` and the GPU build share
+  `patch_layout::append_patch` with `GpuEditableMesh` (CPU), and the GPU build
+  writes the same words (`runtime_shaders/build_arena.wesl`). The GPU build
+  sizes its mask buffer from member totals, so it may end with unused zero
+  words.
+- **Queries.** `EdgeQuery` uses the staged kernel and `FaceVertexQuery` one
+  workgroup per patch, both through `topology::patch_arena`. Every per-face
+  query and all adjacency go through them. The step 1 prototype queries and
+  their benchmarks are gone with the old kernels; `src/gpu/staged.rs` now
+  checks that editable uploads at capacity 1 and 1.5 give the same edge
+  records and face vertices as the static upload.
+- **Tests.** The validator checks the records, masks and ownership in place of
+  the task lists. GPU builds match the CPU arena word for word, and the masks
+  up to the CPU length.
+- **Memory**, from the baseline benchmark at patch size 128: 83–98 B/face in
+  input order and 91–103 B/face shuffled, against 129–145 before. Flat: 36.
+- **Speed**, the same benchmark at 2.1 M faces, median GPU time. This run was
+  noisier than earlier ones, especially on shuffled meshes, where the flat
+  baseline itself ran 18–34% slower than in Milestone 2. Rerun in step 5.
+
+| Query, 2.1 M faces | Order | Milestone 2 patched | Now patched | Flat |
+|---|---|---:|---:|---:|
+| Edge records (grid) | input | 6.29 ms | 2.97 ms | 1.11 ms |
+| Edge records (grid) | shuffled | 6.42 ms | 4.40 ms | 4.33 ms |
+| VV + FF + diamonds + edges (grid) | input | 8.22 ms | 5.59 ms | 3.47 ms |
+| Face vertices, four meshes | input | – | 0.66–0.91 ms | 0.35–0.40 ms |
+
 ## Steps
 
 1. **Prototype the staged edge kernel — done.** See above.
-2. **Move the static arena to the shared header and patch records.**
-   - Change the CPU `arena_contents` and GPU build stage 8.
-   - Add the global edge-ID region and the mask buffer to static uploads.
-   - Change the face-vertex kernel to dispatch by patch instead of by face
-     task.
-   - Keep the word-for-word CPU/GPU arena tests.
-3. **Land the staged edge, boundary and FF kernels** for both mesh types,
-   then remove the old edge and FF kernels.
+2. **Move the static arena to the shared header and patch records — done.**
+   See [Step 2 results](#step-2-results).
+3. **Stage the boundary and FF kernels** for both mesh types, then remove the
+   old FF kernel. Edge records moved to staging in step 2, because removing
+   the edge task list left the old kernel nothing to dispatch over.
 4. **Stage VV,** if the benchmark still shows VV as the order-sensitive cost.
    It needs per-vertex row offsets, so it comes after FF.
 5. **Rerun the baseline** at all sizes and both orders, and update the report.
 
 ## Decisions for the user
 
-1. Decided: the static arena adopts the editable header and patch records.
-2. Proceed to step 2, given the step 1 results? The staged kernel loses at
-   patch size 32.
-3. Defaults taken in step 1, to confirm:
-   - Value-based accessors, with the group-1 bindings in an opt-in module.
-   - Chunked staging for oversized patches, rather than a `LimitsExceeded`
-     error, which would reject the sphere at every patch size.
-   - A full mask buffer for static meshes. The Milestone 5 session preferred
-     a static `slot_end` that reads the capacity, with no mask buffer.
-   - Gating step 2 on step 1's measured speed-up.
-4. The patch size 32 slowdown: profile and fix it now, or record it as a
-   follow-up?
+Decided on 26 November 2026:
+
+1. The static arena adopts the editable header and patch records.
+2. Proceed to step 2.
+3. Static meshes get the full mask buffer: used counts, all-set active masks
+   and owned masks, with no interior mask or owner tables. Codex, the advisor
+   and the Milestone 5 session all recommended it; owned masks inside the
+   arena were the alternative.
+4. The patch size 32 slowdown is a follow-up, not part of this milestone.
+
+Defaults taken in step 1, not yet confirmed:
+
+- Value-based accessors, with the group-1 bindings in an opt-in module.
+- Chunked staging for oversized patches, rather than a `LimitsExceeded`
+  error, which would reject the sphere at every patch size.
 
 ## Open questions
 

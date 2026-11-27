@@ -82,9 +82,11 @@ impl GpuMeshBuilder {
                 .build(device, queue, input, GpuSplit::Morton, self.patch_size)?;
         Ok(GpuMesh {
             arena: built.arena,
+            masks: built.masks,
             face_count: input.face_count,
             vertex_count: input.vertex_count,
             edge_count: built.summary.edges,
+            patch_count: built.split.patch_count,
             mesh: MeshId::next(),
         })
     }
@@ -249,8 +251,13 @@ impl GpuBuilder {
             device,
             "arena",
             include_str!(concat!(env!("OUT_DIR"), "/build_arena.wgsl")),
-            &[false, false, false, true, true, true],
-            ["write_header", "size_regions", "flag_owned", "write_arena"],
+            &[false, false, false, true, true, true, true],
+            [
+                "write_header",
+                "size_patches",
+                "write_records",
+                "write_arena",
+            ],
         );
         let split = Stage::new(
             device,
@@ -893,11 +900,12 @@ impl GpuBuilder {
         Ok(stage)
     }
 
-    /// Records the arena assembly from the second phase's patch rows. The
-    /// result is the arena [`super::GpuMesh::upload`] would store for the same
-    /// mesh and partition, with `STORAGE | COPY_SRC` usage. Returns
-    /// [`GpuError::LimitsExceeded`] before recording if a buffer or dispatch is
-    /// too large.
+    /// Records commands that turn the prepared patch data into connectivity and
+    /// mask buffers for GPU queries. For the same mesh and partition, the result
+    /// matches [`super::GpuMesh::upload`], with possible extra zero words at the
+    /// end of the mask buffer. Both buffers support `STORAGE | COPY_SRC`.
+    /// Returns [`GpuError::LimitsExceeded`] before recording commands if a
+    /// required buffer or dispatch is too large.
     pub(super) fn encode_arena(
         &self,
         device: &wgpu::Device,
@@ -906,47 +914,50 @@ impl GpuBuilder {
         partition: &Partition,
         summary: &Summary,
         patches: &PatchStage,
-    ) -> Result<wgpu::Buffer, GpuError> {
-        // Size the arena from the totals and check every limit.
+    ) -> Result<[wgpu::Buffer; 2], GpuError> {
+        use super::patch_layout::{HEADER_WORDS, RECORD_WORDS};
+        // Compute exact connectivity storage and allow for mask rounding in
+        // every patch. Check buffer and dispatch limits before recording work.
         const RESOURCE: &str = "connectivity arena";
+        const MASKS: &str = "connectivity masks";
         let limits = device.limits();
         let too_large = GpuError::LimitsExceeded { resource: RESOURCE };
-        let (faces, edges) = (u64::from(input.face_count), u64::from(summary.edges));
+        let patch_count = u64::from(partition.patch_count);
         let (fm, em, vm) = (
             u64::from(summary.face_members),
             u64::from(summary.edge_members),
             u64::from(summary.vertex_members),
         );
-        let face_tasks = 4 + vm + 2 * em + 7 * fm;
-        let edge_tasks = face_tasks + 4 * faces;
-        let words = edge_tasks + 7 * edges;
+        let words = HEADER_WORDS as u64 + RECORD_WORDS as u64 * patch_count + vm + 3 * em + 7 * fm;
         check_binding(&limits, 4 * words, RESOURCE)?;
+        let mask_bound = |members: u64| (members + 31 * patch_count) / 32;
+        let mask_words =
+            (3 * patch_count + 2 * (mask_bound(vm) + mask_bound(em) + mask_bound(fm))).max(1);
+        check_binding(&limits, 4 * mask_words, MASKS)?;
         let members = u32::try_from(fm + em + vm).map_err(|_| too_large)?;
-        let owned_flags = (fm + em) as u32;
         let region_plan = scan::ScanPlan::new(partition.patch_count + 1, &limits)?;
-        let task_plan = scan::ScanPlan::new(owned_flags + 1, &limits)?;
         let member_groups = pipeline::workgroup_grid(&limits, members, RESOURCE)?;
-        let flag_groups = pipeline::workgroup_grid(&limits, owned_flags, RESOURCE)?;
         let patch_groups = pipeline::workgroup_grid(&limits, partition.patch_count, RESOURCE)?;
 
         let arena = pipeline::output_buffer(device, "MOPMesh static connectivity", 4 * words);
+        let masks =
+            pipeline::output_buffer(device, "MOPMesh static connectivity masks", 4 * mask_words);
         let params = uniform(
             device,
             &[
+                input.vertex_count,
+                summary.edges,
                 input.face_count,
                 partition.patch_count,
                 members,
                 summary.face_members,
                 summary.edge_members,
-                face_tasks as u32,
-                edge_tasks as u32,
-                summary.edges,
+                0,
             ],
         );
-        let scratch =
-            |label, plan: &scan::ScanPlan| pipeline::output_buffer(device, label, plan.byte_size());
-        let regions = scratch("MOPMesh build arena regions", &region_plan);
-        let tasks = scratch("MOPMesh build arena tasks", &task_plan);
+        let scratch = |label| pipeline::output_buffer(device, label, region_plan.byte_size());
+        let regions = scratch("MOPMesh build arena regions");
+        let mask_regions = scratch("MOPMesh build mask regions");
         let bindings = self.arena.bind(
             device,
             &[
@@ -955,38 +966,34 @@ impl GpuBuilder {
                 &patches.local_ids,
                 &patches.owners,
                 &regions,
-                &tasks,
+                &mask_regions,
                 &arena,
+                &masks,
             ],
         );
-        let [header, size, flag, write] = &self.arena.pipelines;
+        let [header, size, records, write] = &self.arena.pipelines;
         let run = |encoder: &mut wgpu::CommandEncoder, label, pipeline, groups| {
             pipeline::dispatch_grid(encoder, label, pipeline, &bindings, groups)
         };
 
-        // Write the header, then, if the mesh has faces, size each patch
-        // region and flag owned faces and edges, scan both into region starts
-        // and task indices, and write every member.
+        // Write the header even for an empty mesh. For nonempty meshes,
+        // calculate patch sizes, turn them into offsets, and fill the buffers.
         run(encoder, "MOPMesh build arena header", header, [1, 1]);
         if members == 0 {
-            return Ok(arena);
+            return Ok([arena, masks]);
         }
+        run(encoder, "MOPMesh build size patches", size, patch_groups);
+        self.scan.encode(device, encoder, &regions, &region_plan);
+        self.scan
+            .encode(device, encoder, &mask_regions, &region_plan);
         run(
             encoder,
-            "MOPMesh build size arena regions",
-            size,
+            "MOPMesh build write patch records",
+            records,
             patch_groups,
         );
-        run(
-            encoder,
-            "MOPMesh build flag owned elements",
-            flag,
-            flag_groups,
-        );
-        self.scan.encode(device, encoder, &regions, &region_plan);
-        self.scan.encode(device, encoder, &tasks, &task_plan);
         run(encoder, "MOPMesh build write arena", write, member_groups);
-        Ok(arena)
+        Ok([arena, masks])
     }
 
     /// Builds the connectivity arena on the GPU in two submissions, reading
@@ -1039,7 +1046,7 @@ impl GpuBuilder {
             summary: &summary,
         };
         let patches = self.encode_patches(device, &mut encoder, input, &first)?;
-        let arena = self.encode_arena(
+        let [arena, masks] = self.encode_arena(
             device,
             &mut encoder,
             input,
@@ -1050,6 +1057,7 @@ impl GpuBuilder {
         queue.submit([encoder.finish()]);
         Ok(GpuBuild {
             arena,
+            masks,
             split,
             patches,
             summary,
@@ -1079,6 +1087,9 @@ impl GpuBuilder {
 pub(super) struct GpuBuild {
     /// The connectivity arena, with `STORAGE | COPY_SRC` usage.
     pub arena: wgpu::Buffer,
+    /// Slot bounds and bitmasks identifying active and owned elements.
+    /// Supports `STORAGE | COPY_SRC`; trailing zero words may be unused.
+    pub masks: wgpu::Buffer,
     /// Read only by tests, which check the split and patches against the CPU.
     #[cfg_attr(not(test), allow(dead_code))]
     pub split: FaceSplit,
@@ -1611,13 +1622,12 @@ mod tests {
                     vertex_members: sum(|p| p.vertex_ids().len()) as u32,
                 };
                 assert_eq!(summary, expected, "{name}");
-                let words = 4
-                    + 4 * mesh.face_count() as u32
-                    + 7 * summary.edges
+                let words = 8
+                    + 16 * patch_count
                     + summary.vertex_members
-                    + 2 * summary.edge_members
+                    + 3 * summary.edge_members
                     + 7 * summary.face_members;
-                assert_eq!(words as usize, arena.len(), "{name}: arena size");
+                assert_eq!(words as usize, arena.arena.len(), "{name}: arena size");
 
                 // Record and run the second phase.
                 let input = GpuMeshInput {
@@ -1641,13 +1651,14 @@ mod tests {
                     .encode_patches(&device, &mut encoder, &input, &first)
                     .unwrap();
                 let partition = &first.partition;
-                let gpu_arena = builder
+                let [gpu_arena, gpu_masks] = builder
                     .encode_arena(&device, &mut encoder, &input, partition, &summary, &stage)
                     .unwrap();
                 queue.submit([encoder.finish()]);
 
-                // The arena must match GpuMesh::upload's word for word.
-                test_support::assert_arena_eq(&name, &mesh, &read(&gpu_arena), &arena);
+                // The arena and masks must match GpuMesh::upload's word for word.
+                let (gpu_arena, gpu_masks) = (read(&gpu_arena), read(&gpu_masks));
+                test_support::assert_arena_eq(&name, &mesh, &gpu_arena, &gpu_masks, &arena);
                 if patches.is_empty() {
                     continue;
                 }
@@ -1709,6 +1720,7 @@ mod tests {
     /// The output of a full GPU build, read back for checking.
     struct Built {
         arena: Vec<u32>,
+        masks: Vec<u32>,
         face_patch: Vec<u32>,
         patch_sizes: Vec<crate::gpu::validate::PatchSizes>,
     }
@@ -1735,6 +1747,7 @@ mod tests {
         };
         let GpuBuild {
             arena,
+            masks,
             split,
             patches,
             ..
@@ -1759,6 +1772,7 @@ mod tests {
         face_patch.truncate(fixture.triangles.len());
         Ok(Built {
             arena: read(&arena),
+            masks: read(&masks),
             face_patch,
             patch_sizes,
         })
@@ -1887,6 +1901,7 @@ mod tests {
                     // The arena meets the contract.
                     let valid = crate::gpu::validate::validate_arena(
                         &built.arena,
+                        &built.masks,
                         fixture.positions.len(),
                         &fixture.triangles,
                         &built.patch_sizes,
@@ -1900,7 +1915,7 @@ mod tests {
                         .face_patches(&built.face_patch);
                     let (mesh, words) =
                         test_support::reference_with(&fixture, cpu, &device.limits()).unwrap();
-                    test_support::assert_arena_eq(&name, &mesh, &built.arena, &words);
+                    test_support::assert_arena_eq(&name, &mesh, &built.arena, &built.masks, &words);
 
                     // Quality: patch faces including ribbons, per input face. The
                     // GPU Morton split may round differently from the CPU's, but
@@ -1943,6 +1958,7 @@ mod tests {
                         gpu_build(&device, &queue, &builder, &fixture, method, size).unwrap();
                     assert_eq!(again.face_patch, built.face_patch, "{name}: repeat split");
                     assert_eq!(again.arena, built.arena, "{name}: repeat arena");
+                    assert_eq!(again.masks, built.masks, "{name}: repeat masks");
                 }
             }
         }
