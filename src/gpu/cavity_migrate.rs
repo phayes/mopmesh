@@ -278,6 +278,19 @@ pub(super) mod tests {
         /// Rounds in which every acting patch failed, leaving arena and
         /// masks byte-identical.
         unchanged_rounds: usize,
+        /// Maps that cleanup rebuilt because their erase count passed the
+        /// threshold, outside failed acting patches.
+        threshold_rebuilds: usize,
+    }
+
+    /// Returns each patch's three map erase counts.
+    fn erase_counts(maps: &[u32], patches: usize) -> Vec<[u32; 3]> {
+        (0..patches)
+            .map(|p| {
+                let at = layout::MAP_HEADER_WORDS * p + layout::MAP_ERASED_WORD;
+                [maps[at], maps[at + 1], maps[at + 2]]
+            })
+            .collect()
     }
 
     /// Runs three batches of migration rounds over every edge, on each
@@ -329,6 +342,10 @@ pub(super) mod tests {
                         assert!(round < 10_000, "{context}: rounds drain");
                         let context = format!("{context}, round {round}");
                         let before = [gpu.arena(), gpu.masks()].map(|b| read(&device, &queue, b));
+                        let patches = gpu.patch_count() as usize;
+                        let counts_before =
+                            erase_counts(&read(&device, &queue, gpu.maps()), patches);
+                        let mut failed_actors = BTreeSet::new();
 
                         // Model: group the selected requests by acting
                         // patch, migrate each, then clean every footprint.
@@ -370,6 +387,7 @@ pub(super) mod tests {
                                 }
                                 None => {
                                     seen.failures += 1;
+                                    failed_actors.insert(actor as usize);
                                     for &r in requests {
                                         let at = REQUEST_WORDS * r;
                                         words[at] = FAILED;
@@ -395,8 +413,19 @@ pub(super) mod tests {
                         assert_eq!(read_back, words, "{context}: requests");
                         let arena = read(&device, &queue, gpu.arena());
                         let masks = read(&device, &queue, gpu.masks());
-                        check_invariants(&arena, &masks, &read(&device, &queue, gpu.maps()));
+                        let maps = read(&device, &queue, gpu.maps());
+                        check_invariants(&arena, &masks, &maps);
                         check_exact_ribbons(&arena, &masks);
+                        for (p, (now, was)) in erase_counts(&maps, patches)
+                            .iter()
+                            .zip(&counts_before)
+                            .enumerate()
+                        {
+                            if !failed_actors.contains(&p) {
+                                seen.threshold_rebuilds +=
+                                    now.iter().zip(was).filter(|(n, w)| n < w).count();
+                            }
+                        }
                         for (p, view) in patch_views(&arena, &masks).into_iter().enumerate() {
                             assert_eq!(view, model_view(&sim, p as u32), "{context}: patch {p}");
                         }
@@ -433,6 +462,10 @@ pub(super) mod tests {
             "some acting patch has overlapping cavities"
         );
         assert!(seen.returns > 0, "some face returns to a former owner");
+        assert!(
+            seen.threshold_rebuilds > 0,
+            "cleanup rebuilds some map past its erase threshold"
+        );
     }
 
     #[test]

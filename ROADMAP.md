@@ -347,11 +347,19 @@ RXMesh.
     bound matters: with entries at least twice the capacity, it leaves
     `map_claim` room for every free slot, so no acting patch fails on a
     full map that preflight would pass, and keeps occupancy at or below
-    3/4. Reviewed with Codex and the advisor (a fixed occupancy threshold
-    was rejected: it can fail actors with free slots).
-  - Result (27 November 2026), interleaved A/B against ccf334e, 524 K
+    3/4. Codex and the advisor reviewed the design: a fixed occupancy
+    threshold was rejected, because it can fail actors that have free
+    slots. Codex's review of the committed code ran out of credits partway
+    through. By then it had found no counterexample to the bound or the
+    barrier order, and it flagged that the synthetic threshold test
+    doesn't cover concurrent erasures. `rounds_migrate_like_the_cpu_model`
+    now asserts that real rounds cross the threshold (1321 rebuilds, with
+    invariants checked after every round).
+  - Shortcut: an erase count only rises, so it overcounts when `map_set`
+    reuses an erased entry, and the map is rebuilt early.
+  - Result (27 November 2026), interleaved A/B against d810c2e, 524 K
     faces, identical statuses: cleanup 14.5–18.5 → 5.8–7.9 ms per batch;
-    cross-patch GPU time 52–58 → 45–49 ms (in order) and 67–70 → 59–63 ms
+    cross-patch GPU time 53–59 → 43–52 ms (in order) and 65–69 → 59–64 ms
     (shuffled); claim, fill and transfer unchanged. Delaunay settle of
     513x513 (7 runs per invocation, three invocations each): 936–944 →
     791–808 ms.

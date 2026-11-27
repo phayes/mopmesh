@@ -579,7 +579,8 @@ pub(super) mod inspect {
     /// edits must preserve:
     /// - owner tables point at active owned slots, one per global ID;
     /// - each patch holds at most one copy of an ID, and its maps record
-    ///   exactly its active slots;
+    ///   exactly its active slots, with no more erased entries than their
+    ///   erase counts and no count above a quarter of the map's entries;
     /// - edge and face rows reference active slots, and every copy agrees
     ///   with the owner's connectivity;
     /// - each edge joins two different vertices, and each face has three
