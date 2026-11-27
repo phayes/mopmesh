@@ -16,6 +16,7 @@
 //! `encode` allocates), submitting and waiting. GPU time, where the adapter
 //! supports timestamp queries, is the sum of each compute pass's own time;
 //! it leaves out gaps between passes.
+use super::adjacency::AdjacencyPlan;
 use super::baseline::{FlatMesh, FlatQueries};
 use super::bench::{ms, wait};
 use super::bench_meshes::{self, BenchMesh};
@@ -436,6 +437,13 @@ impl Bench {
             .unwrap();
         self.queue.submit([encoder.finish()]);
         wait(d);
+        let adjacency_plan = AdjacencyPlan::new(
+            &d.limits(),
+            gpu.vertex_count(),
+            gpu.face_count(),
+            gpu.edge_count(),
+        )
+        .unwrap();
 
         // Queries with an unpartitioned twin: (name, patched, flat).
         let paired: Vec<(&str, Record, Record)> = vec![
@@ -493,6 +501,13 @@ impl Bench {
             (
                 "boundary flags",
                 Box::new(|e| drop(self.boundary.encode(d, e, gpu).unwrap())),
+            ),
+            (
+                "VV (edge records given)",
+                Box::new(|e| {
+                    self.adjacency
+                        .record_vertex_neighbors(d, e, &adjacency_plan, &adjacency)
+                }),
             ),
             (
                 "smooth x10 (adjacency given)",
