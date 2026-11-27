@@ -56,11 +56,25 @@ public struct FlipQuad {
     status: u32,
 }
 
+// Returns true when `face` contains `edge` and runs it in the edge's stored
+// vertex order. Use it to choose which face to pass as `first` to `flip_quad`.
+public fn runs_stored_order(face: FaceEdges, edge: u32) -> bool {
+    for (var i = 0u; i < 3u; i++) {
+        if (face.edges[i] == edge) { return face.reversed[i] == 0u; }
+    }
+    return false;
+}
+
 // Finds the region that flipping `edge` would change. `first` and `second`
 // are the two faces on `edge`; `first_vertices` and `second_vertices` are the
 // stored endpoints of each face's three edges, in FaceEdges order. Returns
 // FLIP_DEGENERATE in `status` if either face doesn't contain `edge`, if both
 // run it in the same direction, or if c equals d.
+//
+// Pass as `first` the face for which `runs_stored_order` is true. Then a -> b
+// is the edge's stored order, and the flip writes `first` as a -> d -> c and
+// `second` as d -> b -> c, starting at those corners. Swapping the faces
+// gives the same triangles, but each starts at a different corner.
 public fn flip_quad(
     edge: u32,
     first: FaceEdges,
@@ -95,13 +109,15 @@ public fn flip_quad(
 }
 
 // The two faces that replace `first` and `second` after a flip, for a valid
-// `quad`. `new_edge` is the ID of the new edge, whose stored vertex order
-// must be (quad.c, quad.d). Returns a -> d -> c, then d -> b -> c.
+// `quad`. `new_edge` is the ID of the new edge. Pass `c_first` true when the
+// new edge is stored as (quad.c, quad.d), false when stored as (quad.d, quad.c).
+// Returns a -> d -> c, then d -> b -> c.
 public fn flipped_faces(
     quad: FlipQuad,
     first: FaceEdges,
     second: FaceEdges,
     new_edge: u32,
+    c_first: bool,
 ) -> array<FaceEdges, 2> {
     let i = quad.first_slot;
     let j = quad.second_slot;
@@ -109,15 +125,18 @@ public fn flipped_faces(
     let ca = (i + 2u) % 3u;
     let ad = (j + 1u) % 3u;
     let db = (j + 2u) % 3u;
-    // a -> d (from second), d -> c (new edge, against its stored order), c -> a (from first).
+    // Direction flags for the new edge: d -> c in the first face, c -> d in the second.
+    let dc_reversed = select(0u, 1u, c_first);
+    let cd_reversed = 1u - dc_reversed;
+    // a -> d (from second), d -> c (new edge), c -> a (from first).
     let adc = FaceEdges(
         vec3(second.edges[ad], new_edge, first.edges[ca]),
-        vec3(second.reversed[ad], 1u, first.reversed[ca]),
+        vec3(second.reversed[ad], dc_reversed, first.reversed[ca]),
     );
-    // d -> b (from second), b -> c (from first), c -> d (new edge, in its stored order).
+    // d -> b (from second), b -> c (from first), c -> d (new edge).
     let dbc = FaceEdges(
         vec3(second.edges[db], first.edges[bc], new_edge),
-        vec3(second.reversed[db], first.reversed[bc], 0u),
+        vec3(second.reversed[db], first.reversed[bc], cd_reversed),
     );
     return array(adc, dbc);
 }
@@ -133,15 +152,17 @@ public fn flipped_faces(
 //
 //   1. Find the edge's owning patch through the edge owner table, and decode
 //      that patch's record with `decode_record` (topology::patch).
-//   2. Find the two active faces on the edge, then call `flip_quad`. Stop
-//      unless its status is FLIP_DONE.
+//   2. Find the two active faces on the edge, then call `flip_quad` with the
+//      face that runs the edge in its stored order (`runs_stored_order`) as
+//      `first`. Stop unless its status is FLIP_DONE.
 //   3. Check that all four corners are interior to the patch (interior mask),
 //      and that no active edge already joins c and d. Otherwise stop with
 //      FLIP_NOT_INTERIOR or FLIP_CONNECTED.
 //   4. Pick one inactive edge slot and two inactive face slots, using
 //      `free_bit` on active-mask words. Stop with FLIP_OUT_OF_CAPACITY if
 //      there aren't enough.
-//   5. Call `flip_writes` and apply every entry:
+//   5. Call `flip_writes`, giving the mesh-wide vertex IDs of c and d in
+//      `FlipSlots`, and apply every entry:
 //        for (var i = 0u; i < FLIP_ARENA_WRITES; i++) {
 //            let w = writes.arena[i];
 //            arena[w.offset] = w.value;
@@ -259,8 +280,11 @@ public struct FlipWrites {
 // The local slots a flip frees and fills, and the global IDs it carries over.
 // `edge`, `first` and `second` are the old edge and its two faces, in the
 // order passed to `flip_quad`. `new_edge`, `new_first` and `new_second` are
-// inactive slots picked by the caller, all different. `global_*` are the
-// global IDs stored at the old slots. The new edge and faces keep them.
+// inactive slots picked by the caller, all different. `global_edge`,
+// `global_first` and `global_second` are the global IDs stored at the old
+// slots. The new edge and faces keep them. `global_c` and `global_d` are the
+// mesh-wide vertex IDs of `quad.c` and `quad.d`; the new edge stores the one
+// with the smaller ID first.
 public struct FlipSlots {
     edge: u32,
     first: u32,
@@ -271,6 +295,8 @@ public struct FlipSlots {
     global_edge: u32,
     global_first: u32,
     global_second: u32,
+    global_c: u32,
+    global_d: u32,
 }
 
 // Returns the lowest clear bit (0-31) of an active-mask word, or 32 if every
@@ -297,7 +323,8 @@ public fn flip_writes(
     const INVALID: u32 = 0xffffffffu;
     var out: FlipWrites;
     var n = 0u;
-    let new_faces = flipped_faces(quad, first, second, slots.new_edge);
+    let c_first = slots.global_c < slots.global_d;
+    let new_faces = flipped_faces(quad, first, second, slots.new_edge, c_first);
     let old_faces = array(slots.first, slots.second);
     let new_slots = array(slots.new_first, slots.new_second);
     let globals = array(slots.global_first, slots.global_second);
@@ -316,10 +343,11 @@ public fn flip_writes(
         out.arena[n] = ArenaWrite(global_face_offset(r, old_faces[f]), INVALID); n++;
     }
 
-    // Store the new edge c-d and point its owner entry at the new slot.
+    // Store the new edge c-d in ascending global vertex order, and point its
+    // owner entry at the new slot.
     let new_ev = edge_vertices_offset(r, slots.new_edge);
-    out.arena[n] = ArenaWrite(new_ev, quad.c); n++;
-    out.arena[n] = ArenaWrite(new_ev + 1u, quad.d); n++;
+    out.arena[n] = ArenaWrite(new_ev, select(quad.d, quad.c, c_first)); n++;
+    out.arena[n] = ArenaWrite(new_ev + 1u, select(quad.c, quad.d, c_first)); n++;
     out.arena[n] = ArenaWrite(global_edge_offset(r, slots.new_edge), slots.global_edge); n++;
     out.arena[n] = ArenaWrite(owner_offset(edge_owners, slots.global_edge) + 1u, slots.new_edge); n++;
 

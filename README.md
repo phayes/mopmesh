@@ -526,10 +526,11 @@ let statuses = flips.encode(&device, &mut encoder, &mut editable, &edge_ids)?;
 ```
 
 Flipping an edge shared by two triangles replaces it with the other diagonal
-of the four-sided region they form: triangles `a -> b -> c` and `b -> a -> d`
-become `a -> d -> c` and `d -> b -> c`. The flipped edge keeps its edge ID,
-and the two new faces take the two old faces' IDs, so edge and face
-attributes keep their slots. Their values are left as they were; recompute
+of the four-sided region they form. For edge `a-b` with `a < b`, triangles
+`a -> b -> c` and `b -> a -> d` become `a -> d -> c` and `d -> b -> c`, each
+keeping its face ID and starting at those corners. The flipped edge keeps its
+edge ID, and its endpoints `c` and `d` are stored in ascending order like every
+other edge, so edge and face attributes keep their slots. Their values are left as they were; recompute
 them if they depend on the changed connectivity. Edge IDs on an edited mesh
 no longer follow the ascending vertex-pair order of a freshly built mesh.
 
@@ -565,14 +566,16 @@ dispatch, using its own bindings. Bind `GpuEditableMesh::arena()` as
 1. Look up the edge's patch and local slot in the edge owner table
    (`owner_offset(arena[OWNERS_WORD + EDGE], edge)`), and decode that patch's
    record.
-2. Find the edge's two active faces in that patch and call `flip_quad`.
-   Continue only if its `status` is `FLIP_DONE`.
+2. Find the edge's two active faces in that patch and call `flip_quad`, passing
+   first the face for which `runs_stored_order(face, edge)` is true. Continue
+   only if its `status` is `FLIP_DONE`.
 3. Apply your own condition, for example "the new edge is shorter".
 4. Check the library's preconditions: all four corners set in the patch's
    interior mask, no active edge already joining `c` and `d`, and one free edge
    slot and two free face slots (`free_bit` on active-mask words, below the
    record's capacity).
-5. Call `flip_writes` and apply every entry: store each `ArenaWrite`, and
+5. Call `flip_writes`, with the mesh-wide vertex IDs of `c` and `d` in
+   `FlipSlots::global_c` and `global_d`, and apply every entry: store each `ArenaWrite`, and
    apply each `MaskUpdate` with `atomicOr` (`MASK_SET`), `atomicAnd` of the
    complement (`MASK_CLEAR`) or `atomicMax` (`MASK_MAX`).
 

@@ -8,7 +8,7 @@ import mopmesh::topology::patch::{
     face_edge_offset, edge_vertices_offset, global_vertex_offset, global_face_offset,
 };
 import mopmesh::topology::flip::{
-    FaceEdges, FlipSlots, flip_quad, flip_writes, free_bit,
+    FaceEdges, FlipSlots, flip_quad, flip_writes, free_bit, runs_stored_order,
     MASK_SET, MASK_CLEAR, FLIP_ARENA_WRITES, FLIP_MASK_UPDATES,
     FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR,
     FLIP_CONNECTED, FLIP_OUT_OF_CAPACITY, FLIP_NOT_AN_EDGE,
@@ -82,6 +82,9 @@ fn flip_if_shorter(global_edge: u32) -> u32 {
         }
     }
     if (found < 2u) { return FLIP_BOUNDARY; }
+    if (!runs_stored_order(face_edges(r, faces[0]), edge)) {
+        faces = array(faces[1], faces[0]);
+    }
     let first = face_edges(r, faces[0]);
     let second = face_edges(r, faces[1]);
     let quad = flip_quad(
@@ -118,6 +121,7 @@ fn flip_if_shorter(global_edge: u32) -> u32 {
     let slots = FlipSlots(
         edge, faces[0], faces[1], new_edge, new_first, new_second, global_edge,
         arena[global_face_offset(r, faces[0])], arena[global_face_offset(r, faces[1])],
+        arena[global_vertex_offset(r, quad.c)], arena[global_vertex_offset(r, quad.d)],
     );
     let writes = flip_writes(r, edge_owners, face_owners, quad, first, second, slots);
     for (var i = 0u; i < FLIP_ARENA_WRITES; i++) {

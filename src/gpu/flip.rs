@@ -9,8 +9,12 @@ use wgpu::util::DeviceExt;
 /// [`Flipped`](Self::Flipped) leaves the mesh unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipStatus {
-    /// The edge was flipped. It keeps its edge ID, and the two new faces
-    /// take the two old faces' IDs.
+    /// The edge was flipped. It keeps its edge ID and now joins the other two
+    /// corners, with endpoints in ascending order. If the edge was `a-b`
+    /// (`a < b`) with faces `a -> b -> c` and `b -> a -> d`, those faces keep
+    /// their IDs and become `a -> d -> c` and `d -> b -> c`, starting at those
+    /// corners. Flipping the edge back restores the triangles but swaps the
+    /// two faces' IDs.
     Flipped,
     /// The edge is on the mesh boundary, with only one face.
     Boundary,
@@ -308,7 +312,8 @@ const SLOT_WORDS: u32 = 7;
 mod tests {
     use super::*;
     use crate::gpu::editable::inspect::{
-        PatchView, check_owner_tables, edge_endpoints as edge_endpoints_after, patch_views, records,
+        PatchView, check_owner_tables, edge_endpoints as edge_endpoints_after, face_vertices,
+        patch_views, records,
     };
     use crate::gpu::editable::{EditCapacity, editable_contents};
     use crate::gpu::test_support::{self, fixtures};
@@ -420,6 +425,36 @@ mod tests {
                 [vs[0], vs[1], vs[2]]
             })
             .collect()
+    }
+
+    /// Applies flips by the documented face-ID rule: for edge `[a, b]` in
+    /// stored (ascending) order, the face running a -> b -> c becomes
+    /// a -> d -> c and the face running b -> a -> d becomes d -> b -> c,
+    /// starting at those corners. Triangles are indexed by face ID, and
+    /// unflipped triangles keep their input corner order.
+    fn documented_flips(triangles: &[[u32; 3]], edges: &[[u32; 2]]) -> Vec<[u32; 3]> {
+        let mut tris = triangles.to_vec();
+        let runs = |t: &[u32; 3], a, b| (0..3).any(|k| t[k] == a && t[(k + 1) % 3] == b);
+        for &[a, b] in edges {
+            let first = tris.iter().position(|t| runs(t, a, b)).unwrap();
+            let second = tris.iter().position(|t| runs(t, b, a)).unwrap();
+            let opposite = |t: &[u32; 3]| *t.iter().find(|&&x| x != a && x != b).unwrap();
+            let (c, d) = (opposite(&tris[first]), opposite(&tris[second]));
+            tris[first] = [a, d, c];
+            tris[second] = [d, b, c];
+        }
+        tris
+    }
+
+    /// Asserts that every global face in `arena` holds the triangle at its ID.
+    fn assert_faces_by_id(arena: &[u32], expected: &[[u32; 3]], context: &str) {
+        for (face, &t) in expected.iter().enumerate() {
+            assert_eq!(
+                face_vertices(arena, face as u32),
+                t,
+                "{context}: face {face}"
+            );
+        }
     }
 
     /// Predicts the flip of the edge `u-v` from the input triangles and patch
@@ -577,6 +612,11 @@ mod tests {
                                     expected.new_edge,
                                     "{context}: edge {edge}"
                                 );
+                                assert_faces_by_id(
+                                    &arena,
+                                    &documented_flips(&fixture.triangles, &[uv]),
+                                    &context,
+                                );
                                 // Upload afresh for the next edge.
                                 editable = None;
                             }
@@ -625,17 +665,31 @@ mod tests {
     fn flipping_twice_restores_the_mesh_and_counts_versions() {
         let gpu = Gpu::new();
         let capacity = EditCapacity::default();
-        let (_, mesh, edge) = single_patch_grid();
+        let (fixture, mesh, edge) = single_patch_grid();
         let mut editable = GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
         let original = patch_views(&gpu.read(editable.arena()), &gpu.read(editable.masks()));
+        let ab = edge_endpoints(&mesh)[edge as usize];
         assert_eq!(editable.version(), 0);
         assert_eq!(gpu.flip(&mut editable, edge), FlipStatus::Flipped);
-        let flipped = patch_views(&gpu.read(editable.arena()), &gpu.read(editable.masks()));
-        assert_ne!(flipped, original);
+        let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
+        assert_ne!(patch_views(&arena, &masks), original);
+        let cd = edge_endpoints_after(&arena, edge);
+        assert_faces_by_id(
+            &arena,
+            &documented_flips(&fixture.triangles, &[ab]),
+            "first flip",
+        );
+
+        // Flipping back restores the mesh, but swaps the two faces' IDs.
         assert_eq!(gpu.flip(&mut editable, edge), FlipStatus::Flipped);
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
         check_owner_tables(&arena, &masks);
         assert_eq!(patch_views(&arena, &masks), original);
+        assert_faces_by_id(
+            &arena,
+            &documented_flips(&fixture.triangles, &[ab, cd]),
+            "second flip",
+        );
 
         // Rejected flips count as edits too.
         assert_eq!(gpu.flip(&mut editable, u32::MAX), FlipStatus::NotAnEdge);
@@ -651,15 +705,24 @@ mod tests {
         let capacity = EditCapacity::new(1.05).unwrap();
         let (fixture, mesh, edge) = single_patch_grid();
         let mut editable = GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
+        let mut flipped = vec![edge_endpoints(&mesh)[edge as usize]];
         for round in 0..20 {
             assert_eq!(
                 gpu.flip(&mut editable, edge),
                 FlipStatus::Flipped,
                 "round {round}"
             );
+            // Track the edge's endpoints so its next flip can be replayed.
+            flipped.push(edge_endpoints_after(&gpu.read(editable.arena()), edge));
         }
+        flipped.pop();
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
         check_owner_tables(&arena, &masks);
+        assert_faces_by_id(
+            &arena,
+            &documented_flips(&fixture.triangles, &flipped),
+            "after 20 flips",
+        );
         assert_eq!(
             patch_views(&arena, &masks),
             rebuilt_views(&mesh, &fixture, &fixture.triangles),
@@ -818,6 +881,11 @@ mod tests {
                 patch_views(&arena, &masks),
                 rebuilt_views(&mesh, &fixture, &triangles),
                 "{context}"
+            );
+            assert_faces_by_id(
+                &arena,
+                &documented_flips(&fixture.triangles, &flipped),
+                &context,
             );
             for (&edge, status) in edges.iter().zip(&statuses) {
                 if *status == FlipStatus::Flipped {

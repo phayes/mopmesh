@@ -275,7 +275,7 @@ pub(super) mod inspect {
 
     /// One patch's active elements, each as global vertex IDs. Faces are
     /// rotated to start at their smallest vertex, keeping their winding;
-    /// edges are sorted.
+    /// edges are in stored order, which is ascending on a valid arena.
     #[derive(Debug, PartialEq, Eq, Default)]
     pub struct PatchView {
         pub vertices: BTreeSet<u32>,
@@ -346,8 +346,7 @@ pub(super) mod inspect {
                 let vertex = |local: u32| arena[(r.vertex_ids + local) as usize];
                 let edge = |slot: u32| {
                     let at = (r.ev + layout::EV_WORDS * slot) as usize;
-                    let [a, b] = [vertex(arena[at]), vertex(arena[at + 1])];
-                    [a.min(b), a.max(b)]
+                    [vertex(arena[at]), vertex(arena[at + 1])]
                 };
                 let face = |slot: u32| {
                     rotate([0, 1, 2].map(|i| {
@@ -389,14 +388,26 @@ pub(super) mod inspect {
             .collect()
     }
 
-    /// Returns the sorted global endpoints of global edge `edge`, found through
-    /// its owner-table entry.
+    /// Returns the global endpoints of global edge `edge` in stored order,
+    /// found through its owner-table entry.
     pub fn edge_endpoints(arena: &[u32], edge: u32) -> [u32; 2] {
         let at = (arena[layout::OWNERS[1]] + layout::OWNER_WORDS * edge) as usize;
         let r = &records(arena)[arena[at] as usize];
         let ev = (r.ev + layout::EV_WORDS * arena[at + 1]) as usize;
-        let [a, b] = [arena[ev], arena[ev + 1]].map(|v| arena[(r.vertex_ids + v) as usize]);
-        [a.min(b), a.max(b)]
+        [arena[ev], arena[ev + 1]].map(|v| arena[(r.vertex_ids + v) as usize])
+    }
+
+    /// Returns the global vertices of global face `face` in stored corner
+    /// order, found through its owner-table entry.
+    pub fn face_vertices(arena: &[u32], face: u32) -> [u32; 3] {
+        let at = (arena[layout::OWNERS[2]] + layout::OWNER_WORDS * face) as usize;
+        let r = &records(arena)[arena[at] as usize];
+        let slot = arena[at + 1];
+        [0, 1, 2].map(|i| {
+            let fe = (r.fe + layout::FE_WORDS * slot + 2 * i) as usize;
+            let ev = (r.ev + layout::EV_WORDS * arena[fe] + arena[fe + 1]) as usize;
+            arena[(r.vertex_ids + arena[ev]) as usize]
+        })
     }
 
     /// Panics unless every owner-table entry points at an active, owned slot

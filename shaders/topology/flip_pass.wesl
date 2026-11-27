@@ -26,6 +26,7 @@ import super::patch::{
 };
 import super::flip::{
     FaceEdges, FlipQuad, FlipSlots, flip_quad, flip_writes, free_bit, flip_priority,
+    runs_stored_order,
     MASK_SET, MASK_CLEAR, FLIP_ARENA_WRITES, FLIP_MASK_UPDATES,
     FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR, FLIP_CONNECTED,
     FLIP_LOST_CLAIM, FLIP_OUT_OF_CAPACITY, FLIP_NOT_AN_EDGE,
@@ -58,8 +59,8 @@ const STAGE_RESERVED: u32 = 2u;
 // when the status is FLIP_DONE.
 //
 // `corners` contains mesh-wide vertex IDs [a, b, c, d]. The current edge
-// joins a to b; the replacement would join c to d. The two triangles are
-// oriented a -> b -> c and b -> a -> d. Pass the candidate unchanged to
+// joins a to b, with a -> b in the edge's stored order; the replacement would
+// join c to d. The two triangles are oriented a -> b -> c and b -> a -> d. Pass the candidate unchanged to
 // `flip_claim`; its remaining fields are not application inputs.
 public struct FlipCandidate {
     status: u32,
@@ -154,6 +155,12 @@ public fn flip_candidate(index: u32, global_edge: u32) -> FlipCandidate {
     }
     out.status = FLIP_BOUNDARY;
     if (found < 2u) { return out; }
+
+    // Put the face that runs the edge in its stored order first, so each
+    // replacement face starts at the documented corner.
+    if (!runs_stored_order(face_edges(r, faces[0]), at.edge)) {
+        faces = array(faces[1], faces[0]);
+    }
     let quad = quad_of(at, face_edges(r, faces[0]), face_edges(r, faces[1]));
     out.status = quad.status;
     if (quad.status != FLIP_DONE) { return out; }
@@ -262,8 +269,10 @@ public fn flip_reserve(index: u32) -> u32 {
 
 // Applies a reserved flip and returns true, or returns false if the request
 // was not reserved. Call once per request in a separate dispatch after all
-// reservations finish. A successful flip preserves the mesh-wide edge ID
-// and the two face IDs.
+// reservations finish. A successful flip keeps the mesh-wide edge ID, now
+// joining c and d with the smaller vertex ID first. The face a -> b -> c
+// becomes a -> d -> c, and b -> a -> d becomes d -> b -> c, each keeping its
+// face ID.
 public fn flip_commit(index: u32) -> bool {
     let base = index * SLOT_WORDS;
     if (slots[base + SLOT_STAGE] != STAGE_RESERVED) { return false; }
@@ -276,14 +285,16 @@ public fn flip_commit(index: u32) -> bool {
     let second_slot = slots[base + SLOT_FACES + 1u];
     let first = face_edges(r, first_slot);
     let second = face_edges(r, second_slot);
+    let quad = quad_of(at, first, second);
+    let global = corners(r, quad);
     let picked = FlipSlots(
         at.edge, first_slot, second_slot,
         slots[base + SLOT_NEW], slots[base + SLOT_NEW + 1u], slots[base + SLOT_NEW + 2u],
         global_edge, arena[global_face_offset(r, first_slot)], arena[global_face_offset(r, second_slot)],
+        global[2], global[3],
     );
     let writes = flip_writes(
-        r, arena[OWNERS_WORD + EDGE], arena[OWNERS_WORD + FACE],
-        quad_of(at, first, second), first, second, picked,
+        r, arena[OWNERS_WORD + EDGE], arena[OWNERS_WORD + FACE], quad, first, second, picked,
     );
 
     // Write the replacement data. Update masks atomically because other flips
