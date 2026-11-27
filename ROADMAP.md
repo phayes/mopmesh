@@ -13,20 +13,24 @@ contracts in the README alongside the code.
 
 The prototype has the planned static adjacency families, canonical vertex
 attributes, hierarchical scans, and two runnable downstream WESL examples.
-Geometry algorithms have begun; topology editing has not. Meshes can be built
-and partitioned on the CPU (`MeshBuilder`, then `GpuMesh::upload`) or entirely
-on the GPU (`GpuMeshBuilder`); both run the same query suite against Alum.
-Uploaded topology is immutable.
+Geometry algorithms have begun, and so has topology editing:
+`GpuEditableMesh` supports single and parallel interior edge flips, every
+query runs on edited meshes through `GpuTopology`, and results from before an
+edit are rejected with `GpuError::Stale`. Meshes can be built and partitioned
+on the CPU (`MeshBuilder`, then `GpuMesh::upload`) or entirely on the GPU
+(`GpuMeshBuilder`); both run the same query suite against Alum. Static
+uploads (`GpuMesh`) are immutable.
 
 The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run passed 42 tests: 22 hardware-independent tests
-and 20 opt-in GPU tests (two are the GPU build and baseline benchmarks, which
+The last full verification run (27 November 2026, commit `746a47f`) passed
+61 tests: 27 hardware-independent tests and 34 opt-in GPU tests (two are the GPU build and baseline benchmarks, which
 return at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
-checks passed, and all three examples ran. GPU execution has only been verified on
+checks passed, and all four runnable examples ran (the Alum benchmark
+example was not run). GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
 
 Evidence lives in [host topology tests](tests/static_topology.rs),
@@ -284,10 +288,14 @@ local cavities. The current Cargo version does not mean that release scope is co
    connectivity in global arrays) on generated grids, spheres, tori and
    irregular grids, each also with shuffled IDs, at 32 K–2.1 M faces and
    patch sizes 32–512. It reports setup, bytes per face, ribbon overhead,
-   wall and per-pass GPU time, dispatches, buffers and bind groups. The arena
-   is slower on every query today: edge records 5.8x and batched adjacency
-   2.9x at 2.1 M faces in input order, 1.8x and 1.15x shuffled. It uses
-   3.6–4x the memory. Scratch bytes are not measured, because Metal does not
+   wall and per-pass GPU time, dispatches, buffers and bind groups. It was
+   rerun after Milestone 3 (27 November 2026). At 2.1 M faces and patch size
+   128, the arena now beats the flat layout on shuffled meshes for batched
+   adjacency (0.75x) and matches it for edge records (0.97–1.08x). In input
+   order it is still slower: edge records 2.6–3.2x and batched adjacency
+   1.6–1.9x, from 5.8x and 2.9x in Milestone 2. It uses 2.3–2.9x the
+   memory, from 3.6–4x. Patch size 512 is faster and smaller than 128 on
+   every staged query. Scratch bytes are not measured, because Metal does not
    report buffer memory. The [approximate comparison against Alum](docs/approximate_benchmark.md)
    remains for the GPU build and single-thread CPU numbers. Open:
    - [ ] Report scratch bytes per query, from wgpu's buffer-memory counter
@@ -295,8 +303,7 @@ local cavities. The current Cargo version does not mean that release scope is co
    - [ ] Rerun on real scanned meshes (`MOPMESH_BENCH_OBJ`) once the Phase 0
      benchmark meshes are curated.
    - [ ] Rerun on a second adapter, ideally a discrete GPU.
-3. **Workgroup-local traversal (Milestone 3) — steps 1–3 done, step 4
-   skipped, step 5 open.** Each staged query runs one workgroup per patch and
+3. **Workgroup-local traversal (Milestone 3) — done.** Each staged query runs one workgroup per patch and
    finds each edge's faces in workgroup memory. Editing is a headline feature
    and the design follows RXMesh, so static and editable meshes share one
    patch layout and one set of staged kernels. The
@@ -314,11 +321,19 @@ local cavities. The current Cargo version does not mean that release scope is co
    - [x] Step 4 skipped (27 November 2026): VV alone is 0.9–1.1 ms in input
      order and 2.4–2.7 ms shuffled, a quarter of shuffled adjacency, so
      staging it could save little and would likely slow input order.
-   - [ ] Step 5: clean benchmark rerun and report update; see the plan.
-   - Follow-ups, not scheduled: the staged pass is still 2.5–3x the flat
-     edge pass in input order and is most of the shuffled adjacency cost;
-     patch size 32 runs 3.5–4x slower than before; an all-active static
-     reader could recover 5–15%; staging FE is untried.
+   - [x] Step 5: clean benchmark rerun (three runs) and
+     [report](docs/baseline_benchmark.md) update.
+   - Follow-ups, not scheduled:
+     - [ ] Profile the staged pass: still 2.6–3.2x the flat edge pass in
+       input order, and most of the shuffled adjacency cost.
+     - [ ] Patch size 32 is about 3x slower than in Milestone 2 (deferred).
+     - [ ] Decide the default patch size: 512 beat 128 on every staged query
+       and used 65–75 against 83–103 B/face.
+     - [ ] Per-face queries are 9–27% slower than in Milestone 2; an
+       all-active static reader could recover 5–15%.
+     - [ ] Give the benchmark's "VV, edge records given" row its own output,
+       so the smoothing row after it measures a clean adjacency.
+     - [ ] Staging FE is untried.
 4. **Complete useful static functionality — done.** Edge/face attributes,
    normals, areas, boundary flags, reductions and smoothing landed with
    documented contracts, reference checks and the `smoothing` example. Their

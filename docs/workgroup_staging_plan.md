@@ -1,10 +1,12 @@
 # Milestone 3 plan: workgroup staging
 
-Status: draft. Decided 26 November 2026: the static arena adopts the editable
-header and patch records. Steps 1 to 3 are done; see
-[Step 1 results](#step-1-results), [Step 2 results](#step-2-results) and
-[Step 3 results](#step-3-results). The remaining decisions are listed at the
-end.
+Status: complete (27 November 2026). Steps 1 to 3 and 5 are done and step 4
+was skipped; see [Step 1 results](#step-1-results),
+[Step 2 results](#step-2-results), [Step 3 results](#step-3-results) and
+[Step 5 results](#step-5-results). The step 2 and 3 speed tables are the
+measurements taken at the time; the
+[baseline report](baseline_benchmark.md) has the clean rerun. Decisions and
+remaining defaults are listed at the end.
 
 The direction behind it: follow RXMesh, editing a mesh is a headline feature,
 and in-kernel local queries should be revisited for editing. The Milestone 5
@@ -315,6 +317,31 @@ torus and irregular meshes, against today's face-task kernel:
   patch size 32 follow-up. It needs profiling before it is worth its
   workgroup memory.
 
+## Step 5 results
+
+The full baseline benchmark ran three times on commit `746a47f`, at
+32 K–2.1 M faces, patch sizes 32, 128 and 512, in input and shuffled
+order; the [baseline report](baseline_benchmark.md) has the tables and
+method. At 2.1 M faces and patch size 128:
+
+| Query | Order | Milestone 2 | Milestone 3 | Flat |
+|---|---|---:|---:|---:|
+| Edge records | input | 6.29–7.22 ms | 2.67–3.26 ms | 1.01–1.05 ms |
+| Edge records | shuffled | 6.42–7.49 ms | 3.54–3.93 ms | 3.65–3.66 ms |
+| VV + FF + diamonds + edges | input | 8.22–9.29 ms | 4.47–5.24 ms | 2.82–2.92 ms |
+| VV + FF + diamonds + edges | shuffled | 15.09–16.28 ms | 9.67–10.07 ms | 13.12–13.24 ms |
+| Boundary flags | both | 6.54–7.39 ms | 2.39–4.41 ms | – |
+| Memory | both | 129–145 B/face | 83–103 B/face | 36 B/face |
+
+- Patch size 512 is now the fastest setting measured, and the smallest:
+  edge records 1.6–1.9 ms in input order and 2.0–2.2 ms shuffled, batched
+  adjacency 3.4–3.8 and 8.9–9.2 ms, 65–75 B/face. The default is still 128.
+- Patch size 32 is about 3x slower than in milestone 2 (follow-up, deferred).
+- Per-face queries on the arena are 9–27% slower than in milestone 2.
+- The "10 smoothing steps, adjacency given" row probably reads a buffer the
+  preceding VV row rewrites, which would make it unreliable on shuffled
+  meshes; see the report.
+
 ## Steps
 
 1. **Prototype the staged edge kernel — done.** See above.
@@ -330,7 +357,9 @@ torus and irregular meshes, against today's face-task kernel:
    edge, FF and diamond pass is the other 7.2–7.5 ms. Staging VV could save
    at most part of 2.5 ms shuffled, and staged kernels have so far run
    2.5–3x slower than flat ones in input order, where VV costs under 1 ms.
-5. **Rerun the baseline and update the reports.**
+5. **Rerun the baseline and update the reports — done.** See
+   [Step 5 results](#step-5-results). The checklist below was followed,
+   with three runs instead of two because the first two disagreed in bursts.
    1. Before starting, ask the Milestone 5 session for a quiet GPU and CPU
       (no builds or tests) for the whole run, and tell it when done.
    2. Run on a clean committed tree:
