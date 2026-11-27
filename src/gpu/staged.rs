@@ -250,7 +250,10 @@ mod tests {
                         .patch_size(patch_size)
                         .build()
                         .unwrap();
-                    chunked |= mesh.patches().iter().any(|p| p.edge_ids().len() > 1024);
+                    chunked |= mesh
+                        .patches()
+                        .iter()
+                        .any(|p| p.edge_ids().len() > test_support::STAGED_EDGES);
                     let context = format!("{} at patch size {patch_size}", m.name);
                     check(&device, &queue, &q, &mesh, &context);
                 }

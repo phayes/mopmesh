@@ -7,10 +7,11 @@
 // own buffers and pass the values in. For ready-made loops over a read-only
 // arena, import `topology::patch_queries` instead.
 //
-// Vertex neighbors (VV) are built in memory shared by a workgroup of 64
-// invocations, for up to VV_ROWS vertex slots at a time. All 64 invocations
-// must run these steps in order, each in uniform control flow, with a
-// workgroupBarrier() after each one:
+// Vertex neighbors (VV) are built in memory shared by a workgroup of
+// PATCH_LANES invocations (from `topology::patch`), for up to VV_ROWS vertex
+// slots at a time. All PATCH_LANES invocations must run these steps in
+// order, each in uniform control flow, with a workgroupBarrier() after each
+// one:
 //
 // 1. vv_clear(lane).
 // 2. For every active edge of the patch, divided among the invocations:
@@ -25,13 +26,13 @@
 
 import super::directed_edge::directed_start;
 import super::csr::CsrRow;
+import super::patch::PATCH_LANES;
 
 // Vertex slots handled per chunk.
 public const VV_ROWS: u32 = 256u;
 // Neighbor entries that fit in shared memory per chunk. A vertex with more
 // neighbors than this is reported as oversized by vv_oversized.
 public const VV_ENTRIES: u32 = 1024u;
-const LANES: u32 = 64u;
 
 var<workgroup> vv_cursor: array<atomic<u32>, 256>;
 var<workgroup> vv_start: array<u32, 256>;
@@ -63,10 +64,10 @@ public fn opposite_vertex(endpoints: vec2<u32>, reversed: u32) -> u32 {
     return directed_start(endpoints, reversed != 0u);
 }
 
-// Starts a VV chunk with no neighbors counted. All 64 invocations must call
-// this with their local_invocation_index as `lane`.
+// Starts a VV chunk with no neighbors counted. All PATCH_LANES invocations
+// must call this with their local_invocation_index as `lane`.
 public fn vv_clear(lane: u32) {
-    for (var i = lane; i < VV_ROWS; i += LANES) {
+    for (var i = lane; i < VV_ROWS; i += PATCH_LANES) {
         atomicStore(&vv_cursor[i], 0u);
     }
 }
@@ -86,7 +87,7 @@ public fn vv_count_edge(first: u32, endpoints: vec2<u32>) {
 // chunk; later slots wait for the next chunk, which starts at `end`. The
 // result is the same in every invocation and is always greater than
 // `first` when `first < vertex_end`. `vertex_end` is the patch's slot
-// bound for vertices. All 64 invocations must call this.
+// bound for vertices. All PATCH_LANES invocations must call this.
 public fn vv_plan(lane: u32, first: u32, vertex_end: u32) -> u32 {
     // One invocation assigns each row its place in the entry array, and
     // stops the chunk when the next row would not fit. A vertex whose row
@@ -116,7 +117,7 @@ public fn vv_plan(lane: u32, first: u32, vertex_end: u32) -> u32 {
     let end = workgroupUniformLoad(&vv_end);
 
     // Reset the cursors for the scatter step.
-    for (var i = lane; i < VV_ROWS; i += LANES) {
+    for (var i = lane; i < VV_ROWS; i += PATCH_LANES) {
         atomicStore(&vv_cursor[i], 0u);
     }
     workgroupBarrier();

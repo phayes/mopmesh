@@ -11,6 +11,7 @@ import mopmesh::topology::flip_pass::{
 };
 import mopmesh::topology::flip::FLIP_DONE;
 import mopmesh::topology::patch_staging::STAGED_EDGES;
+import mopmesh::topology::patch::PATCH_LANES;
 import mopmesh::parallel::grid::flat_group;
 
 @group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
@@ -40,7 +41,7 @@ fn should_flip(corners: array<u32, 4>) -> bool {
 // flips a non-conflicting set of the requested edges. Edges that can't flip
 // report why; eligible edges that pass the angle test report
 // FLIP_NOT_REQUESTED.
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn flip(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -52,7 +53,7 @@ fn flip(
     let edges = flip_edge_end(lane, r);
     for (var first = 0u; first < edges; first += STAGED_EDGES) {
         flip_stage(lane, r, first);
-        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += PATCH_LANES) {
             let c = flip_candidate(r, first, e);
             flip_request(c, c.status != FLIP_DONE || should_flip(c.corners));
         }

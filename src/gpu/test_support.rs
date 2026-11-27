@@ -7,6 +7,11 @@ use wgpu::util::DeviceExt;
 #[path = "../../tests/support/fixtures.rs"]
 pub mod fixtures;
 
+/// Edge slots staged per chunk; the value of `STAGED_EDGES` in
+/// `topology::patch_staging`. A patch with more edge slots than this is
+/// staged in several chunks.
+pub const STAGED_EDGES: usize = 512;
+
 /// Creates a device and queue on the default adapter with `limits`; pass
 /// `wgpu::Limits::default()` to test against portable WebGPU limits. Panics if no
 /// adapter is available, so an opt-in GPU test never passes without running.

@@ -1,5 +1,5 @@
 import package::shaders::topology::edge::{EdgeRecord, INVALID_FACE, INVALID_VERTEX};
-import package::shaders::topology::patch::{PatchRecord, EDGE};
+import package::shaders::topology::patch::{PatchRecord, EDGE, PATCH_LANES};
 import package::shaders::topology::patch_arena::{
     patch_count, patch_record, slot_active, slot_owned, face_edge, edge_vertices,
     global_vertex, global_edge, global_face,
@@ -32,7 +32,7 @@ fn edge_record(r: PatchRecord, e: u32, local: vec2<u32>) -> EdgeRecord {
 
 // Writes each mesh edge's endpoints and adjoining faces. One workgroup
 // handles each patch, and only the patch that owns an edge writes it.
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -45,7 +45,7 @@ fn main(
     for (var first = 0u; first < edges; first += STAGED_EDGES) {
         stage_patch_edges(lane, r, first, edges);
         let end = min(edges, first + STAGED_EDGES);
-        for (var e = first + lane; e < end; e += 64u) {
+        for (var e = first + lane; e < end; e += PATCH_LANES) {
             if (!slot_active(r, EDGE, e) || !slot_owned(r, EDGE, e)) { continue; }
             records[global_edge(r, e)] = edge_record(r, e, staged_edge_faces(first, e));
         }
@@ -56,7 +56,7 @@ fn main(
 // Writes the same edge records as `main`, together with each face's
 // neighbors and each edge's diamond. The patch that owns an edge holds both
 // of its faces, so it fills both faces' neighbor entries for that edge.
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn adjacency(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -69,7 +69,7 @@ fn adjacency(
     for (var first = 0u; first < edges; first += STAGED_EDGES) {
         stage_patch_edges(lane, r, first, edges);
         let end = min(edges, first + STAGED_EDGES);
-        for (var e = first + lane; e < end; e += 64u) {
+        for (var e = first + lane; e < end; e += PATCH_LANES) {
             if (!slot_active(r, EDGE, e) || !slot_owned(r, EDGE, e)) { continue; }
             let local = staged_edge_faces(first, e);
             let record = edge_record(r, e, local);

@@ -133,7 +133,7 @@ impl Kernels {
                 entry_point: Some(entry_point),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &constants,
-                    ..Default::default()
+                    ..pipeline::NO_ZERO_FILL
                 },
                 cache: None,
             })

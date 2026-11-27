@@ -1,5 +1,5 @@
 import package::shaders::topology::edge::is_boundary_edge;
-import package::shaders::topology::patch::EDGE;
+import package::shaders::topology::patch::{EDGE, PATCH_LANES};
 import package::shaders::topology::patch_arena::{
     patch_count, patch_record, slot_active, slot_owned, edge_vertices, global_vertex, global_edge,
 };
@@ -15,7 +15,7 @@ import package::shaders::parallel::grid::flat_group;
 
 // Flags boundary edges and their endpoints. One workgroup handles each
 // patch, and only the patch that owns an edge writes its flag.
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -28,7 +28,7 @@ fn main(
     for (var first = 0u; first < edges; first += STAGED_EDGES) {
         stage_patch_edges(lane, r, first, edges);
         let end = min(edges, first + STAGED_EDGES);
-        for (var e = first + lane; e < end; e += 64u) {
+        for (var e = first + lane; e < end; e += PATCH_LANES) {
             if (!slot_active(r, EDGE, e) || !slot_owned(r, EDGE, e)) { continue; }
             let boundary = is_boundary_edge(staged_edge_faces(first, e));
             edge_mask[global_edge(r, e)] = select(0u, 1u, boundary);

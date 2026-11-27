@@ -349,6 +349,90 @@ method. At 2.1 M faces and patch size 128:
   fixed that, and a third rerun there put adjacency back within noise of
   `746a47f`.
 
+## Staged pass profile
+
+Profiled on 27 November 2026 at `42aad9e`, on an Apple M1 Max at 2.1 M
+faces. Scratch copies of the edge-record kernel had parts removed, and
+staging sizes and lane counts varied. GPU time is per compute pass, from
+21 timed runs after 2 warm-ups, and every variant's records were checked
+against the flat kernel. The tables give minimum times; medians agreed
+except in noisy runs.
+
+**Where the time goes.** At patch size 512, the shipped kernel takes
+1.60 ms on the grid in input order. Staging alone takes 1.13 ms. The
+writes are cheap: the record writes take 0.31 ms including the patch
+record read, and the active-slot check under 0.1 ms. The 9–27% per-face
+slowdown therefore doesn't come from these checks, at least in this kernel.
+
+**The cost is workgroup memory, not staging work.** The grid at patch size
+128 never needs a second chunk, since it has at most 369 edge slots. Even
+so, its time tracks the declared size of `edge_faces`. There are two
+effects:
+
+1. wgpu zero-fills every workgroup's workgroup memory before it runs,
+   because `zero_initialize_workgroup_memory` is on by default. That costs
+   0.2 ms at patch size 512 and 0.74 ms at 128, where there are four times
+   as many workgroups. The staging functions already clear what they read.
+2. The 8 KB array limits how many workgroups run at once per GPU core. A
+   4 KB array is faster even when patches at 512 then need two or three
+   chunks, each rescanning the patch's faces. With 128 lanes per workgroup
+   instead of 64, the same memory serves twice the invocations.
+
+Edge records (ms; flat 1.02–1.06 in input order, 3.64–3.71 shuffled):
+
+| Lanes, staged edges, zero-fill | Grid 128 | Grid 512 | Sphere 128 | Sphere 512 | Shuffled grid 128 | Shuffled grid 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| 64, 1024, on (shipped) | 2.63 | 1.60 | 3.21 | 1.89 | 3.65 | 2.00 |
+| 64, 1024, off | 1.89 | 1.40 | 2.29 | 1.67 | 2.46 | 1.67 |
+| 64, 512, on | 1.55 | 1.24 | 1.98 | 1.51 | – | – |
+| 64, 512, off | 1.25 | 1.17 | 1.61 | 1.43 | – | – |
+| 128, 512, on | 1.31 | 0.97 | 1.71 | 1.20 | 1.94 | 1.44 |
+| 128, 512, off | 1.06 | 0.92 | 1.42 | 1.15 | 1.61 | 1.36 |
+
+Batched adjacency through `AdjacencyQuery`, zero-fill on (ms):
+
+| Configuration | Grid 128 | Grid 512 | Sphere 128 | Sphere 512 | Shuffled grid 128 | Shuffled grid 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flat | 2.78 | 2.78 | 2.80 | 2.84 | 13.10 | 13.10 |
+| 64 lanes, 1024 (shipped) | 4.55 | 3.48 | 5.35 | 3.90 | 9.84 | 8.66 |
+| 128 lanes, 512 | 2.82 | 2.45 | 3.35 | 2.79 | 9.58 | 9.13 |
+
+With 128 lanes and 512 staged edges, edge records on the grid at patch size
+512 beat the flat kernel. Batched adjacency beats it at patch size 512 on
+the grid and roughly matches it on the sphere.
+
+Caveats:
+
+- The 128-lane rows come from one or two runs each, and the shipped rows
+  from three. Sweep repeats agreed within 0.05 ms, apart from noisy bursts.
+- The adjacency output wasn't checked in the 128-lane configuration.
+- The shuffled grid at 512 came out 0.5 ms slower with 128 lanes, from a
+  single run. Recheck it before changing anything.
+- 256 lanes and 256 staged edges gave no gain over 128 and 512, each in
+  one noisy run.
+- Packing both local face slots of an edge into one word with workgroup
+  atomics would halve the memory again. Not tried.
+
+Other workgroup memory: `local_query` declares about 7 KB (`vv_entries`
+and three 256-entry tables). A kernel using both it and the staging array
+would hold about 15 KB per workgroup. If those kernels show the same
+pattern, the per-patch flip and editing kernels likely pay the same cost.
+Not measured.
+
+All three fixes were applied together, agreed with the Milestone 5
+session; benchmark results are pending:
+
+1. The crate's compute pipelines no longer zero-fill workgroup memory
+   (`pipeline::NO_ZERO_FILL`). Every kernel was checked to write its
+   workgroup variables before reading them. Pipelines that users build keep
+   wgpu's default, which is correct but slower.
+2. `STAGED_EDGES` is 512, so `edge_faces` takes 4 KB.
+3. Per-patch kernels run with `PATCH_LANES` (128) invocations, a public
+   constant in `topology::patch`. It replaces the 64-lane contract of
+   `patch_staging`, `patch_edge_staging`, `patch_queries`, `local_query`
+   and `flip_pass`, and is used by boundary flags, edge records,
+   adjacency, edge flips and the consumer examples.
+
 ## Steps
 
 1. **Prototype the staged edge kernel — done.** See above.
@@ -419,4 +503,7 @@ Default taken in step 3, not yet confirmed:
 
 - Does staging FE as well as edge faces help the later kernels enough to be
   worth its workgroup memory? Not tried in step 3; see
-  [Step 3 results](#step-3-results). Profile the staged pass first.
+  [Step 3 results](#step-3-results). The
+  [profile](#staged-pass-profile) shows that workgroup memory decides
+  occupancy here, so staging FE would probably slow the pass down unless
+  its memory came from somewhere else.

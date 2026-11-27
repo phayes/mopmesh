@@ -1,7 +1,8 @@
 // Finds the faces touching each edge of a patch using memory shared by a
-// group of 64 shader invocations. Process up to STAGED_EDGES local edge slots
-// at a time, starting at `first`. No buffer bindings are added; shared memory
-// use is STAGED_EDGES * 8 bytes per workgroup.
+// workgroup of PATCH_LANES invocations (from `topology::patch`). Process up
+// to STAGED_EDGES local edge slots at a time, starting at `first`. No buffer
+// bindings are added; shared memory use is STAGED_EDGES * 8 bytes per
+// workgroup.
 //
 // For each chunk, all invocations must follow the same sequence:
 // 1. Call clear_staged_edges, then workgroupBarrier().
@@ -14,17 +15,18 @@
 // the edge in opposite directions.
 
 import super::edge::INVALID_FACE;
+import super::patch::PATCH_LANES;
 
-public const STAGED_EDGES: u32 = 1024u;
-const LANES: u32 = 64u;
+public const STAGED_EDGES: u32 = 512u;
 
-var<workgroup> edge_faces: array<u32, 2048>;
+var<workgroup> edge_faces: array<u32, 1024>;
 
-// Resets the chunk so each edge starts with no faces. All 64 invocations
-// must call this with their local_invocation_index as `lane` and the same
-// `count`. Clears min(count, STAGED_EDGES) entries; read only those entries.
+// Resets the chunk so each edge starts with no faces. All PATCH_LANES
+// invocations must call this with their local_invocation_index as `lane`
+// and the same `count`. Clears min(count, STAGED_EDGES) entries; read only
+// those entries.
 public fn clear_staged_edges(lane: u32, count: u32) {
-    for (var i = lane; i < 2u * min(count, STAGED_EDGES); i += LANES) {
+    for (var i = lane; i < 2u * min(count, STAGED_EDGES); i += PATCH_LANES) {
         edge_faces[i] = INVALID_FACE;
     }
 }

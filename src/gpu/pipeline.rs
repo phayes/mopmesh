@@ -196,8 +196,20 @@ pub(super) fn shader_module(
     })
 }
 
+/// Compilation options for the crate's compute pipelines. They skip wgpu's
+/// default zero-fill of workgroup memory, so a shader built with them must
+/// write each workgroup variable before reading it.
+pub(super) const NO_ZERO_FILL: wgpu::PipelineCompilationOptions<'static> =
+    wgpu::PipelineCompilationOptions {
+        constants: &[],
+        zero_initialize_workgroup_memory: false,
+    };
+
 /// Creates a compute pipeline for `entry_point` in `module`.
 /// Pass `None` for `layout` to infer buffer bindings from the shader.
+///
+/// Workgroup memory starts with unspecified contents, so the shader must
+/// write each workgroup variable before reading it.
 pub(super) fn compute_pipeline(
     device: &wgpu::Device,
     label: &str,
@@ -210,7 +222,7 @@ pub(super) fn compute_pipeline(
         layout,
         module,
         entry_point: Some(entry_point),
-        compilation_options: Default::default(),
+        compilation_options: NO_ZERO_FILL,
         cache: None,
     })
 }

@@ -3,14 +3,15 @@
 // so results stay correct after edits. Importing this module imports
 // `patch_arena`, which binds the arena and masks at group 1 (read-only).
 //
-// Call these functions from a workgroup of 64 invocations that all work on
-// the same patch, in uniform control flow. Example over vertex neighbors:
+// Call these functions from a workgroup of PATCH_LANES invocations (from
+// `topology::patch`) that all work on the same patch, in uniform control
+// flow. Example over vertex neighbors:
 //
 //     let vertices = patch_slot_end(lane, r, VERTEX);
 //     var first = 0u;
 //     while (first < vertices) {
 //         let end = stage_vertex_neighbors(lane, r, first);
-//         for (var v = first + lane; v < end; v += 64u) {
+//         for (var v = first + lane; v < end; v += PATCH_LANES) {
 //             if (!slot_active(r, VERTEX, v) || !slot_owned(r, VERTEX, v)) { continue; }
 //             for (var it = vv_begin(r, first, v); vv_valid(it); it = vv_next(r, it)) {
 //                 let n = vv_vertex(r, it);   // a local vertex slot
@@ -23,7 +24,7 @@
 // holds every face around it. Rows of vertices the patch doesn't own may
 // miss neighbors held only by other patches.
 
-import super::patch::{PatchRecord, VERTEX, EDGE};
+import super::patch::{PatchRecord, VERTEX, EDGE, PATCH_LANES};
 import super::patch_arena::{slot_end, slot_active, face_edge, edge_vertices};
 import super::patch_staging::staged_edge_faces;
 import super::edge::{INVALID_FACE, INVALID_VERTEX};
@@ -31,8 +32,6 @@ import super::local_query::{
     face_edge_index, opposite_edge, opposite_vertex, vv_clear, vv_count_edge, vv_plan, vv_scatter_edge,
     vv_oversized, vv_row, vv_entry,
 };
-
-const LANES: u32 = 64u;
 
 var<workgroup> shared_slot_end: u32;
 
@@ -75,11 +74,11 @@ public fn stage_vertex_neighbors(lane: u32, r: PatchRecord, first: u32) -> u32 {
     vv_clear(lane);
     workgroupBarrier();
     let edges = slot_end(r, EDGE);
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         if (slot_active(r, EDGE, e)) { vv_count_edge(first, edge_vertices(r, e)); }
     }
     let end = vv_plan(lane, first, slot_end(r, VERTEX));
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         if (slot_active(r, EDGE, e)) { vv_scatter_edge(first, end, edge_vertices(r, e)); }
     }
     workgroupBarrier();

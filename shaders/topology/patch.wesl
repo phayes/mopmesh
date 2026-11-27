@@ -13,6 +13,12 @@ public const EDGE: u32 = 1u;
 // Selects triangular faces in fields and functions indexed by element kind.
 public const FACE: u32 = 2u;
 
+// Number of invocations in a workgroup that processes one patch. The
+// per-patch modules (patch_staging, patch_edge_staging, patch_queries,
+// local_query and flip_pass) require it: declare such kernels with
+// @workgroup_size(PATCH_LANES), and step loops over slots by PATCH_LANES.
+public const PATCH_LANES: u32 = 128u;
+
 // Index of the arena word that stores the mesh's vertex count. The edge and
 // face counts follow at VERTEX_COUNT_WORD + EDGE and VERTEX_COUNT_WORD + FACE.
 public const VERTEX_COUNT_WORD: u32 = 0u;

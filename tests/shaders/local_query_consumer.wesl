@@ -2,7 +2,7 @@
 // inside its own kernels with `topology::patch_queries`, one workgroup per
 // patch, and writes them in the layout of the library's global queries so a
 // test can compare the two.
-import mopmesh::topology::patch::{PatchRecord, VERTEX, EDGE};
+import mopmesh::topology::patch::{PatchRecord, VERTEX, EDGE, PATCH_LANES};
 import mopmesh::topology::patch_arena::{
     patch_count, patch_record, slot_active, slot_owned, global_vertex, global_edge,
 };
@@ -29,7 +29,7 @@ fn to_global(r: PatchRecord, slot: u32) -> u32 {
     return global_vertex(r, slot);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn edge_diamonds(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -41,7 +41,7 @@ fn edge_diamonds(
     let edges = patch_edge_end(lane, r);
     for (var first = 0u; first < edges; first += STAGED_EDGES) {
         stage_patch_edges(lane, r, first, edges);
-        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += PATCH_LANES) {
             if (!slot_active(r, EDGE, e) || !slot_owned(r, EDGE, e)) { continue; }
             let d = edge_diamond(r, first, e);
             let at = 4u * global_edge(r, e);
@@ -51,7 +51,7 @@ fn edge_diamonds(
     }
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn vertex_neighbors(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -64,7 +64,7 @@ fn vertex_neighbors(
     var first = 0u;
     while (first < vertices) {
         let end = stage_vertex_neighbors(lane, r, first);
-        for (var v = first + lane; v < end; v += 64u) {
+        for (var v = first + lane; v < end; v += PATCH_LANES) {
             if (!slot_active(r, VERTEX, v) || !slot_owned(r, VERTEX, v)) { continue; }
             let g = global_vertex(r, v);
             atomicStore(&rows[3u * g + 1u], vv_size(first, v));

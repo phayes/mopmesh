@@ -2,8 +2,9 @@
 // using the workgroup memory of `patch_staging`. Importing this module
 // imports both, so the arena and masks are bound at group 1.
 //
-// Call these functions from a workgroup of 64 invocations that all work on
-// the same patch, in uniform control flow:
+// Call these functions from a workgroup of PATCH_LANES invocations (from
+// `topology::patch`) that all work on the same patch, in uniform control
+// flow:
 //
 //     let edges = patch_edge_end(lane, r);
 //     for (var first = 0u; first < edges; first += STAGED_EDGES) {
@@ -13,7 +14,7 @@
 //         workgroupBarrier();
 //     }
 
-import super::patch::{PatchRecord, EDGE, FACE};
+import super::patch::{PatchRecord, EDGE, FACE, PATCH_LANES};
 import super::patch_arena::{slot_end, slot_active, face_edge};
 import super::patch_staging::{clear_staged_edges, stage_face_edge};
 
@@ -35,7 +36,7 @@ public fn stage_patch_edges(lane: u32, r: PatchRecord, first: u32, edges: u32) {
     clear_staged_edges(lane, edges - first);
     workgroupBarrier();
     let faces = slot_end(r, FACE);
-    for (var f = lane; f < faces; f += 64u) {
+    for (var f = lane; f < faces; f += PATCH_LANES) {
         if (!slot_active(r, FACE, f)) { continue; }
         for (var i = 0u; i < 3u; i++) {
             let e = face_edge(r, f, i);

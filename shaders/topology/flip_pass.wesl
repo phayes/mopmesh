@@ -7,12 +7,12 @@
 // for your own data. Do not also import `topology::patch_arena`: it uses
 // group 1 too.
 //
-// A batch is one dispatch with one workgroup of 64 invocations per patch
-// (`FlipPass::patch_grid`). Every active edge the patch owns is offered to
-// your rule once, with its four corners; then the workgroup picks
-// non-conflicting flips and applies them:
+// A batch is one dispatch with one workgroup of PATCH_LANES invocations
+// (from `topology::patch`) per patch (`FlipPass::patch_grid`). Every active
+// edge the patch owns is offered to your rule once, with its four corners;
+// then the workgroup picks non-conflicting flips and applies them:
 //
-//     @compute @workgroup_size(64)
+//     @compute @workgroup_size(PATCH_LANES)
 //     fn flip(@builtin(workgroup_id) group: vec3<u32>,
 //             @builtin(num_workgroups) groups: vec3<u32>,
 //             @builtin(local_invocation_index) lane: u32) {
@@ -22,7 +22,7 @@
 //         let edges = flip_edge_end(lane, r);
 //         for (var first = 0u; first < edges; first += STAGED_EDGES) {
 //             flip_stage(lane, r, first);
-//             for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+//             for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += PATCH_LANES) {
 //                 let c = flip_candidate(r, first, e);
 //                 flip_request(c, c.status != FLIP_DONE || my_rule(c.corners));
 //             }
@@ -43,6 +43,7 @@ import super::patch::{
     PatchRecord, EDGE, FACE, PATCH_COUNT_WORD, RECORDS_WORD,
     record_offset, decode_record, used_offset, mask_word, mask_test,
     face_edge_offset, edge_vertices_offset, global_vertex_offset, global_edge_offset,
+    PATCH_LANES,
 };
 import super::flip::{
     FaceEdges, FlipQuad, flip_quad, flip_in_place_writes, flip_priority, runs_stored_order,
@@ -53,7 +54,6 @@ import super::patch_staging::{clear_staged_edges, stage_face_edge, staged_edge_f
 import super::edge::INVALID_FACE;
 
 const INVALID: u32 = 0xffffffffu;
-const LANES: u32 = 64u;
 
 // Selection rounds per batch. Each round decides at least the request with
 // the highest priority among those left, and usually far more. Requests
@@ -180,7 +180,7 @@ public fn flip_stage(lane: u32, r: PatchRecord, first: u32) {
     clear_staged_edges(lane, atomicLoad(&masks[used_offset(r, EDGE)]) - first);
     workgroupBarrier();
     let faces = atomicLoad(&masks[used_offset(r, FACE)]);
-    for (var f = lane; f < faces; f += LANES) {
+    for (var f = lane; f < faces; f += PATCH_LANES) {
         if (!bit(r.active_masks[FACE], f)) { continue; }
         let face = face_edges(r, f);
         for (var i = 0u; i < 3u; i++) {
@@ -273,7 +273,7 @@ fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
     workgroupBarrier();
 
     // Clear the bids at every undecided request's corners.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
         if (edge == INVALID) { continue; }
         for (var k = 0u; k < 4u; k++) { atomicStore(&claims[corner(edge, k)], 0u); }
@@ -281,7 +281,7 @@ fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
     storageBarrier();
 
     // A request touching a selected flip loses; the others bid.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
         if (edge == INVALID) { continue; }
         var taken = false;
@@ -298,7 +298,7 @@ fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
 
     // A request with the highest bid at all four corners wins them for now,
     // and marks the ends of its new edge.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
         if (edge == INVALID) { continue; }
         let priority = flip_priority(edge, pass_params.seed);
@@ -317,7 +317,7 @@ fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
     // Find winners whose new edge already exists. Their ends are interior to
     // this patch, so such an edge is in this patch with both ends interior;
     // other edges are skipped, so only this patch's vertices are looked up.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         if (!bit(r.active_masks[EDGE], e)) { continue; }
         let ends = edge_vertices(r, e);
         if (!bit(r.interior_mask, ends.x) || !bit(r.interior_mask, ends.y)) { continue; }
@@ -338,7 +338,7 @@ fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
 
     // Drop winners whose new edge exists, freeing their corners, and select
     // the rest, marking all four of their corners.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         if (!bit(r.active_masks[EDGE], e) || !bit(r.owned_masks[EDGE], e)) { continue; }
         let edge = arena[global_edge_offset(r, e)];
         let base = edge * STATE_WORDS;
@@ -377,7 +377,7 @@ public fn flip_finish(lane: u32, r: PatchRecord, edges: u32) {
 
     // Report requests still undecided, then apply the selected flips. They
     // share no vertices, so each reads and writes only its own rows.
-    for (var e = lane; e < edges; e += LANES) {
+    for (var e = lane; e < edges; e += PATCH_LANES) {
         if (!bit(r.active_masks[EDGE], e) || !bit(r.owned_masks[EDGE], e)) { continue; }
         let edge = arena[global_edge_offset(r, e)];
         let base = edge * STATE_WORDS;
