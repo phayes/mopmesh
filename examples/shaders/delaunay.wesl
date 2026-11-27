@@ -4,14 +4,14 @@
 // edge exceeds that angle limit.
 //
 // Group 0 holds positions. `topology::flip_pass` supplies group 1 and handles
-// conflicts, storage, mesh updates and each edge's status.
+// conflicts, mesh updates and each edge's status.
 import mopmesh::topology::flip_pass::{
-    flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request, flip_select,
-    flip_reserve, flip_commit,
+    flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request,
+    flip_finish,
 };
 import mopmesh::topology::flip::FLIP_DONE;
 import mopmesh::topology::patch_staging::STAGED_EDGES;
-import mopmesh::parallel::grid::{flat_index, flat_group};
+import mopmesh::parallel::grid::flat_group;
 
 @group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
 
@@ -36,11 +36,12 @@ fn should_flip(corners: array<u32, 4>) -> bool {
     return angle_at(c, a, b) + angle_at(d, a, b) > PI + TOLERANCE;
 }
 
-// One workgroup per patch offers each of the patch's edges to the rule.
-// Edges that can't flip report why; eligible edges that pass the angle
-// test report FLIP_NOT_REQUESTED.
+// One workgroup per patch offers each of the patch's edges to the rule, then
+// flips a non-conflicting set of the requested edges. Edges that can't flip
+// report why; eligible edges that pass the angle test report
+// FLIP_NOT_REQUESTED.
 @compute @workgroup_size(64)
-fn claim(
+fn flip(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
@@ -56,15 +57,5 @@ fn claim(
             flip_request(c, c.status != FLIP_DONE || should_flip(c.corners));
         }
     }
-    flip_select(lane, r, edges);
-}
-
-@compute @workgroup_size(64)
-fn reserve(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    flip_reserve(flat_index(id, groups));
-}
-
-@compute @workgroup_size(64)
-fn commit(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    flip_commit(flat_index(id, groups));
+    flip_finish(lane, r, edges);
 }

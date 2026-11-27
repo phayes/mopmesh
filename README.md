@@ -196,33 +196,36 @@ flip when the angles opposite an edge sum to more than 180 degrees:
 cargo run --example delaunay_flips
 ```
 
-A batch uses three ordered dispatches:
-
-1. **Claim:** one 64-lane workgroup per patch stages edges, obtains candidates
-   with `flip_candidate`, calls `flip_request` with your decision, and settles
-   competing claims with `flip_select`.
-2. **Reserve:** call `flip_reserve` once per mesh edge to reserve free slots.
-3. **Commit:** call `flip_commit` once per mesh edge to apply accepted edits.
+A batch is one dispatch with one 64-lane workgroup per patch, as in RXMesh's
+cavity manager. The workgroup stages the patch's edges, offers each candidate
+from `flip_candidate` to your rule, and passes your decision to
+`flip_request`. Then `flip_finish` selects a maximal set of non-conflicting
+flips and applies them.
 
 A candidate with `status == FLIP_DONE` is eligible for your rule; it has not
 flipped yet. Its `corners` are mesh-wide vertex IDs `[a, b, c, d]`, with current
 diagonal `a-b` and proposed diagonal `c-d`. Read them only for eligible
 candidates. Follow the example's collective calls and synchronization when
-adapting the claim kernel.
+adapting the kernel.
+
+Requested flips are selected in decreasing priority. A flip that shares a
+vertex with an already selected one reports `FLIP_LOST_CLAIM` and can be
+retried in a later batch. A flip whose `c-d` edge already exists reports
+`FLIP_CONNECTED` and blocks nothing. Each flip rewrites its own edge and face
+slots, so flips need no spare capacity.
 
 On the host, create a `GpuEditableMesh` and an `EdgeFlipQuery`. Use your own
 bindings at group 0 and `EdgeFlipQuery::pass_layout()` at group 1. For each batch,
-call `begin_pass`, bind its `bind_group()` for all three stages, and dispatch
-claim with `patch_grid()` and reserve/commit with `edge_grid()`.
+call `begin_pass`, bind its `bind_group()`, and dispatch `patch_grid()`
+workgroups; the results are in `statuses()`.
 Do not combine `flip_pass` with `patch_arena` in the same shader: both use group 1.
 See the [host integration](examples/support/delaunay.rs).
 
 Flips preserve global edge and face IDs. Attribute slots remain valid, but
 values derived from connectivity need to be recomputed. Boundary edges,
 cross-patch neighborhoods, existing replacement diagonals, and degenerate
-configurations are rejected. Conflicting claims and insufficient spare slots
-are reported per edge and can be retried in a fresh batch. Recompute query
-results after edits and submit commands in recording order.
+configurations are rejected and reported per edge. Recompute query results
+after edits and submit commands in recording order.
 
 For lower-level control with your own bindings,
 [`topology::flip`](shaders/topology/flip.wesl) exposes precondition and write-list

@@ -19,8 +19,9 @@ const INVALID: u32 = 0xffffffffu;
 @group(0) @binding(0) var<storage, read_write> arena: array<u32>;
 @group(0) @binding(1) var<storage, read_write> masks: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read> positions: array<vec4<f32>>;
-// In: the edge to consider. Out: its flip status, or FLIP_NOT_REQUESTED if
-// the flip wouldn't shorten it.
+// Word 0, in: the edge to consider. Word 1, out: its flip status, or
+// FLIP_NOT_REQUESTED if the flip wouldn't shorten it. Word 2, in: nonzero to
+// flip whether or not it shortens the edge.
 @group(0) @binding(3) var<storage, read_write> request: array<u32>;
 
 fn record(patch_id: u32) -> PatchRecord {
@@ -97,7 +98,7 @@ fn flip_if_shorter(global_edge: u32) -> u32 {
     // This kernel's own rule: only flip if the new edge is shorter.
     let old_length = distance(position(r, quad.a), position(r, quad.b));
     let new_length = distance(position(r, quad.c), position(r, quad.d));
-    if (new_length >= old_length) { return FLIP_NOT_REQUESTED; }
+    if (request[2] == 0u && new_length >= old_length) { return FLIP_NOT_REQUESTED; }
 
     // The library's preconditions: interior corners, no existing c-d edge,
     // and free slots.

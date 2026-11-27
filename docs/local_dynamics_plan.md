@@ -83,7 +83,8 @@ and it was adopted; the user can still overrule it.
   - a 1,124-neighbor fan;
   - a multi-patch grid after every round of Delaunay flips.
 
-**Flip.** `topology::flip_pass` has a per-patch claim:
+**Flip** (since replaced by [Step 2 as built](#step-2-as-built)).
+`topology::flip_pass` has a per-patch claim:
 `flip_patch`, `flip_edge_end`, `flip_stage`, `flip_candidate`, `flip_request`
 and `flip_select`. Reserve and commit still run one invocation per edge.
 `flip_select` works in three passes:
@@ -128,8 +129,76 @@ and 8 B per vertex for claims and partners.
 - **Wall time.** At 2.1 M faces it was 64.8–71.0 ms. Each batch allocates
   about 126 MB of flip state, plus statuses and masks, and that time isn't in
   the GPU sum.
-- **Not measured.** Per-pass times were not recorded, so the split between
-  the claim and the per-edge reserve and commit dispatches is not known yet.
+- **Per-pass split, measured later.** Recorded before step 2, at 2.1 M
+  faces: claim 17–24 ms, per-edge reserve 3.4–5.8 ms, per-edge commit about
+  7.6 ms.
+
+### Step 2 as built
+
+Decided by the user on 27 November 2026:
+- **Maximal selection**, as RXMesh does.
+- **In-place slots**, as RXMesh does.
+- **Claims in storage**, with workgroup-memory claims a measured follow-up.
+
+**One dispatch.** `topology::flip_pass` runs one dispatch per batch, one
+workgroup per patch.
+- The claim loop is unchanged: `flip_candidate`, then `flip_request`.
+- `flip_finish` then selects flips in rounds and applies them.
+- `flip_reserve`, `flip_commit` and `FlipPass::edge_grid` are gone. Flip
+  state is 7 words per edge.
+
+**Selection rounds** (at most `MAX_ROUNDS`, 64) run inside the workgroup.
+Each round:
+1. resets the bids at undecided requests' corners;
+2. drops requests touching a selected flip (LostClaim) and lets the rest bid;
+3. marks requests holding all four corners as tentative;
+4. checks for an existing c-d edge in one pass over the patch's interior
+   edges;
+5. selects the remaining tentative winners, which take their four corners.
+
+The result equals greedy selection in decreasing priority. A Connected flip
+blocks nothing, which reverses step 1's rule. On every benchmark mesh, a
+bound of 8 rounds gives the same flips as 1,024.
+
+**Flips rewrite in place.** `topology::flip::flip_in_place_writes` writes the
+flipped edge's endpoints and the two faces' edge rows, 14 words, keeping
+every slot and ID.
+- Masks, owner tables and used counts never change, so flips need no spare
+  capacity, and `EdgeFlipQuery` never reports `OutOfCapacity`.
+- `flip_writes`, which places a flip in free slots, stays for custom kernels.
+  The tests use it through `tests/shaders/flip_consumer.wesl` to leave empty
+  slots below the used counts before running queries
+  (`tests/support/fresh_flips.rs`).
+
+**Tests.**
+- The batch predictor is greedy by priority.
+- A split grid with a valence-3 vertex covers a flip going ahead next to a
+  higher-priority Connected flip.
+- Every lost flip must share a corner with a selected one.
+- After every batch, masks and owner tables must be unchanged.
+- Mutation checks each fail a test: one round only, a selected flip not
+  marking `a` and `b`, a skipped Connected check, swapped face slots, and a
+  wrong direction flag.
+
+**Timings**, Apple M1 Max, patch size 512, medians:
+- **Settle** is `tests/bench_delaunay.rs`, run with `MOPMESH_BENCH=1 cargo
+  test --release --test bench_delaunay -- --ignored --nocapture`. It repeats
+  the Delaunay example's batches on a skewed grid until none flips.
+- The 524 K settle times were noisy, at 71–147 ms over repeated runs.
+
+| Measure | Step 1 | 2a: one dispatch, one round | 2b: maximal rounds |
+|---|---:|---:|---:|
+| All-edges batch, 2.1 M faces, input order | 30.8–34.4 ms | 25.7–29.6 ms | 37.1–42.0 ms |
+| All-edges batch, 2.1 M faces, shuffled | 32.3–36.4 ms | 30.5–32.7 ms | 52.6–55.3 ms |
+| Flips per all-edges batch, 2.1 M grid | 89,524 | 89,524 | 157,550 |
+| Delaunay settle, 2.1 M faces: batches | 15 | 15 | 9 |
+| Delaunay settle, 2.1 M faces: time | 346 ms | 254 ms | 208 ms |
+| Delaunay settle, 524 K faces: batches | 15 | 15 | 9 |
+
+**Shuffled meshes** gain least from the extra rounds. Each round rereads
+per-edge state indexed by global edge ID, which is scattered there.
+Workgroup-memory claims and patch-local request lists are the measured
+follow-ups.
 
 ## Bottom line
 
@@ -146,7 +215,9 @@ and 8 B per vertex for claims and partners.
   (`atomicOr`, keeping the slot only if its bit was clear). Slots freed by a
   batch become reusable from the next batch, so a rejected or interrupted edit
   never overwrites rows it still needs. Capacity only has to cover one batch's
-  new elements, not every edit ever made.
+  new elements, not every edit ever made. (Since step 2, `flip_pass` rewrites
+  a flip's own slots instead and needs no free slots; free-slot placement
+  remains in `flip_writes` for custom kernels and for Phase 6.)
 - **Global IDs, with global capacity deferred.** Attributes and query results
   stay indexed by global ID. Flips never create or delete global IDs, so global
   spare capacity and global active masks arrive in Phase 6, together with the
@@ -414,6 +485,5 @@ shared Rust files, apart from one `mod` line in `src/gpu.rs`.
   benchmark, 2.1M faces). Capacity slack, masks, owner tables and the
   interior bitmask add to that. Report B/face for the editable arena next to
   the static one.
-- Is a default capacity factor of 1.5 right? With slot reuse, a batch needs one
-  free edge slot and two free face slots per flip in each patch. Measure
-  once flips run.
+- Is a default capacity factor of 1.5 right? Since step 2, flips need no free
+  slots, so the spare room is unused until splits and collapses (Phase 6).

@@ -248,8 +248,13 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 - [x] Time per-patch claims against the previous per-request claims. At
   2.1 M faces and patch size 512, one all-edges batch drops from 155–169 ms
   to 30–35 ms in input order and from 544–566 ms to 35–38 ms shuffled.
-- [ ] Decide on step 2: one per-patch kernel doing select, reserve and
-  commit, with claims in workgroup memory.
+- [x] Step 2: one per-patch flip dispatch, as RXMesh's cavity manager.
+  Selection repeats in the workgroup until the set of flips is maximal
+  (greedy by priority), and flips rewrite their own slots, so they need no
+  spare capacity. A Delaunay settle at 2.1 M faces takes 9 batches and 208 ms
+  instead of 15 and 346 ms. See `docs/local_dynamics_plan.md`.
+- [ ] Measure workgroup-memory claims and patch-local request lists,
+  especially for shuffled meshes.
 
 ### 5 — Boundary dynamics: not started
 

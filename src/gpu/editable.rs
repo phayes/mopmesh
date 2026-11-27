@@ -8,7 +8,9 @@ use wgpu::util::DeviceExt;
 ///
 /// Each patch gets `factor` times as many local vertex, edge and face slots as
 /// it has elements, rounded up. Edits that need more free slots in a patch than
-/// it has are rejected.
+/// it has are rejected. Edge flips through [`EdgeFlipQuery`](super::EdgeFlipQuery)
+/// reuse their own slots and need no spare room; custom kernels that place
+/// edits in free slots do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditCapacity {
     factor: f32,

@@ -3,6 +3,8 @@
 //! the flipped triangles, and results from before an edit must be rejected.
 #[path = "../examples/support/delaunay.rs"]
 mod delaunay;
+#[path = "support/fresh_flips.rs"]
+mod fresh_flips;
 #[path = "support/replay.rs"]
 mod replay;
 use mopmesh::{
@@ -363,11 +365,38 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         },
     );
 
-    // Flip until a batch makes no progress, replaying each reported flip on
-    // the CPU. Patches too full for any flip stop progress before the rule
-    // settles everywhere; the comparison doesn't need a settled mesh.
+    // First flip some edges into free slots, one at a time, so the patches
+    // have empty slots below their used counts and reused slots. Replay
+    // each flip on the CPU.
     let mut endpoints = replay::edge_endpoints(&mesh);
-    let (mut flipped, mut out_of_capacity, mut stalled) = (0, 0, false);
+    let some_edges: Vec<u32> = (0..mesh.edge_count() as u32).step_by(5).collect();
+    let fresh = fresh_flips::FreshFlips::new(&device).flip(
+        &device,
+        &queue,
+        &flip,
+        &mut editable,
+        &position_buffer,
+        &some_edges,
+    );
+    let mut fresh_flipped = 0;
+    for (&edge, status) in some_edges.iter().zip(&fresh) {
+        if *status == Some(FlipStatus::Flipped) {
+            replay::replay(&mut triangles, &mut endpoints, edge as usize);
+            fresh_flipped += 1;
+        }
+    }
+    assert!(
+        fresh_flipped > mesh.patches().len(),
+        "only {fresh_flipped} flips into free slots"
+    );
+    assert!(
+        fresh.contains(&Some(FlipStatus::OutOfCapacity)),
+        "free slots never ran out"
+    );
+
+    // Then flip in batches until one flips nothing, replaying each reported
+    // flip on the CPU.
+    let (mut flipped, mut stalled) = (0, false);
     for _ in 0..1000 {
         let mut encoder = device.create_command_encoder(&Default::default());
         let status = flips
@@ -382,13 +411,9 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         queue.submit([encoder.finish()]);
         let words = delaunay::read_words(&device, &queue, &status);
         for (edge, &word) in words.iter().enumerate() {
-            match FlipStatus::from_word(word) {
-                Some(FlipStatus::Flipped) => {
-                    replay::replay(&mut triangles, &mut endpoints, edge);
-                    flipped += 1;
-                }
-                Some(FlipStatus::OutOfCapacity) => out_of_capacity += 1,
-                _ => {}
+            if FlipStatus::from_word(word) == Some(FlipStatus::Flipped) {
+                replay::replay(&mut triangles, &mut endpoints, edge);
+                flipped += 1;
             }
         }
         if delaunay::Round::from_statuses(&words).flipped == 0 {
@@ -397,12 +422,9 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         }
     }
     assert!(stalled, "flipping never stopped");
-    // With room for about one flip per patch, more flips than patches means
-    // later flips reused slots that earlier flips freed.
-    assert!(out_of_capacity > 0, "spare room never ran out");
     assert!(
         flipped > mesh.patches().len(),
-        "only {flipped} flips; slots were never reused"
+        "only {flipped} flips in batches"
     );
 
     // Compare against a fresh static upload of the replayed triangles.

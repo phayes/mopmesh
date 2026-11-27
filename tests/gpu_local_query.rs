@@ -7,6 +7,8 @@
 mod delaunay;
 #[path = "support/fixtures.rs"]
 mod fixtures;
+#[path = "support/fresh_flips.rs"]
+mod fresh_flips;
 use mopmesh::{
     Mesh, MeshBuilder,
     gpu::{AdjacencyQuery, EdgeFlipQuery, EditCapacity, GpuEditableMesh, GpuMesh, GpuTopology},
@@ -272,8 +274,29 @@ fn local_queries_follow_edits_with_reused_slots() {
     let query = EdgeFlipQuery::new(&device);
     let flips = delaunay::DelaunayFlips::new(&device, &query);
 
-    // Flip until a round flips nothing, checking the local queries after
-    // every round.
+    // Flip some edges into free slots first, so patches have empty and
+    // reused slots below their used counts.
+    let some_edges: Vec<u32> = (0..mesh.edge_count() as u32).step_by(5).collect();
+    let fresh = fresh_flips::FreshFlips::new(&device).flip(
+        &device,
+        &queue,
+        &query,
+        &mut gpu,
+        &positions,
+        &some_edges,
+    );
+    let fresh_flipped = fresh
+        .iter()
+        .filter(|&&s| s == Some(mopmesh::gpu::FlipStatus::Flipped))
+        .count();
+    assert!(
+        fresh_flipped > mesh.patches().len(),
+        "only {fresh_flipped} flips into free slots"
+    );
+    q.compare(&device, &queue, &gpu, "after flips into free slots");
+
+    // Then flip in batches until one flips nothing, checking the local
+    // queries after every batch.
     let mut flipped = 0;
     for round in 0..64 {
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -290,7 +313,7 @@ fn local_queries_follow_edits_with_reused_slots() {
     }
     assert!(
         flipped > mesh.patches().len() as u32,
-        "too few flips to reuse slots"
+        "only {flipped} flips in batches"
     );
 }
 

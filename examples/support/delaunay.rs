@@ -54,9 +54,7 @@ pub fn skewed_grid(n: u32, patch_size: usize) -> (Mesh, Vec<[f32; 4]>, Vec<[u32;
 /// batches to reconsider edges that could not flip together.
 pub struct DelaunayFlips {
     layout: wgpu::BindGroupLayout,
-    claim: wgpu::ComputePipeline,
-    reserve: wgpu::ComputePipeline,
-    commit: wgpu::ComputePipeline,
+    flip: wgpu::ComputePipeline,
 }
 impl DelaunayFlips {
     pub fn new(device: &wgpu::Device, query: &EdgeFlipQuery) -> Self {
@@ -85,22 +83,15 @@ impl DelaunayFlips {
             bind_group_layouts: &[Some(&layout), Some(query.pass_layout())],
             immediate_size: 0,
         });
-        let stage = |entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        Self {
-            claim: stage("claim"),
-            reserve: stage("reserve"),
-            commit: stage("commit"),
-            layout,
-        }
+        let flip = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Delaunay flips"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("flip"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { flip, layout }
     }
 
     /// Records one batch and returns a GPU buffer with one `u32` status per
@@ -128,20 +119,14 @@ impl DelaunayFlips {
             }],
         });
 
-        // Finish claim before reserve, and reserve before commit, using
-        // separate dispatches. Claim runs one workgroup per patch; the other
-        // stages run one invocation per edge.
-        for (stage, [x, y]) in [
-            (&self.claim, pass.patch_grid()),
-            (&self.reserve, pass.edge_grid()),
-            (&self.commit, pass.edge_grid()),
-        ] {
-            let mut compute = encoder.begin_compute_pass(&Default::default());
-            compute.set_pipeline(stage);
-            compute.set_bind_group(0, &own, &[]);
-            compute.set_bind_group(1, pass.bind_group(), &[]);
-            compute.dispatch_workgroups(x, y, 1);
-        }
+        // One dispatch, one workgroup per patch.
+        let [x, y] = pass.patch_grid();
+        let mut compute = encoder.begin_compute_pass(&Default::default());
+        compute.set_pipeline(&self.flip);
+        compute.set_bind_group(0, &own, &[]);
+        compute.set_bind_group(1, pass.bind_group(), &[]);
+        compute.dispatch_workgroups(x, y, 1);
+        drop(compute);
         Ok(pass.statuses().buffer().clone())
     }
 }
@@ -151,8 +136,8 @@ impl DelaunayFlips {
 pub struct Round {
     /// Number of edges successfully flipped.
     pub flipped: u32,
-    /// Number of requests that lost a shared vertex or could not acquire storage.
-    /// A later batch can retry them, but retrying does not add patch capacity.
+    /// Number of requests that lost a shared vertex to a selected flip. A
+    /// later batch can retry them.
     pub retry: u32,
 }
 impl Round {
@@ -161,7 +146,7 @@ impl Round {
         for &word in words {
             match FlipStatus::from_word(word) {
                 Some(FlipStatus::Flipped) => round.flipped += 1,
-                Some(FlipStatus::LostClaim | FlipStatus::OutOfCapacity) => round.retry += 1,
+                Some(FlipStatus::LostClaim) => round.retry += 1,
                 _ => {}
             }
         }

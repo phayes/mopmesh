@@ -192,11 +192,12 @@ public fn flipped_faces(
 // A batch can flip several edges safely by choosing flips that share no
 // corner vertices and reserving separate storage for each. Run `claim`,
 // `reserve`, and `commit` as three ordered GPU dispatches; there is no need
-// to read results back to the CPU between them. Import `topology::flip_pass`
-// to use these stages with bind group 1. Its claim stage runs one workgroup
-// per patch and also settles the winners and the c-d check there. If your
-// shader needs to manage its own bindings and buffers, the steps below are
-// a simpler version with one invocation per request in every stage.
+// to read results back to the CPU between them. `topology::flip_pass` does
+// all of this in one dispatch instead: one workgroup per patch selects the
+// flips and rewrites each one in place with `flip_in_place_writes`, so it
+// needs no free slots. If your shader needs to manage its own bindings and
+// buffers, the steps below are a simpler version with one invocation per
+// request in every stage, using free slots.
 //
 // Give every request a unique index. For each request, allocate a status
 // word and five slot indices: two for the original faces, followed by one
@@ -236,6 +237,56 @@ public fn flipped_faces(
 //   request will win, or make space in a patch with no spare slots.
 // - List each edge once. At most one duplicate request can flip it; retrying
 //   another copy after that success can flip the edge back.
+
+// Number of entries in FlipInPlaceWrites.
+public const FLIP_IN_PLACE_WRITES: u32 = 14u;
+
+// Everything a flip writes when it reuses its own slots: the edge's two
+// endpoints, then the two faces' edge rows.
+public struct FlipInPlaceWrites {
+    arena: array<ArenaWrite, 14>,
+}
+
+// Returns the writes that flip `edge` in patch `r` by rewriting its own edge
+// and face slots, for a valid `quad` from `flip_quad`. `first_face` and
+// `second_face` are the slots of `first` and `second`, in the order passed
+// to `flip_quad`. `global_c` and `global_d` are the mesh-wide vertex IDs of
+// `quad.c` and `quad.d`; the edge stores the one with the smaller ID first.
+//
+// The edge and faces keep their slots and mesh-wide IDs: `first_face`
+// becomes a -> d -> c and `second_face` becomes d -> b -> c. Masks, owner
+// tables, used counts and mesh-wide IDs stay as they are, so the flip needs
+// no free slots. No other invocation may read or write these three slots,
+// or the edges of the two faces, while the writes are applied. The entries
+// don't overlap and may be applied in any order.
+public fn flip_in_place_writes(
+    r: PatchRecord,
+    edge: u32,
+    first_face: u32,
+    second_face: u32,
+    quad: FlipQuad,
+    first: FaceEdges,
+    second: FaceEdges,
+    global_c: u32,
+    global_d: u32,
+) -> FlipInPlaceWrites {
+    var out: FlipInPlaceWrites;
+    let c_first = global_c < global_d;
+    let ev = edge_vertices_offset(r, edge);
+    out.arena[0] = ArenaWrite(ev, select(quad.d, quad.c, c_first));
+    out.arena[1] = ArenaWrite(ev + 1u, select(quad.c, quad.d, c_first));
+    let faces = flipped_faces(quad, first, second, edge, c_first);
+    let slots = array(first_face, second_face);
+    var n = 2u;
+    for (var f = 0u; f < 2u; f++) {
+        for (var i = 0u; i < 3u; i++) {
+            let at = face_edge_offset(r, slots[f], i);
+            out.arena[n] = ArenaWrite(at, faces[f].edges[i]); n++;
+            out.arena[n] = ArenaWrite(at + 1u, faces[f].reversed[i]); n++;
+        }
+    }
+    return out;
+}
 
 // Returns a repeatable, shuffled priority for a request. Higher values win
 // shared corners. With a fixed `seed`, distinct request indices have

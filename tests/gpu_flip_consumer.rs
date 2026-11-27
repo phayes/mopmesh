@@ -8,7 +8,7 @@ mod delaunay;
 mod replay;
 use mopmesh::{
     Mesh, MeshBuilder,
-    gpu::{EdgeFlipQuery, EditCapacity, FlipStatus, GpuEditableMesh},
+    gpu::{EdgeFlipQuery, EdgeQuery, EditCapacity, FaceVertexQuery, FlipStatus, GpuEditableMesh},
 };
 use wgpu::util::DeviceExt;
 
@@ -33,7 +33,7 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
         });
         let request = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("consumer request"),
-            contents: bytemuck::cast_slice(&[edge, u32::MAX]),
+            contents: bytemuck::cast_slice(&[edge, u32::MAX, 0]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -73,15 +73,28 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
             let library = read_words(&device, &queue, library.buffer())[edge as usize];
             assert_eq!(FlipStatus::from_word(library), Some(FlipStatus::Flipped));
             assert_eq!(FlipStatus::from_word(status), Some(FlipStatus::Flipped));
-            for (ours, theirs) in [
-                (by_consumer.arena(), by_library.arena()),
-                (by_consumer.masks(), by_library.masks()),
-            ] {
-                assert_eq!(
-                    read_words(&device, &queue, ours),
-                    read_words(&device, &queue, theirs)
-                );
-            }
+
+            // The consumer places the flip in free slots and the library
+            // rewrites its own slots, so compare the resulting meshes by
+            // global ID: every face's corners, and every edge's endpoints and
+            // pair of faces. The order of an edge's two faces follows their
+            // slots, so it is compared as a set.
+            let topology = |mesh: &GpuEditableMesh| {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                let faces = FaceVertexQuery::new(&device)
+                    .encode(&device, &mut encoder, mesh)
+                    .unwrap();
+                let edges = EdgeQuery::new(&device)
+                    .encode(&device, &mut encoder, mesh)
+                    .unwrap();
+                queue.submit([encoder.finish()]);
+                let mut records = read_words(&device, &queue, edges.buffer());
+                for record in records.chunks_mut(4) {
+                    record[2..].sort();
+                }
+                (read_words(&device, &queue, faces.buffer()), records)
+            };
+            assert_eq!(topology(&by_consumer), topology(&by_library));
             assert_ne!(read_words(&device, &queue, by_consumer.arena()), original);
         } else {
             assert_eq!(status, 0, "kept: the flip would not shorten the edge");
@@ -114,7 +127,7 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
         "the fixture should start with non-Delaunay edges"
     );
     let mut flipped_total = 0;
-    for _ in 0..64 {
+    for batch in 1..=64 {
         let mut encoder = device.create_command_encoder(&Default::default());
         let status = flips
             .encode(&device, &mut encoder, &query, &mut gpu, &buffer)
@@ -138,6 +151,10 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
         if round == delaunay::Round::default() {
             assert!(flipped_total > 0);
             assert_eq!(violations(&triangles, &positions), 0);
+            // Each batch selects a maximal set of compatible flips, so this
+            // grid settles in fewer batches than the 11 that one selection
+            // round per batch took (8 on the machine this was measured on).
+            assert!(batch < 11, "settled only after {batch} batches");
             return;
         }
     }

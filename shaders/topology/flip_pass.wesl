@@ -7,53 +7,47 @@
 // for your own data. Do not also import `topology::patch_arena`: it uses
 // group 1 too.
 //
-// Each batch runs three dispatches in order, with the sizes FlipPass gives:
+// A batch is one dispatch with one workgroup of 64 invocations per patch
+// (`FlipPass::patch_grid`). Every active edge the patch owns is offered to
+// your rule once, with its four corners; then the workgroup picks
+// non-conflicting flips and applies them:
 //
-// 1. Claim: one workgroup of 64 invocations per patch. Every active edge the
-//    patch owns is offered to your rule once, with its four corners:
+//     @compute @workgroup_size(64)
+//     fn flip(@builtin(workgroup_id) group: vec3<u32>,
+//             @builtin(num_workgroups) groups: vec3<u32>,
+//             @builtin(local_invocation_index) lane: u32) {
+//         let p = flat_group(group, groups);
+//         if (p >= flip_patch_count(lane)) { return; }
+//         let r = flip_patch(p);
+//         let edges = flip_edge_end(lane, r);
+//         for (var first = 0u; first < edges; first += STAGED_EDGES) {
+//             flip_stage(lane, r, first);
+//             for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+//                 let c = flip_candidate(r, first, e);
+//                 flip_request(c, c.status != FLIP_DONE || my_rule(c.corners));
+//             }
+//         }
+//         flip_finish(lane, r, edges);
+//     }
 //
-//        @compute @workgroup_size(64)
-//        fn claim(@builtin(workgroup_id) group: vec3<u32>,
-//                 @builtin(num_workgroups) groups: vec3<u32>,
-//                 @builtin(local_invocation_index) lane: u32) {
-//            let p = flat_group(group, groups);
-//            if (p >= flip_patch_count(lane)) { return; }
-//            let r = flip_patch(p);
-//            let edges = flip_edge_end(lane, r);
-//            for (var first = 0u; first < edges; first += STAGED_EDGES) {
-//                flip_stage(lane, r, first);
-//                for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
-//                    let c = flip_candidate(r, first, e);
-//                    flip_request(c, c.status != FLIP_DONE || my_rule(c.corners));
-//                }
-//            }
-//            flip_select(lane, r, edges);
-//        }
+// Call flip_patch_count, flip_edge_end, flip_stage and flip_finish from
+// every invocation, in uniform control flow, exactly as above.
 //
-//    Call flip_patch_count, flip_edge_end, flip_stage and flip_select from
-//    every invocation, in uniform control flow, exactly as above.
-// 2. Reserve: call `flip_reserve(edge)` for every mesh-wide edge ID below
-//    `flip_edge_count()`, one invocation per edge.
-// 3. Commit: call `flip_commit(edge)` the same way.
-//
-// No CPU readback is needed between stages. Each edge's outcome is in the
-// status buffer, indexed by mesh-wide edge ID; read it after commit.
-// Flips that share any of their four vertices compete, and at most one of
-// them succeeds. An edge that reports FLIP_LOST_CLAIM or
-// FLIP_OUT_OF_CAPACITY can be tried again in a later batch.
+// After the dispatch, each edge's outcome is in the status buffer, indexed
+// by mesh-wide edge ID. Flips that share any of their four vertices compete,
+// and at most one of them succeeds. An edge that reports FLIP_LOST_CLAIM can
+// be tried again in a later batch. Flips reuse their own edge and face
+// slots, so they need no free slots.
 
 import super::patch::{
-    PatchRecord, EDGE, FACE, VERTEX_COUNT_WORD, PATCH_COUNT_WORD, RECORDS_WORD, OWNERS_WORD,
-    record_offset, decode_record, owner_offset, used_offset, mask_word, mask_test,
+    PatchRecord, EDGE, FACE, PATCH_COUNT_WORD, RECORDS_WORD,
+    record_offset, decode_record, used_offset, mask_word, mask_test,
     face_edge_offset, edge_vertices_offset, global_vertex_offset, global_edge_offset,
-    global_face_offset,
 };
 import super::flip::{
-    FaceEdges, FlipQuad, FlipSlots, flip_quad, flip_writes, free_bit, flip_priority,
-    runs_stored_order,
-    MASK_SET, MASK_CLEAR, FLIP_ARENA_WRITES, FLIP_MASK_UPDATES,
-    FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR, FLIP_CONNECTED,
-    FLIP_LOST_CLAIM, FLIP_OUT_OF_CAPACITY,
+    FaceEdges, FlipQuad, flip_quad, flip_in_place_writes, flip_priority, runs_stored_order,
+    FLIP_IN_PLACE_WRITES, FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR,
+    FLIP_CONNECTED, FLIP_LOST_CLAIM,
 };
 import super::patch_staging::{clear_staged_edges, stage_face_edge, staged_edge_faces};
 import super::edge::INVALID_FACE;
@@ -61,35 +55,45 @@ import super::edge::INVALID_FACE;
 const INVALID: u32 = 0xffffffffu;
 const LANES: u32 = 64u;
 
+// Selection rounds per batch. Each round decides at least the request with
+// the highest priority among those left, and usually far more. Requests
+// still undecided after the last round report FLIP_LOST_CLAIM.
+const MAX_ROUNDS: u32 = 64u;
+
 struct PassParams { seed: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 @group(1) @binding(0) var<storage, read_write> arena: array<u32>;
 @group(1) @binding(1) var<storage, read_write> masks: array<atomic<u32>>;
-// One priority per mesh vertex; each batch starts with all priorities at zero.
+// One bid per mesh vertex, reset each selection round.
 @group(1) @binding(2) var<storage, read_write> claims: array<atomic<u32>>;
 // Temporary flip data, STATE_WORDS zero-initialized words per mesh edge.
 @group(1) @binding(3) var<storage, read_write> state: array<u32>;
 @group(1) @binding(4) var<uniform> pass_params: PassParams;
 // One FLIP_* outcome per mesh edge, zero-initialized.
 @group(1) @binding(5) var<storage, read_write> statuses: array<u32>;
-// Per mesh vertex: one more than the edge ID of the winning flip whose new
-// edge would end at this vertex, or zero. Zero-initialized.
+// Per mesh vertex: one more than the edge ID of the selected flip that uses
+// this vertex, or zero. Zero-initialized.
 @group(1) @binding(6) var<storage, read_write> partners: array<u32>;
 
-// Words per edge: a stage marker, the two original face slots, three
-// replacement slots, and the four corners' mesh-wide vertex IDs.
-const STATE_WORDS: u32 = 10u;
+// Words per edge: a stage marker, the two face slots, and the four corners'
+// mesh-wide vertex IDs.
+const STATE_WORDS: u32 = 7u;
 const STATE_STAGE: u32 = 0u;
 const STATE_FACES: u32 = 1u;
-const STATE_NEW: u32 = 3u;
-const STATE_CORNERS: u32 = 6u;
-const STAGE_CLAIMED: u32 = 1u;
-const STAGE_RESERVED: u32 = 2u;
+const STATE_CORNERS: u32 = 3u;
+// Requested and eligible, not yet decided.
+const STAGE_CANDIDATE: u32 = 1u;
+// Won its corners this round; not yet checked for an existing c-d edge.
+const STAGE_TENTATIVE: u32 = 2u;
+// Won its corners, but c and d are already joined.
 const STAGE_CONNECTED: u32 = 3u;
+// Selected; applied at the end of the batch.
+const STAGE_SELECTED: u32 = 4u;
 
 var<workgroup> shared_word: u32;
+var<workgroup> undecided: atomic<u32>;
 
 // An edge offered to your rule by `flip_candidate`.
-// `status == FLIP_DONE` means the edge can be claimed; it hasn't flipped.
+// `status == FLIP_DONE` means the edge can be requested; it hasn't flipped.
 // Any other status says why it can't flip; only read `corners` when the
 // status is FLIP_DONE.
 //
@@ -104,12 +108,6 @@ public struct FlipCandidate {
     edge: u32,
     first_face: u32,
     second_face: u32,
-}
-
-// Returns the number of edges in the mesh, the bound for the edge IDs
-// passed to flip_reserve and flip_commit.
-public fn flip_edge_count() -> u32 {
-    return arena[VERTEX_COUNT_WORD + EDGE];
 }
 
 // Shares a value from the first invocation with the whole workgroup.
@@ -151,21 +149,14 @@ fn global_vertex(r: PatchRecord, slot: u32) -> u32 {
     return arena[global_vertex_offset(r, slot)];
 }
 
-// An edge location: its owning patch and its slot within that patch.
-struct Located { r: PatchRecord, edge: u32, }
-fn locate(global_edge: u32) -> Located {
-    let owner = owner_offset(arena[OWNERS_WORD + EDGE], global_edge);
-    return Located(record(arena[owner]), arena[owner + 1u]);
-}
-
 // Builds the four-vertex region formed by the two triangles sharing an edge.
 fn quad_of(r: PatchRecord, edge: u32, first: FaceEdges, second: FaceEdges) -> FlipQuad {
     return flip_quad(edge, first, face_edge_vertices(r, first), second, face_edge_vertices(r, second));
 }
 
-// Returns the number of patches, the same in every invocation. A claim
-// workgroup whose index (parallel::grid::flat_group) is not below it must
-// return without calling the other claim functions.
+// Returns the number of patches, the same in every invocation. A workgroup
+// whose index (parallel::grid::flat_group) is not below it must return
+// without calling the other flip functions.
 public fn flip_patch_count(lane: u32) -> u32 {
     return broadcast(lane, arena[PATCH_COUNT_WORD]);
 }
@@ -203,8 +194,8 @@ public fn flip_stage(lane: u32, r: PatchRecord, first: u32) {
 // flip_request when the slot is empty or another patch owns its edge.
 // Otherwise the edge must join two triangles forming a proper four-sided
 // region, and all four vertices must be interior to this patch. This check
-// doesn't look at positions, competing flips, an existing c-d edge, or free
-// storage; flip_select and flip_reserve check the last three.
+// doesn't look at positions, competing flips, or an existing c-d edge;
+// flip_finish checks the last two.
 public fn flip_candidate(r: PatchRecord, first: u32, e: u32) -> FlipCandidate {
     var out: FlipCandidate;
     out.status = FLIP_NOT_REQUESTED;
@@ -241,9 +232,9 @@ public fn flip_candidate(r: PatchRecord, first: u32, e: u32) -> FlipCandidate {
 
 // Records your decision for a candidate. With `wanted` false, the edge is
 // left alone and reports FLIP_NOT_REQUESTED. With `wanted` true, an edge
-// that can't flip reports why, and an eligible edge is claimed. A claim can
-// still lose to a competing flip, find c and d already joined, or find no
-// free storage. Call once per candidate, after its flip_candidate call.
+// that can't flip reports why, and an eligible edge becomes a request that
+// flip_finish settles. Call once per candidate, after its flip_candidate
+// call.
 public fn flip_request(candidate: FlipCandidate, wanted: bool) {
     let edge = candidate.edge;
     if (edge == INVALID) { return; }
@@ -254,58 +245,78 @@ public fn flip_request(candidate: FlipCandidate, wanted: bool) {
     statuses[edge] = candidate.status;
     if (candidate.status != FLIP_DONE) { return; }
 
-    // Save the flip, then bid for its four corners.
+    // Save the flip for flip_finish.
     let base = edge * STATE_WORDS;
     state[base + STATE_FACES] = candidate.first_face;
     state[base + STATE_FACES + 1u] = candidate.second_face;
     for (var k = 0u; k < 4u; k++) { state[base + STATE_CORNERS + k] = candidate.corners[k]; }
-    state[base + STATE_STAGE] = STAGE_CLAIMED;
-    let priority = flip_priority(edge, pass_params.seed);
-    for (var k = 0u; k < 4u; k++) { atomicMax(&claims[candidate.corners[k]], priority); }
+    state[base + STATE_STAGE] = STAGE_CANDIDATE;
 }
 
-// Reads the saved stage of edge slot `e`, returning INVALID for a slot that
-// is empty, owned by another patch, or not claimed in this batch.
-fn claimed_edge(r: PatchRecord, e: u32, stage: u32) -> u32 {
+// Returns the mesh-wide ID of the edge in slot `e` if this patch owns it and
+// its saved stage is `stage`, or INVALID.
+fn edge_at_stage(r: PatchRecord, e: u32, stage: u32) -> u32 {
     if (!bit(r.active_masks[EDGE], e) || !bit(r.owned_masks[EDGE], e)) { return INVALID; }
     let edge = arena[global_edge_offset(r, e)];
     if (state[edge * STATE_WORDS + STATE_STAGE] != stage) { return INVALID; }
     return edge;
 }
 
-// Settles which claims in this patch go ahead, after every candidate has
-// been passed to flip_request. A claim goes ahead only if it has the highest
-// priority at all four corners, and c and d aren't already joined by an
-// edge. `edges` is the value returned by flip_edge_end.
-public fn flip_select(lane: u32, r: PatchRecord, edges: u32) {
-    // Every flip that shares a corner with one in this patch is in this patch,
-    // so the claims are complete once this workgroup has made them.
-    storageBarrier();
+fn corner(edge: u32, k: u32) -> u32 {
+    return state[edge * STATE_WORDS + STATE_CORNERS + k];
+}
 
-    // Winners mark the two ends of their new edge.
+// Runs one selection round over the patch's requests and returns how many
+// remain undecided, the same in every invocation.
+fn select_round(lane: u32, r: PatchRecord, edges: u32) -> u32 {
+    if (lane == 0u) { atomicStore(&undecided, 0u); }
+    workgroupBarrier();
+
+    // Clear the bids at every undecided request's corners.
     for (var e = lane; e < edges; e += LANES) {
-        let edge = claimed_edge(r, e, STAGE_CLAIMED);
+        let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
         if (edge == INVALID) { continue; }
-        let base = edge * STATE_WORDS;
-        let priority = flip_priority(edge, pass_params.seed);
-        var won = true;
-        for (var k = 0u; k < 4u; k++) {
-            won = won && atomicLoad(&claims[state[base + STATE_CORNERS + k]]) == priority;
-        }
-        if (!won) {
-            state[base + STATE_STAGE] = 0u;
-            statuses[edge] = FLIP_LOST_CLAIM;
-            continue;
-        }
-        partners[state[base + STATE_CORNERS + 2u]] = edge + 1u;
-        partners[state[base + STATE_CORNERS + 3u]] = edge + 1u;
+        for (var k = 0u; k < 4u; k++) { atomicStore(&claims[corner(edge, k)], 0u); }
     }
     storageBarrier();
 
-    // Reject a winner whose new edge already exists. Its ends are interior to
+    // A request touching a selected flip loses; the others bid.
+    for (var e = lane; e < edges; e += LANES) {
+        let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
+        if (edge == INVALID) { continue; }
+        var taken = false;
+        for (var k = 0u; k < 4u; k++) { taken = taken || partners[corner(edge, k)] != 0u; }
+        if (taken) {
+            state[edge * STATE_WORDS + STATE_STAGE] = 0u;
+            statuses[edge] = FLIP_LOST_CLAIM;
+            continue;
+        }
+        let priority = flip_priority(edge, pass_params.seed);
+        for (var k = 0u; k < 4u; k++) { atomicMax(&claims[corner(edge, k)], priority); }
+    }
+    storageBarrier();
+
+    // A request with the highest bid at all four corners wins them for now,
+    // and marks the ends of its new edge.
+    for (var e = lane; e < edges; e += LANES) {
+        let edge = edge_at_stage(r, e, STAGE_CANDIDATE);
+        if (edge == INVALID) { continue; }
+        let priority = flip_priority(edge, pass_params.seed);
+        var won = true;
+        for (var k = 0u; k < 4u; k++) {
+            won = won && atomicLoad(&claims[corner(edge, k)]) == priority;
+        }
+        if (won) {
+            state[edge * STATE_WORDS + STATE_STAGE] = STAGE_TENTATIVE;
+            partners[corner(edge, 2u)] = edge + 1u;
+            partners[corner(edge, 3u)] = edge + 1u;
+        }
+    }
+    storageBarrier();
+
+    // Find winners whose new edge already exists. Their ends are interior to
     // this patch, so such an edge is in this patch with both ends interior;
     // other edges are skipped, so only this patch's vertices are looked up.
-    // Each vertex has at most one winner.
     for (var e = lane; e < edges; e += LANES) {
         if (!bit(r.active_masks[EDGE], e)) { continue; }
         let ends = edge_vertices(r, e);
@@ -314,7 +325,9 @@ public fn flip_select(lane: u32, r: PatchRecord, edges: u32) {
         let w = global_vertex(r, ends.y);
         let marked = partners[u];
         if (marked == 0u) { continue; }
-        let base = (marked - 1u) * STATE_WORDS;
+        let winner = marked - 1u;
+        let base = winner * STATE_WORDS;
+        if (state[base + STATE_STAGE] != STAGE_TENTATIVE) { continue; }
         let c = state[base + STATE_CORNERS + 2u];
         let d = state[base + STATE_CORNERS + 3u];
         if ((c == u && d == w) || (c == w && d == u)) {
@@ -323,111 +336,68 @@ public fn flip_select(lane: u32, r: PatchRecord, edges: u32) {
     }
     storageBarrier();
 
-    // Report the rejected winners.
+    // Drop winners whose new edge exists, freeing their corners, and select
+    // the rest, marking all four of their corners.
     for (var e = lane; e < edges; e += LANES) {
-        let edge = claimed_edge(r, e, STAGE_CONNECTED);
-        if (edge == INVALID) { continue; }
-        state[edge * STATE_WORDS + STATE_STAGE] = 0u;
-        statuses[edge] = FLIP_CONNECTED;
-    }
-}
-
-// Claims a free edge or face slot by atomically setting its active bit.
-// Returns INVALID if no slot can be acquired within the patch capacity.
-fn reserve_slot(r: PatchRecord, kind: u32) -> u32 {
-    let capacity = r.capacity[kind];
-    for (var base = 0u; base < capacity; base += 32u) {
-        let at = mask_word(r.active_masks[kind], base);
-        var word = atomicLoad(&masks[at]);
-        // Bound the search when other flips compete for slots in this mask word.
-        for (var attempt = 0u; attempt < 32u; attempt++) {
-            let slot = base + free_bit(word);
-            if (slot >= min(capacity, base + 32u)) { break; }
-            let mask = 1u << (slot % 32u);
-            let before = atomicOr(&masks[at], mask);
-            if ((before & mask) == 0u) { return slot; }
-            word = before | mask;
+        if (!bit(r.active_masks[EDGE], e) || !bit(r.owned_masks[EDGE], e)) { continue; }
+        let edge = arena[global_edge_offset(r, e)];
+        let base = edge * STATE_WORDS;
+        let stage = state[base + STATE_STAGE];
+        if (stage == STAGE_CONNECTED) {
+            state[base + STATE_STAGE] = 0u;
+            statuses[edge] = FLIP_CONNECTED;
+            partners[corner(edge, 2u)] = 0u;
+            partners[corner(edge, 3u)] = 0u;
+        } else if (stage == STAGE_TENTATIVE) {
+            state[base + STATE_STAGE] = STAGE_SELECTED;
+            partners[corner(edge, 0u)] = edge + 1u;
+            partners[corner(edge, 1u)] = edge + 1u;
+        } else if (stage == STAGE_CANDIDATE) {
+            atomicAdd(&undecided, 1u);
         }
     }
-    return INVALID;
-}
-fn release_slot(r: PatchRecord, kind: u32, slot: u32) {
-    atomicAnd(&masks[mask_word(r.active_masks[kind], slot)], ~(1u << (slot % 32u)));
+    storageBarrier();
+    workgroupBarrier();
+    return broadcast(lane, atomicLoad(&undecided));
 }
 
-// Gets storage for the flip of mesh-wide edge `edge`, if it was selected.
-// Call once per edge ID in a separate dispatch after every claim workgroup
-// finishes; IDs at or past flip_edge_count() are ignored. An edge that finds
-// no free storage reports FLIP_OUT_OF_CAPACITY and doesn't flip.
-public fn flip_reserve(edge: u32) {
-    if (edge >= flip_edge_count()) { return; }
-    let base = edge * STATE_WORDS;
-    if (state[base + STATE_STAGE] != STAGE_CLAIMED) { return; }
-    let r = locate(edge).r;
-
-    // Acquire all three replacement slots before committing. On failure,
-    // release any slots acquired for this flip.
-    let new_edge = reserve_slot(r, EDGE);
-    var new_first = INVALID;
-    var new_second = INVALID;
-    if (new_edge != INVALID) { new_first = reserve_slot(r, FACE); }
-    if (new_first != INVALID) { new_second = reserve_slot(r, FACE); }
-    if (new_second == INVALID) {
-        if (new_edge != INVALID) { release_slot(r, EDGE, new_edge); }
-        if (new_first != INVALID) { release_slot(r, FACE, new_first); }
-        state[base + STATE_STAGE] = 0u;
-        statuses[edge] = FLIP_OUT_OF_CAPACITY;
-        return;
+// Settles every request made in this patch and applies the selected flips,
+// after every candidate has been passed to flip_request. Requests are
+// selected in decreasing priority: a request goes ahead unless an
+// already-selected flip uses one of its corners (FLIP_LOST_CLAIM) or c and d
+// are already joined by an edge (FLIP_CONNECTED). Selected flips report
+// FLIP_DONE. `edges` is the value returned by flip_edge_end.
+public fn flip_finish(lane: u32, r: PatchRecord, edges: u32) {
+    // Every flip that shares a corner with one in this patch is in this patch,
+    // so the requests are complete once this workgroup has made them.
+    storageBarrier();
+    for (var round = 0u; round < MAX_ROUNDS; round++) {
+        if (select_round(lane, r, edges) == 0u) { break; }
     }
-    state[base + STATE_NEW] = new_edge;
-    state[base + STATE_NEW + 1u] = new_first;
-    state[base + STATE_NEW + 2u] = new_second;
-    state[base + STATE_STAGE] = STAGE_RESERVED;
-}
 
-// Applies the flip of mesh-wide edge `edge`, if it has storage. Call once per
-// edge ID in a separate dispatch after every reservation finishes; IDs at or
-// past flip_edge_count() are ignored. A flipped edge keeps its ID, now
-// joining c and d with the smaller vertex ID first. The face a -> b -> c
-// becomes a -> d -> c, and b -> a -> d becomes d -> b -> c, each keeping its
-// face ID.
-public fn flip_commit(edge: u32) {
-    if (edge >= flip_edge_count()) { return; }
-    let base = edge * STATE_WORDS;
-    if (state[base + STATE_STAGE] != STAGE_RESERVED) { return; }
-    let at = locate(edge);
-    let r = at.r;
-
-    // Gather the original triangles and their IDs for the replacement.
-    let first_slot = state[base + STATE_FACES];
-    let second_slot = state[base + STATE_FACES + 1u];
-    let first = face_edges(r, first_slot);
-    let second = face_edges(r, second_slot);
-    let quad = quad_of(r, at.edge, first, second);
-    let picked = FlipSlots(
-        at.edge, first_slot, second_slot,
-        state[base + STATE_NEW], state[base + STATE_NEW + 1u], state[base + STATE_NEW + 2u],
-        edge, arena[global_face_offset(r, first_slot)], arena[global_face_offset(r, second_slot)],
-        state[base + STATE_CORNERS + 2u], state[base + STATE_CORNERS + 3u],
-    );
-    let writes = flip_writes(
-        r, arena[OWNERS_WORD + EDGE], arena[OWNERS_WORD + FACE], quad, first, second, picked,
-    );
-
-    // Write the replacement data. Update masks atomically because other flips
-    // may change different bits in the same word.
-    for (var k = 0u; k < FLIP_ARENA_WRITES; k++) {
-        let w = writes.arena[k];
-        arena[w.offset] = w.value;
-    }
-    for (var k = 0u; k < FLIP_MASK_UPDATES; k++) {
-        let m = writes.masks[k];
-        if (m.op == MASK_SET) {
-            atomicOr(&masks[m.offset], m.bits);
-        } else if (m.op == MASK_CLEAR) {
-            atomicAnd(&masks[m.offset], ~m.bits);
-        } else {
-            atomicMax(&masks[m.offset], m.bits);
+    // Report requests still undecided, then apply the selected flips. They
+    // share no vertices, so each reads and writes only its own rows.
+    for (var e = lane; e < edges; e += LANES) {
+        if (!bit(r.active_masks[EDGE], e) || !bit(r.owned_masks[EDGE], e)) { continue; }
+        let edge = arena[global_edge_offset(r, e)];
+        let base = edge * STATE_WORDS;
+        let stage = state[base + STATE_STAGE];
+        if (stage == STAGE_CANDIDATE) {
+            statuses[edge] = FLIP_LOST_CLAIM;
+            continue;
+        }
+        if (stage != STAGE_SELECTED) { continue; }
+        let first_face = state[base + STATE_FACES];
+        let second_face = state[base + STATE_FACES + 1u];
+        let first = face_edges(r, first_face);
+        let second = face_edges(r, second_face);
+        let quad = quad_of(r, e, first, second);
+        let writes = flip_in_place_writes(
+            r, e, first_face, second_face, quad, first, second,
+            state[base + STATE_CORNERS + 2u], state[base + STATE_CORNERS + 3u],
+        );
+        for (var k = 0u; k < FLIP_IN_PLACE_WRITES; k++) {
+            arena[writes.arena[k].offset] = writes.arena[k].value;
         }
     }
 }
