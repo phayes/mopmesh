@@ -47,7 +47,7 @@
 import super::patch::{PatchRecord, VERTEX, EDGE, FACE, PATCH_LANES};
 import super::patch_arena::{
     slot_end, slot_active, slot_owned, face_edge, edge_vertices, global_vertex, global_edge,
-    global_face, owner,
+    global_face, owner, next_unused_id,
 };
 import super::directed_edge::directed_start;
 import super::flip::flip_priority;
@@ -120,11 +120,14 @@ const INVALID: u32 = 0xffffffffu;
 // orders acting patches and must change every round; `request_count` is the
 // number of requests; `flat_grid` and `patch_grid` are the workgroup counts
 // `cavity_plan` writes while requests are pending.
+// `bound_kind` is the element kind whose next unused ID bounds the requests
+// a round visits, when request i belongs to element i of that kind, or
+// 0xffffffff for no bound. `flat_grid` covers every request.
 struct RoundParams {
     seed: u32,
     round_seed: u32,
     request_count: u32,
-    _pad: u32,
+    bound_kind: u32,
     flat_grid: vec2<u32>,
     patch_grid: vec2<u32>,
 }
@@ -432,7 +435,17 @@ public fn cavity_conclude(request: u32) {
 // stage of the round, migration included, with these sizes.
 public fn cavity_plan() {
     let busy = atomicLoad(&plan[CAVITY_PLAN_PENDING]) != 0u;
-    let flat = select(vec2(0u, 1u), round_params.flat_grid, busy);
+
+    // Requests past the next unused ID of their kind belong to no element,
+    // so the flat grid stops there, rows as wide as the full grid's.
+    var flat = round_params.flat_grid;
+    if (round_params.bound_kind != 0xffffffffu) {
+        let count = min(round_params.request_count, next_unused_id(round_params.bound_kind));
+        let groups = (count + 63u) / 64u;
+        let width = min(groups, flat.x);
+        flat = vec2(width, select(0u, (groups + width - 1u) / max(width, 1u), width > 0u));
+    }
+    flat = select(vec2(0u, 1u), flat, busy);
     let patches = select(vec2(0u, 1u), round_params.patch_grid, busy);
     atomicStore(&plan[CAVITY_PLAN_FLAT], flat.x);
     atomicStore(&plan[CAVITY_PLAN_FLAT + 1u], flat.y);

@@ -470,6 +470,14 @@ Steps:
   `NotAnEdge` (new WESL `flip_reject_unused`, `element_alive`). Tests: a
   spread-ID fixture (ID `i` becomes `2i + 1`) compared with static uploads
   for every query, plus flips on it.
+  - Cost, all-edges flip batch at about 787 K edges (patch size 512, five
+    runs each, statuses identical): GPU time against `11527c8` is level on
+    the grid (48.8 against 48.9 ms) and 12–16% higher on the sphere, torus
+    and irregular grid (for example 56.1 → 65.0 ms on the torus). Per-ID
+    buffers are twice as long; the cavity rounds' per-request stages now
+    stop at the next unused edge ID, which made no measurable difference.
+    Single stages vary by up to 2x between runs of the same commit, so an
+    interleaved A/B belongs with Phase 5 step 5's profiling.
 - [ ] Step 2: ID allocator and single-patch splits (`EdgeSplitQuery`).
 - [ ] Step 3: cross-patch splits.
 - [ ] Step 4: patch slicing, with the patch capacity decision above.

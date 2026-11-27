@@ -420,7 +420,7 @@ impl EdgeFlipQuery {
         let checked = "checked by check_cross_patch";
         let edges = mesh.edge_capacity();
         let flat = pipeline::workgroup_grid(&device.limits(), edges, RESOURCE).expect(checked);
-        let state = CavityState::zeroed(device, mesh, edges, pass.seed).expect(checked);
+        let state = CavityState::for_edges(device, mesh, pass.seed).expect(checked);
 
         // Bind the glue stages and the per-round flip of selected requests,
         // which writes its own statuses for merge to read.

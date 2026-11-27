@@ -7,6 +7,7 @@ import super::patch::{
     PatchRecord, PATCH_COUNT_WORD, RECORDS_WORD, record_offset, decode_record, used_offset,
     mask_word, mask_test, face_edge_offset, edge_vertices_offset, global_vertex_offset,
     global_edge_offset, global_face_offset, ID_CAPACITY_WORD, OWNERS_WORD, owner_offset,
+    NEXT_ID_WORD,
 };
 
 @group(1) @binding(0) var<storage, read> arena: array<u32>;
@@ -83,6 +84,13 @@ public fn element_alive(kind: u32, global: u32) -> bool {
     if (global >= id_capacity(kind)) { return false; }
     let table = arena[OWNERS_WORD + kind];
     return table == 0xffffffffu || arena[owner_offset(table, global)] != 0xffffffffu;
+}
+
+// Returns the lowest ID of `kind` no element has used yet: every used ID is
+// below it. Use only with editable arenas, whose mask buffers start with
+// these words.
+public fn next_unused_id(kind: u32) -> u32 {
+    return masks[NEXT_ID_WORD + kind];
 }
 
 // Finds the unique owning copy of an element identified by its mesh-wide ID.

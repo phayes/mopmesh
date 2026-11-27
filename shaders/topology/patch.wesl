@@ -25,6 +25,15 @@ public const PATCH_LANES: u32 = 128u;
 // capacities are its element counts; an editable arena may leave some IDs
 // below them unused.
 public const ID_CAPACITY_WORD: u32 = 0u;
+// Index of the editable mask-buffer word that stores the lowest vertex ID
+// no element has used yet; the edge and face words follow at
+// NEXT_ID_WORD + EDGE and NEXT_ID_WORD + FACE. Every used ID of a kind is
+// below its word. Static mask buffers don't have these words.
+public const NEXT_ID_WORD: u32 = 0u;
+// Index of the editable mask-buffer word that stores the number of vertices
+// in the mesh; the edge and face counts follow at LIVE_COUNT_WORD + EDGE and
+// LIVE_COUNT_WORD + FACE.
+public const LIVE_COUNT_WORD: u32 = 3u;
 // Index of the arena word that stores the number of patches.
 public const PATCH_COUNT_WORD: u32 = 3u;
 // Index of the arena word that stores the first patch record's word offset.

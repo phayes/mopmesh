@@ -82,8 +82,16 @@ pub(crate) struct CavityState {
     /// dispatches: a dispatch can't also bind its size buffer as storage.
     pub(super) args: wgpu::Buffer,
     request_count: u32,
+    /// The element kind whose next unused ID bounds the requests each round
+    /// visits, or `NO_BOUND`.
+    bound_kind: u32,
     seed: u32,
 }
+
+/// `CavityState::bound_kind` for requests not indexed by element ID.
+const NO_BOUND: u32 = u32::MAX;
+/// `CavityState::bound_kind` for requests indexed by edge ID.
+const EDGE_KIND: u32 = 1;
 
 impl CavityRounds {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -159,7 +167,7 @@ impl CavityRounds {
             state.seed,
             round_seed,
             state.request_count,
-            0,
+            state.bound_kind,
             flat[0],
             flat[1],
             patches[0],
@@ -236,16 +244,18 @@ impl CavityState {
         Self::allocate(device, mesh, count, seed, Some(requests))
     }
 
-    /// Allocates `request_count` requests, all CAVITY_NONE, for a batch on
-    /// `mesh`, to be filled on the GPU. `seed` orders requests that share an
-    /// acting patch.
-    pub fn zeroed(
+    /// Allocates one request per edge ID of `mesh`, all CAVITY_NONE, for a
+    /// batch to be filled on the GPU; request `e` belongs to edge `e`. Each
+    /// round only visits the requests below the next unused edge ID. `seed`
+    /// orders requests that share an acting patch.
+    pub fn for_edges(
         device: &wgpu::Device,
         mesh: &GpuEditableMesh,
-        request_count: u32,
         seed: u32,
     ) -> Result<Self, GpuError> {
-        Self::allocate(device, mesh, request_count, seed, None)
+        let mut state = Self::allocate(device, mesh, mesh.edge_capacity(), seed, None)?;
+        state.bound_kind = EDGE_KIND;
+        Ok(state)
     }
 
     /// Checks that a state for `request_count` requests on `mesh` fits the
@@ -340,6 +350,7 @@ impl CavityState {
             taken: scratch("MOPMesh cavity taken vertices", vertex_bytes),
             scratch: scratch("MOPMesh cavity slot scratch", scratch_bytes),
             request_count,
+            bound_kind: NO_BOUND,
             seed,
         })
     }
