@@ -193,8 +193,10 @@ public fn flipped_faces(
 // corner vertices and reserving separate storage for each. Run `claim`,
 // `reserve`, and `commit` as three ordered GPU dispatches; there is no need
 // to read results back to the CPU between them. Import `topology::flip_pass`
-// to use these stages with bind group 1, or follow the steps below if your
-// shader needs to manage its own bindings and buffers.
+// to use these stages with bind group 1. Its claim stage runs one workgroup
+// per patch and also settles the winners and the c-d check there. If your
+// shader needs to manage its own bindings and buffers, the steps below are
+// a simpler version with one invocation per request in every stage.
 //
 // Give every request a unique index. For each request, allocate a status
 // word and five slot indices: two for the original faces, followed by one

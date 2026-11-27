@@ -239,6 +239,14 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   Queries take `&impl GpuTopology`; topology results and derived attributes
   carry a `TopologyStamp`. `tests/gpu_edited.rs` compares every query after
   many flips with a fresh upload of the replayed triangles.
+- [x] In-kernel local queries, step 1 (RXMesh style): `topology::local_query`
+  and `topology::patch_queries` build edge diamonds and vertex neighbors per
+  patch in shared memory, checked against the global queries, including
+  after flips (`tests/gpu_local_query.rs`). The flip claim stage runs one
+  workgroup per patch and settles conflicts there; statuses are indexed by
+  edge ID. See `docs/local_dynamics_plan.md`.
+- [ ] Time per-patch claims against the previous per-request claims, then
+  decide on step 2: one per-patch kernel doing select, reserve and commit.
 
 ### 5 — Boundary dynamics: not started
 

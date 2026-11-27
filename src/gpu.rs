@@ -74,6 +74,9 @@ pub enum GpuError {
     /// A buffer or slice you passed in has too few values, the wrong length,
     /// or lacks a required buffer usage. `resource` identifies which one.
     InvalidBuffer { resource: &'static str },
+    /// A slice you passed in holds an element ID that is not less than the
+    /// mesh's count of that element. `resource` identifies which slice.
+    ElementOutOfRange { resource: &'static str },
 }
 
 impl std::fmt::Display for GpuError {
@@ -88,6 +91,9 @@ impl std::fmt::Display for GpuError {
             ),
             Self::InvalidBuffer { resource } => {
                 write!(f, "{resource} has the wrong size or buffer usage")
+            }
+            Self::ElementOutOfRange { resource } => {
+                write!(f, "{resource} contains an ID outside the mesh")
             }
         }
     }

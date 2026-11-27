@@ -521,8 +521,9 @@ let mut editable = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default
 let flips = EdgeFlipQuery::new(&device);
 // Request any number of edges; they are flipped in parallel.
 let statuses = flips.encode(&device, &mut encoder, &mut editable, &edge_ids)?;
-// After submitting, read statuses.buffer(): one word per requested edge.
-// FlipStatus::from_word(word) == Some(FlipStatus::Flipped)
+// After submitting, read statuses.buffer(): one word per mesh edge, indexed
+// by edge ID, and 0 for edges you didn't request.
+// FlipStatus::from_word(words[edge]) == Some(FlipStatus::Flipped)
 ```
 
 Flipping an edge shared by two triangles replaces it with the other diagonal
@@ -542,14 +543,16 @@ A flip is rejected, and the mesh left exactly as it was, when:
 - the two faces don't form a proper four-sided region (`Degenerate`);
 - the patch has no free edge slot or two free face slots (`OutOfCapacity`);
 - another requested flip shares one of its four corners and won it
-  (`LostClaim`);
-- the edge ID is out of range (`NotAnEdge`).
+  (`LostClaim`). The winner can still fail with `Connected` or
+  `OutOfCapacity`; the flips it beat report `LostClaim` all the same.
+
+`encode` returns `GpuError::ElementOutOfRange`, without recording anything,
+if an edge ID is not less than the mesh's edge count. Listing an edge twice is
+the same as listing it once.
 
 `LostClaim` and `OutOfCapacity` can depend on the other flips in the same
 call, so request those edges again in a later call to retry them. Which of two
-conflicting flips wins is pseudo-random and changes from call to call. List
-each edge at most once per call: a repeated edge flips once, and requesting
-its losing copies again would flip it back.
+conflicting flips wins is pseudo-random and changes from call to call.
 
 Slots freed by a flip are reused by flips in later calls, so capacity only has
 to cover one call's flips. Calls recorded one after another apply in order.
@@ -603,64 +606,68 @@ Rules for step 5:
 
 **Flipping many edges at once from WESL.** Use `topology::flip_pass` to
 choose edges with your own shader rule while the library handles competing
-requests and mesh updates. Give each request a unique index, list each edge
-at most once, and run three entry points in order: claim, reserve, then commit.
-Each stage handles one request per invocation and skips indices at or beyond
-`flip_pass_count()`. No CPU readback is needed between stages.
-
-The claim stage below uses two application-defined functions:
-`edge_for_request(i)` supplies a mesh-wide edge ID, and `my_rule` decides
-whether its four vertices need a flip.
+flips and mesh updates. As in RXMesh, the claim stage runs one workgroup of
+64 invocations per patch. The workgroup finds each of the patch's edges'
+faces in shared memory, offers every edge the patch owns to your rule once,
+then settles which claims go ahead. Reserve and commit run one invocation
+per mesh edge. No CPU readback is needed between stages.
 
 ```wgsl
 import mopmesh::topology::flip_pass::{
-    flip_pass_count, flip_candidate, flip_claim, flip_reserve, flip_commit,
+    flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request,
+    flip_select, flip_reserve, flip_commit,
 };
-import mopmesh::topology::flip::{FLIP_DONE, FLIP_NOT_REQUESTED};
-import mopmesh::parallel::grid::flat_index;
-
-@group(0) @binding(0) var<storage, read_write> status: array<u32>;
+import mopmesh::topology::flip::FLIP_DONE;
+import mopmesh::topology::patch_staging::STAGED_EDGES;
+import mopmesh::parallel::grid::{flat_index, flat_group};
 
 @compute @workgroup_size(64)
-fn claim(@builtin(global_invocation_id) id: vec3<u32>,
-         @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = flat_index(id, groups);
-    if (i >= flip_pass_count()) { return; }
-    let candidate = flip_candidate(i, edge_for_request(i));
-    var outcome = candidate.status;
-    if (outcome == FLIP_DONE && my_rule(candidate.corners)) {
-        flip_claim(i, candidate);
-    } else if (outcome == FLIP_DONE) {
-        outcome = FLIP_NOT_REQUESTED;
+fn claim(@builtin(workgroup_id) group: vec3<u32>,
+         @builtin(num_workgroups) groups: vec3<u32>,
+         @builtin(local_invocation_index) lane: u32) {
+    let p = flat_group(group, groups);
+    if (p >= flip_patch_count(lane)) { return; }
+    let r = flip_patch(p);
+    let edges = flip_edge_end(lane, r);
+    for (var first = 0u; first < edges; first += STAGED_EDGES) {
+        flip_stage(lane, r, first);
+        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+            let c = flip_candidate(r, first, e);
+            flip_request(c, c.status != FLIP_DONE || my_rule(c.corners));
+        }
     }
-    status[i] = outcome;
+    flip_select(lane, r, edges);
 }
-// reserve: if status[i] == FLIP_DONE, set status[i] = flip_reserve(i).
-// commit: call flip_commit(i).
+
+@compute @workgroup_size(64)
+fn reserve(@builtin(global_invocation_id) id: vec3<u32>,
+           @builtin(num_workgroups) groups: vec3<u32>) {
+    flip_reserve(flat_index(id, groups));
+}
+// commit: the same, calling flip_commit.
 ```
 
-`candidate.corners` contains mesh-wide vertex IDs `[a, b, c, d]`: the
-current edge joins `a` to `b`, and the replacement would join `c` to `d`.
-Read these only when the candidate status is `FLIP_DONE`. At this stage,
-that status means the edge is eligible, not that it has already flipped.
+Call `flip_patch_count`, `flip_edge_end`, `flip_stage` and `flip_select` from
+every invocation of the workgroup, exactly as above. `c.corners` contains
+mesh-wide vertex IDs `[a, b, c, d]`: the current edge joins `a` to `b`, and
+the replacement would join `c` to `d`. Read these only when the candidate
+status is `FLIP_DONE`, which means the edge is eligible, not that it has
+flipped. Passing `wanted` false to `flip_request` leaves the edge alone with
+status `FLIP_NOT_REQUESTED`; passing true for an ineligible edge reports why.
 
 In the host pipeline layout, use your application bindings as group 0 and
 `EdgeFlipQuery::pass_layout()` as group 1. For each batch, call
-`EdgeFlipQuery::begin_pass(device, &mut mesh, count)` and bind the returned
-`FlipPass::bind_group()` at group 1 for all three dispatches. Use
-`FlipPass::grid()` for the x and y workgroup counts and 1 for z with the
-64-invocation workgroups shown above. Preparing a pass increases the mesh
-version even if no dispatch follows. Do not also import
+`EdgeFlipQuery::begin_pass(device, &mut mesh)` and bind the returned
+`FlipPass::bind_group()` at group 1 for all three dispatches. Dispatch claim
+with `FlipPass::patch_grid()`, and reserve and commit with
+`FlipPass::edge_grid()`, each with 1 for z. Preparing a pass increases the
+mesh version even if no dispatch follows. Do not also import
 `topology::patch_arena`, which uses group 1 too.
 
-After all claims finish, call `flip_reserve(i)` for each eligible request
-and store its returned status. After all reservations finish, call
-`flip_commit(i)` once per request. Only successfully reserved requests
-change the mesh. Final statuses follow the same rules as
-`EdgeFlipQuery::encode`: requests that share a vertex may report
-`FLIP_LOST_CLAIM`, and requests without replacement storage report
-`FLIP_OUT_OF_CAPACITY`. Both can be retried in a fresh batch; retrying does
-not create additional storage.
+After commit, `FlipPass::statuses()` holds one status per mesh edge, under
+the same rules as `EdgeFlipQuery::encode`. `FLIP_LOST_CLAIM` and
+`FLIP_OUT_OF_CAPACITY` can be retried in a fresh batch; retrying does not
+create additional storage.
 
 [`examples/delaunay_flips.rs`](examples/delaunay_flips.rs) and its
 [shader](examples/shaders/delaunay.wesl) demonstrate this approach on a flat,
@@ -674,6 +681,26 @@ If group 1 is already in use, the header of `topology::flip` explains how to
 manage the three stages with your own buffers and bindings.
 [`tests/shaders/flip_consumer.wesl`](tests/shaders/flip_consumer.wesl) provides
 a smaller example of a single flip with custom bindings.
+
+**Local queries inside your own kernel.** As in RXMesh, a kernel can work out
+mesh relations for one patch on the spot, in shared memory, instead of
+reading global query buffers. Results are rebuilt from the patch as it is
+now, so they stay correct after edits. `topology::patch_queries` (which
+imports `topology::patch_arena`, group 1 read-only) offers:
+
+- `edge_diamond(r, first, e)`: an edge's endpoints and the two opposite
+  vertices, as local slots, after staging the edge's chunk with
+  `topology::patch_edge_staging`;
+- `stage_vertex_neighbors(lane, r, first)` and an iterator (`vv_begin`,
+  `vv_valid`, `vv_vertex`, `vv_next`) over each vertex's neighbors, in chunks
+  of up to 256 vertex slots. Neighbors of a vertex the patch owns are
+  complete. A vertex with more than 1,024 neighbors is iterated by scanning
+  the patch's edges instead, with the same results.
+
+Use `global_vertex(r, slot)` for mesh-wide IDs. The value-based building
+blocks are in `topology::local_query`, and
+[`tests/shaders/local_query_consumer.wesl`](tests/shaders/local_query_consumer.wesl)
+is a complete example.
 
 The editable arena is one `u32` buffer: a header, a 16-word record per patch,
 owner tables mapping each global ID to its owning patch and local slot, and

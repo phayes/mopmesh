@@ -6,7 +6,7 @@ import package::shaders::topology::patch_arena::{
 };
 import package::shaders::topology::patch_staging::{STAGED_EDGES, staged_edge_faces};
 import package::shaders::topology::patch_edge_staging::{patch_edge_end, stage_patch_edges};
-import package::shaders::topology::directed_edge::directed_start;
+import package::shaders::topology::local_query::{face_edge_index, opposite_vertex};
 import package::shaders::parallel::grid::flat_group;
 
 // One record per mesh edge, indexed by global edge ID.
@@ -28,14 +28,6 @@ fn edge_record(r: PatchRecord, e: u32, local: vec2<u32>) -> EdgeRecord {
     if (local.y != INVALID_FACE) { faces.y = global_face(r, local.y); }
     let v = edge_vertices(r, e);
     return EdgeRecord(vec2(global_vertex(r, v.x), global_vertex(r, v.y)), faces);
-}
-
-// Returns which of the face's three edges is local edge `e` (0, 1 or 2).
-// The face must contain the edge.
-fn face_edge_index(r: PatchRecord, face: u32, e: u32) -> u32 {
-    if (face_edge(r, face, 0u).x == e) { return 0u; }
-    if (face_edge(r, face, 1u).x == e) { return 1u; }
-    return 2u;
 }
 
 // Writes each mesh edge's endpoints and adjoining faces. One workgroup
@@ -85,16 +77,23 @@ fn adjacency(
             records[global] = record;
 
             // For each face, store the face across this edge and the vertex
-            // opposite the edge, which starts the face's next-but-one edge.
+            // opposite the edge.
             var opposite = vec2(INVALID_VERTEX);
             for (var side = 0u; side < 2u; side++) {
                 let f = local[side];
                 if (f == INVALID_FACE) { continue; }
-                let i = face_edge_index(r, f, e);
+                var slots: vec3<u32>;
+                var reversed: vec3<u32>;
+                var vertices: array<vec2<u32>, 3>;
+                for (var k = 0u; k < 3u; k++) {
+                    let fe = face_edge(r, f, k);
+                    slots[k] = fe.x;
+                    reversed[k] = fe.y;
+                    vertices[k] = edge_vertices(r, fe.x);
+                }
+                let i = face_edge_index(slots, e);
                 neighbors[3u * record.faces[side] + i] = record.faces[1u - side];
-                let next = face_edge(r, f, (i + 2u) % 3u);
-                let start = directed_start(edge_vertices(r, next.x), next.y != 0u);
-                opposite[side] = global_vertex(r, start);
+                opposite[side] = global_vertex(r, opposite_vertex(reversed, vertices, i));
             }
             diamonds[global] = vec4(record.vertices, opposite);
         }

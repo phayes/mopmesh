@@ -7,6 +7,7 @@ fn downstream_shader_can_link_packaged_library() {
         "patch_consumer",
         "patch_arena_consumer",
         "flip_consumer",
+        "local_query_consumer",
     ] {
         validate(&compile_consumer(name));
     }

@@ -70,7 +70,7 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
                 .encode(&device, &mut encoder, &mut by_library, &[edge])
                 .unwrap();
             queue.submit([encoder.finish()]);
-            let library = read_words(&device, &queue, library.buffer())[0];
+            let library = read_words(&device, &queue, library.buffer())[edge as usize];
             assert_eq!(FlipStatus::from_word(library), Some(FlipStatus::Flipped));
             assert_eq!(FlipStatus::from_word(status), Some(FlipStatus::Flipped));
             for (ours, theirs) in [

@@ -3,18 +3,17 @@
 // Repeating this rule aims for a Delaunay triangulation, where no interior
 // edge exceeds that angle limit.
 //
-// Group 0 holds positions and results. `topology::flip_pass` supplies group 1
-// and handles conflicts, storage, and mesh updates.
+// Group 0 holds positions. `topology::flip_pass` supplies group 1 and handles
+// conflicts, storage, mesh updates and each edge's status.
 import mopmesh::topology::flip_pass::{
-    flip_pass_count, flip_candidate, flip_claim, flip_reserve, flip_commit,
+    flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request, flip_select,
+    flip_reserve, flip_commit,
 };
-import mopmesh::topology::flip::{FLIP_DONE, FLIP_NOT_REQUESTED};
-import mopmesh::parallel::grid::flat_index;
+import mopmesh::topology::flip::FLIP_DONE;
+import mopmesh::topology::patch_staging::STAGED_EDGES;
+import mopmesh::parallel::grid::{flat_index, flat_group};
 
 @group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
-// One FLIP_* result per edge. An eligible edge that passes the angle test
-// without needing a flip receives FLIP_NOT_REQUESTED.
-@group(0) @binding(1) var<storage, read_write> status: array<u32>;
 
 // Extra angle, in radians, required beyond 180 degrees. This avoids repeated
 // flips when rounding makes the two diagonals nearly equally suitable.
@@ -37,38 +36,35 @@ fn should_flip(corners: array<u32, 4>) -> bool {
     return angle_at(c, a, b) + angle_at(d, a, b) > PI + TOLERANCE;
 }
 
-// Use each mesh-wide edge ID as its request index; skip excess invocations.
-fn request(id: vec3<u32>, groups: vec3<u32>) -> u32 {
-    let i = flat_index(id, groups);
-    return select(0xffffffffu, i, i < flip_pass_count());
-}
-
+// One workgroup per patch offers each of the patch's edges to the rule.
+// Edges that can't flip report why; eligible edges that pass the angle
+// test report FLIP_NOT_REQUESTED.
 @compute @workgroup_size(64)
-fn claim(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = request(id, groups);
-    if (i == 0xffffffffu) { return; }
-    let candidate = flip_candidate(i, i);
-    var outcome = candidate.status;
-    if (outcome == FLIP_DONE) {
-        if (should_flip(candidate.corners)) {
-            flip_claim(i, candidate);
-        } else {
-            outcome = FLIP_NOT_REQUESTED;
+fn claim(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let p = flat_group(group, groups);
+    if (p >= flip_patch_count(lane)) { return; }
+    let r = flip_patch(p);
+    let edges = flip_edge_end(lane, r);
+    for (var first = 0u; first < edges; first += STAGED_EDGES) {
+        flip_stage(lane, r, first);
+        for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += 64u) {
+            let c = flip_candidate(r, first, e);
+            flip_request(c, c.status != FLIP_DONE || should_flip(c.corners));
         }
     }
-    status[i] = outcome;
+    flip_select(lane, r, edges);
 }
 
 @compute @workgroup_size(64)
 fn reserve(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = request(id, groups);
-    if (i == 0xffffffffu || status[i] != FLIP_DONE) { return; }
-    status[i] = flip_reserve(i);
+    flip_reserve(flat_index(id, groups));
 }
 
 @compute @workgroup_size(64)
 fn commit(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = request(id, groups);
-    if (i == 0xffffffffu) { return; }
-    flip_commit(i);
+    flip_commit(flat_index(id, groups));
 }

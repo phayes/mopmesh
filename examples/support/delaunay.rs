@@ -78,7 +78,7 @@ impl DelaunayFlips {
         };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Delaunay flips"),
-            entries: &[storage(0, true), storage(1, false)],
+            entries: &[storage(0, true)],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Delaunay flips"),
@@ -118,39 +118,31 @@ impl DelaunayFlips {
         mesh: &mut GpuEditableMesh,
         positions: &wgpu::Buffer,
     ) -> Result<wgpu::Buffer, GpuError> {
-        let edges = mesh.edge_count();
-        let pass = query.begin_pass(device, mesh, edges)?;
-        let status = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Delaunay flip statuses"),
-            size: (u64::from(pass.count()) * 4).max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let pass = query.begin_pass(device, mesh)?;
         let own = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Delaunay flips"),
             layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: positions.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: status.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: positions.as_entire_binding(),
+            }],
         });
 
-        // Finish claim before reserve, and reserve before commit, using separate dispatches.
-        let [x, y] = pass.grid();
-        for stage in [&self.claim, &self.reserve, &self.commit] {
+        // Finish claim before reserve, and reserve before commit, using
+        // separate dispatches. Claim runs one workgroup per patch; the other
+        // stages run one invocation per edge.
+        for (stage, [x, y]) in [
+            (&self.claim, pass.patch_grid()),
+            (&self.reserve, pass.edge_grid()),
+            (&self.commit, pass.edge_grid()),
+        ] {
             let mut compute = encoder.begin_compute_pass(&Default::default());
             compute.set_pipeline(stage);
             compute.set_bind_group(0, &own, &[]);
             compute.set_bind_group(1, pass.bind_group(), &[]);
             compute.dispatch_workgroups(x, y, 1);
         }
-        Ok(status)
+        Ok(pass.statuses().buffer().clone())
     }
 }
 

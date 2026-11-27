@@ -17,43 +17,93 @@ Delaunay flips on a renumbered multi-patch grid with slot reuse, then
 compares every query against a fresh upload. Edges are matched by endpoint
 pair, lists as sorted vectors keeping associations, face corners exactly.
 
-Step 5 as built: `topology::flip_pass` binds the arena, masks, claims, slots
-and batch parameters at group 1 and exposes `flip_candidate`, `flip_claim`,
-`flip_reserve` and `flip_commit`, so a downstream kernel adds its rule
-between candidate and claim. `EdgeFlipQuery::begin_pass` allocates that
+Step 5 as built, since replaced by a per-patch claim stage (see
+[In-kernel local queries](#in-kernel-local-queries)): `topology::flip_pass`
+binds the arena, masks, claims, slots and batch parameters at group 1 and
+exposes `flip_candidate`, `flip_claim`, `flip_reserve` and `flip_commit`, so
+a downstream kernel adds its rule between candidate and claim. `EdgeFlipQuery::begin_pass` allocates that
 group and counts an edit; `runtime_shaders/edge_flip.wesl` is now a thin
 wrapper over the module. `examples/delaunay_flips.rs` flips a skewed grid by
 the opposite-angle rule until it settles, and its test replays the reported
 flips on the host.
 
-Step 4 as built: `EdgeFlipQuery::encode` takes a list of edges and records
+Step 4 as built, since replaced by edge-indexed statuses and priorities that
+hash the edge ID: `EdgeFlipQuery::encode` takes a list of edges and records
 three dispatches (claim, reserve, commit). The priority hashes the
 candidate's index in the list, not its edge ID, so a repeated edge can't win
 twice; the seed is the mesh version. Slots are reserved with an atomic
 try-set in their own dispatch, before any slot is freed. Single flips go
 through the same path.
 
-## Direction: in-kernel local queries
+## In-kernel local queries
 
-The user's direction, given when approving this plan: editing is the
-standout feature of this crate, and we definitely want to revisit in-kernel
-local queries. On a separate occasion they also said to follow RXMesh.
-Nothing more specific has been decided.
+Goal, set by the user: a full and proper translation of RXMesh into WGSL,
+well engineered and fast. Editing is the headline feature.
 
-What follows is a proposal, not yet put to the user:
+### Decided on 27 November 2026
 
-- Editable meshes could use RXMesh-style in-kernel local queries: each kernel
-  loads its patch's current EV/FE into workgroup memory and derives adjacency
-  on the spot, so nothing is kept that could go stale.
-- Global query buffers would stay as the simple static API and the test
-  oracle.
-- The topology version check in this plan would then be a safeguard rather
-  than the end state.
-- One way to make Milestone 3's WESL staging usable by editing kernels:
-  patch capacity, tombstoned slots, active masks, and kernels the consumer
-  writes that call library staging functions, since WGSL has no callbacks.
+The user decided the order of work, the flip API and the local-query
+choices. For the scan fallback and out-of-range IDs, the user asked for
+Codex and the advisor to be consulted. Both agreed with the proposal below,
+and it was adopted; the user can still overrule it.
+- **Order of work.** The query library and the flip come first, in two
+  gated steps.
+  - The end state is RXMesh's Delaunay kernel and cavity manager,
+    translated: one workgroup per patch runs query, rule, selection,
+    reservation and commit.
+  - Step 1 is the local queries plus a per-patch claim.
+  - Step 2 folds in reserve and commit, only if step 1's timings justify it.
+- **Flip API.** The rule visits every active owned edge, and statuses are
+  indexed by global edge ID. `EdgeFlipQuery::encode(edges)` uploads an edge
+  mask.
+- **Local queries.**
+  - Oversized patches are chunked.
+  - Neighbors are unordered local slots, with `global_vertex(r, slot)` for
+    mesh-wide IDs.
+  - A vertex row too large for shared memory is iterated by scanning the
+    patch's edges. That needs no scratch memory.
+- **Out-of-range IDs.** `FlipStatus::NotAnEdge` stays for custom kernels.
+  `encode` rejects out-of-range IDs with `GpuError::ElementOutOfRange`.
 
-Check these choices with the user before treating them as decided.
+### Step 1 as built
+
+**Local queries.**
+- `topology::local_query` has no bindings. It provides:
+  - `face_edge_index` and `opposite_vertex`, which `runtime_shaders/edges.wesl`
+    now shares;
+  - VV count, plan, scatter and row accessors in about 7 KB of workgroup
+    memory: 256 rows and 1,024 entries per chunk.
+- `topology::patch_queries` imports `patch_arena` and adds `edge_diamond`,
+  `stage_vertex_neighbors` and a forward iterator. The iterator uses the
+  scanning fallback for an oversized row.
+- `tests/gpu_local_query.rs` compares both relations with `AdjacencyQuery`:
+  - diamonds word for word, rows as sorted lists;
+  - every fixture, at patch sizes 1, 3, 128 and 512, on static and editable
+    uploads;
+  - a 1,124-neighbor fan;
+  - a multi-patch grid after every round of Delaunay flips.
+
+**Flip.** `topology::flip_pass` has a per-patch claim:
+`flip_patch`, `flip_edge_end`, `flip_stage`, `flip_candidate`, `flip_request`
+and `flip_select`. Reserve and commit still run one invocation per edge.
+`flip_select` works in three passes:
+1. It picks the winners of the vertex claims.
+2. Each winner marks the ends of its new edge, and one pass over the patch's
+   edges rejects winners whose c-d edge already exists.
+3. It reports the results.
+
+It needs no other patch, because an interior vertex has exactly one patch
+owning its whole star.
+
+**Behaviour change.** A winner that turns out to be Connected still beats
+the flips it competed with. The batch test predicts this exactly and asserts
+that it occurs.
+
+**Scratch per batch.** 40 B per edge of state plus 4 B per edge of status,
+and 8 B per vertex for claims and partners.
+
+**Not yet done.** Timing against the previous per-request claim, which is the
+gate for step 2. The machine was reserved for the baseline rerun.
 
 ## Bottom line
 
