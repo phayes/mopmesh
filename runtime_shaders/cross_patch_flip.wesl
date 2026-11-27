@@ -12,7 +12,7 @@ import package::shaders::topology::flip::{
 };
 import package::shaders::topology::cavity_rounds::{
     CAVITY_REQUEST_WORDS, CAVITY_NONE, CAVITY_PENDING, CAVITY_SELECTED, CAVITY_LOST,
-    CAVITY_FAILED, CAVITY_DONE,
+    CAVITY_FAILED, CAVITY_DONE, CAVITY_PLAN_PENDING,
 };
 import package::shaders::topology::flip_pass::{FLIP_STATE_WORDS, FLIP_STATE_CORNERS};
 import package::shaders::parallel::grid::flat_index;
@@ -31,6 +31,8 @@ struct Params { edge_count: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 // Nonzero for each mesh vertex used by a selected flip.
 @group(0) @binding(4) var<storage, read_write> taken: array<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
+// The cavity rounds' plan buffer; gather counts the pending requests in it.
+@group(0) @binding(6) var<storage, read_write> plan: array<atomic<u32>>;
 
 @compute @workgroup_size(64)
 fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
@@ -42,6 +44,7 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
         return;
     }
     requests[at] = CAVITY_PENDING;
+    atomicAdd(&plan[CAVITY_PLAN_PENDING], 1u);
     requests[at + 1u] = 0u;
     for (var k = 0u; k < 4u; k++) {
         requests[at + 2u + k] = state[FLIP_STATE_WORDS * e + FLIP_STATE_CORNERS + k];

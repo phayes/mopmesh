@@ -185,6 +185,25 @@ pub(super) fn dispatch_grid_groups(
     pass.dispatch_workgroups(x, y, 1);
 }
 
+/// Like [`dispatch_grid_groups`], with the workgroup counts read on the GPU
+/// from three `u32` words of `args` at byte `offset`, which needs
+/// `INDIRECT` usage. Counts of zero launch nothing.
+pub(super) fn dispatch_indirect_groups(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    bindings: &[&wgpu::BindGroup],
+    args: &wgpu::Buffer,
+    offset: u64,
+) {
+    let mut pass = begin_pass(encoder, label);
+    pass.set_pipeline(pipeline);
+    for (group, b) in bindings.iter().enumerate() {
+        pass.set_bind_group(group as u32, *b, &[]);
+    }
+    pass.dispatch_workgroups_indirect(args, offset);
+}
+
 pub(super) fn shader_module(
     device: &wgpu::Device,
     label: &str,

@@ -2,7 +2,7 @@
 //! using `topology::cavity_migrate`.
 //! [`CavityRounds::encode_round`](super::cavity_rounds::CavityRounds::encode_round)
 //! records them when asked to migrate.
-use super::cavity_rounds::CavityState;
+use super::cavity_rounds::{CavityState, PLAN_PATCHES};
 use super::pipeline;
 use super::{GpuEditableMesh, GpuError};
 use std::ops::Range;
@@ -75,7 +75,9 @@ impl CavityMigrate {
     }
 
     /// Records `stages` (indices into [`STAGES`]) for the round last
-    /// recorded on `state`.
+    /// recorded on `state`. With `planned`, each stage runs with the round's
+    /// planned sizes, so nothing runs once no request is pending; otherwise
+    /// each runs one workgroup per patch.
     pub fn encode(
         &self,
         device: &wgpu::Device,
@@ -83,6 +85,7 @@ impl CavityMigrate {
         mesh: &GpuEditableMesh,
         state: &CavityState,
         stages: Range<usize>,
+        planned: bool,
     ) -> Result<(), GpuError> {
         let patches = pipeline::group_grid(&device.limits(), mesh.patch_count(), RESOURCE)?;
         let empty = pipeline::bind_buffers(device, RESOURCE, &self.empty, &[]);
@@ -99,9 +102,21 @@ impl CavityMigrate {
                 (7, mesh.maps()),
             ],
         );
+        let groups = [&empty, &bindings];
         for i in stages {
             let (pipeline, entry) = (&self.stages[i], STAGES[i]);
-            pipeline::dispatch_grid_groups(encoder, entry, pipeline, &[&empty, &bindings], patches);
+            if planned {
+                pipeline::dispatch_indirect_groups(
+                    encoder,
+                    entry,
+                    pipeline,
+                    &groups,
+                    &state.args,
+                    PLAN_PATCHES,
+                );
+            } else {
+                pipeline::dispatch_grid_groups(encoder, entry, pipeline, &groups, patches);
+            }
         }
         Ok(())
     }
@@ -438,7 +453,7 @@ pub(super) mod tests {
                 queue.write_buffer(&state.patch_words, 0, bytemuck::cast_slice(&words));
                 let mut encoder = device.create_command_encoder(&Default::default());
                 migrate
-                    .encode(&device, &mut encoder, &gpu, &state, 0..STAGES.len())
+                    .encode(&device, &mut encoder, &gpu, &state, 0..STAGES.len(), false)
                     .unwrap();
                 queue.submit([encoder.finish()]);
 

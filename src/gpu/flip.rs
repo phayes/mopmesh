@@ -1,5 +1,5 @@
 //! Edge flips on editable meshes.
-use super::cavity_rounds::{CavityRounds, CavityState};
+use super::cavity_rounds::{CavityRounds, CavityState, PLAN_FLAT, PLAN_PATCHES};
 use super::{GpuEditableMesh, GpuError, pipeline};
 use wgpu::util::DeviceExt;
 
@@ -233,7 +233,7 @@ impl EdgeFlipQuery {
         let (glue, glue_layout) = pipeline::buffer_layout(
             device,
             "MOPMesh cross-patch flips",
-            &[write, read, write, write, write, Uniform],
+            &[write, read, write, write, write, Uniform, write],
         );
         let glue_module = pipeline::shader_module(
             device,
@@ -415,6 +415,7 @@ impl EdgeFlipQuery {
                 state.requests(),
                 state.taken(),
                 &params,
+                state.plan(),
             ],
         );
         let selected =
@@ -440,6 +441,7 @@ impl EdgeFlipQuery {
         encoder.copy_buffer_to_buffer(&pass.partners, 0, state.taken(), 0, pass.partners.size());
 
         // Each round: select and migrate, flip the selected edges, merge.
+        // A round with no pending request launches no workgroups.
         for round in 0..CROSS_PATCH_ROUNDS {
             self.rounds
                 .encode_round(device, encoder, mesh, &state, round, true)
@@ -447,14 +449,22 @@ impl EdgeFlipQuery {
             for buffer in [&pass.claims, &pass.state, &pass.partners, &round_statuses] {
                 encoder.clear_buffer(buffer, 0, None);
             }
-            pipeline::dispatch_grid_groups(
+            pipeline::dispatch_indirect_groups(
                 encoder,
                 "flip selected",
                 &self.flip_selected,
                 &[&selected, &round_pass],
-                pass.patch_grid,
+                &state.args,
+                PLAN_PATCHES,
             );
-            pipeline::dispatch_grid_groups(encoder, "merge", &self.merge, &[&glue], flat);
+            pipeline::dispatch_indirect_groups(
+                encoder,
+                "merge",
+                &self.merge,
+                &[&glue],
+                &state.args,
+                PLAN_FLAT,
+            );
         }
         pipeline::dispatch_grid_groups(encoder, "finish", &self.finish, &[&glue], flat);
         pass.statuses

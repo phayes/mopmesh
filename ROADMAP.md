@@ -30,13 +30,14 @@ The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run (27 November 2026, commit `2dcee78`) passed
-66 tests: 27 hardware-independent tests and 39 opt-in GPU tests (four are
-the GPU build, baseline, flip and Delaunay settle benchmarks, which return
-at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
-sizes; the count is not a measure of exhaustive coverage. Clippy,
-formatting checks and doctests passed, and all four runnable examples ran
-(the Alum benchmark example was not run). GPU execution has only been verified on
+The last full verification run (27 November 2026, after Phase 5 step 4)
+passed 81 tests, GPU tests included, in a release build (four are the GPU
+build, baseline, flip and Delaunay settle benchmarks, which return at once
+unless `MOPMESH_BENCH` is set; the flip and settle benchmarks were also run).
+Those test functions cover many fixtures and patch sizes; the count is not a
+measure of exhaustive coverage. Clippy and formatting checks passed, and all
+five runnable examples ran. A debug-build run did not finish (see Phase 5's
+follow-ups). GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
 
 Evidence lives in [host topology tests](tests/static_topology.rs),
@@ -294,15 +295,70 @@ RXMesh.
   edge against a CPU prediction; the Delaunay example's rule settles 65x65
   and 129x129 skewed grids at patch size 512 with zero violations. At patch
   size 16, edges left report `OutOfCapacity` (patch splitting, Phase 6).
-- [ ] Step 5: measure, and document the design as built.
-- [ ] Step 6: review bid-then-act against RXMesh's try-lock host loop, with
-  the code and measurements in place.
+  (`336f98b`)
+- [x] Rounds with no pending request launch no workgroups: a plan stage
+  writes each round's indirect dispatch sizes from a GPU pending count.
+  This removes the rounds when nothing crosses a border, but saves little
+  otherwise: settle and all-edges batches keep requests pending in every
+  round.
+- [ ] Step 5 (deferred 27 November 2026): cut the cost of the cross-patch
+  rounds, measure, and document the design as built in
+  `docs/local_dynamics_plan.md`. Each batch records up to 154 passes; at
+  524 K faces an all-edges batch is 4–8 ms of interior flips plus 80–106 ms
+  of cross-patch rounds, and at 32 K faces 0.7–1 ms plus 17–22 ms. A
+  Delaunay settle of 513x513 takes 14 batches and about 1.3 s. Every round
+  makes full passes over all requests, vertices and patches while few are
+  pending. Candidates, to profile first:
+  - compact the pending requests and the locked patches into lists, and
+    size the flat and per-patch stages by them;
+  - stop clearing 14 words per vertex every round (clear only touched
+    records, or tag them with the round);
+  - fuse small stages (bid with check, claim with resolve, the three
+    fills);
+  - start cleanup only on patches an acting patch wrote, not on patches
+    locked only by losing bids.
+  The roadmap's earlier flip timings (Phase 4, the Delaunay settle) predate
+  the cross-patch rounds and are stale until this rerun.
+- [ ] Step 6 (deferred 27 November 2026): review bid-then-act against
+  RXMesh's try-lock host loop with Codex and the advisor, with the code and
+  step 5's measurements in place.
 - [ ] Bounded retry queues and handle invalidation, beyond flips.
+- Follow-ups and shortcuts from steps 3–4, not scheduled:
+  - [ ] The cross-patch glue (gather, merge, finish, plan) lives in runtime
+    shaders and Rust, so a WESL-only consumer can't run cross-patch flips;
+    expose it as public value-based WESL functions, as `flip_pass` is.
+  - [ ] The full test suite has only been verified in release builds; in
+    debug, the library's GPU tests ran over 45 CPU-minutes without
+    finishing. Find the slow test and make debug verification practical.
+  - [ ] Used-slot counts never shrink after cleanup frees slots, and slot
+    allocation always scans from the first mask word.
+  - [ ] Fill and transfer skip silently if a slot or map lookup is missing,
+    which preflight should rule out; `finish_pass` panics on limits it
+    checked before recording.
+  - [ ] Small cleanups: `encode_round`'s `migrate` and the migration
+    encoder's `planned` flags could become one enum; the `rotate` test
+    helper exists in three copies.
 
 ### 6 — Growth: not started
 
 - [ ] Implement splits/collapses, slot reservation/recycling and overflow handling.
 - [ ] Add compaction and patch slicing; test capacity pressure and attribute preservation.
+
+Decisions found during Phase 5, to settle when planning:
+- **Global ID room.** Owner tables and element counts are sized to the mesh
+  at upload, and global IDs index every attribute buffer. Splits create
+  vertices, edges and faces, so they need spare global IDs as well as spare
+  slots: an API decision.
+- **Patch splitting (RXMesh's `slice_patches`).** Small patches run out of
+  room in cross-patch flips: at patch size 16–64 a Delaunay settle leaves
+  edges that report `OutOfCapacity`. RXMesh reserves a pool of spare patches
+  up front (`patch_alloc_factor`, 2–5x) and splits a full patch into a new
+  one. Here that needs reserved patch records, arena, mask and map regions,
+  and host dispatch grids sized from the pool, not `patch_count()`; shaders
+  already read the patch count from the arena.
+- **Reuse.** A collapse's cavity is the faces around two vertices, which the
+  cavity rounds' four-corner requests already cover; a split also allocates
+  new elements.
 
 ### 7 — Mesh algorithms: not started
 
@@ -409,12 +465,15 @@ local cavities. The current Cargo version does not mean that release scope is co
    documented contracts, reference checks and the `smoothing` example. Their
    costs are in the [baseline report](docs/baseline_benchmark.md#queries-without-a-twin).
    Still open from Phase 3: the edge-length batch API decision.
-5. **Begin local dynamics.** Use the reviewed storage/synchronization contracts
-   for Phase 4. Acceptance starts with a correct single interior flip before
-   parallel claims or cross-patch editing.
+5. **Local dynamics (Phase 4) — done.** Parallel interior flips, one
+   dispatch per batch, with in-kernel local queries.
+6. **Cross-patch dynamics (Phase 5) — steps 0–4 done.** Edge flips cross
+   patch borders by RXMesh-style migration. Steps 5 (cost) and 6 (lock
+   review) are deferred; see [Phase 5](#5--boundary-dynamics-in-progress).
+7. **Growth (Phase 6) — next.** Splits, collapses and patch splitting, on
+   the Phase 5 cavity machinery.
 
-Do not begin cross-patch transactions or growth before the local-edit invariants
-are tested. CUDA benchmark availability need not block the initial same-adapter
+CUDA benchmark availability need not block the initial same-adapter
 comparison against the unpartitioned WESL baseline.
 
 ## Discoveries and implementation consequences

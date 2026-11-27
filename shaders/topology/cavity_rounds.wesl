@@ -35,7 +35,8 @@
 // so their patches can edit independently. Every round selects at least one
 // request, unless every pending one has lost to a used corner. Run the
 // stages as separate dispatches in this order; each reads what the previous
-// one wrote. Before each round, clear the vertex records and patch words to
+// one wrote, after `cavity_plan`, which skips the whole round once no
+// request is pending. Before each round, clear the vertex records and patch words to
 // zero.
 //
 // Importing this module binds the mesh read-only through
@@ -104,13 +105,25 @@ const INVALID: u32 = 0xffffffffu;
 
 // Per round: `seed` orders requests that share an acting patch; `round_seed`
 // orders acting patches and must change every round; `request_count` is the
-// number of requests.
+// number of requests; `flat_grid` and `patch_grid` are the workgroup counts
+// `cavity_plan` writes while requests are pending.
 struct RoundParams {
     seed: u32,
     round_seed: u32,
     request_count: u32,
     _pad: u32,
+    flat_grid: vec2<u32>,
+    patch_grid: vec2<u32>,
 }
+
+// Words of the plan buffer: the number of pending requests, then from
+// CAVITY_PLAN_FLAT and CAVITY_PLAN_PATCHES, the three workgroup counts of an
+// indirect dispatch for one invocation per request and for one workgroup
+// per patch.
+public const CAVITY_PLAN_WORDS: u32 = 12u;
+public const CAVITY_PLAN_PENDING: u32 = 0u;
+public const CAVITY_PLAN_FLAT: u32 = 4u;
+public const CAVITY_PLAN_PATCHES: u32 = 8u;
 
 // CAVITY_REQUEST_WORDS words per request; set the stage to CAVITY_PENDING
 // and the corners before the first round. Corners that are not used must
@@ -124,6 +137,10 @@ struct RoundParams {
 // it for every round of a batch.
 @group(2) @binding(3) var<storage, read_write> taken: array<atomic<u32>>;
 @group(2) @binding(4) var<uniform> round_params: RoundParams;
+// CAVITY_PLAN_WORDS words. Set the pending count to the number of
+// CAVITY_PENDING requests before the first round; the stages keep it
+// current.
+@group(2) @binding(5) var<storage, read_write> plan: array<atomic<u32>>;
 
 fn stage_word(request: u32) -> u32 {
     return CAVITY_REQUEST_WORDS * request;
@@ -252,6 +269,7 @@ public fn cavity_bid(request: u32) {
     for (var i = 0u; i < 4u; i++) {
         if (atomicLoad(&taken[c[i]]) != 0u) {
             requests[at] = CAVITY_LOST;
+            atomicSub(&plan[CAVITY_PLAN_PENDING], 1u);
             return;
         }
     }
@@ -346,6 +364,7 @@ public fn cavity_resolve(request: u32) {
         }
     }
     requests[at] = CAVITY_SELECTED;
+    atomicSub(&plan[CAVITY_PLAN_PENDING], 1u);
     let tag = requests[at + 1u] + 1u;
     for (var i = 0u; i < 4u; i++) {
         atomicStore(&taken[c[i]], 1u);
@@ -371,6 +390,22 @@ public fn cavity_conclude(request: u32) {
     for (var i = 0u; i < 4u; i++) {
         atomicStore(&taken[c[i]], 0u);
     }
+}
+
+// Before a round's first stage, from a single invocation: writes the
+// round's indirect dispatch sizes into the plan buffer, the full grids
+// while any request is pending and zero workgroups otherwise. Record every
+// stage of the round, migration included, with these sizes.
+public fn cavity_plan() {
+    let busy = atomicLoad(&plan[CAVITY_PLAN_PENDING]) != 0u;
+    let flat = select(vec2(0u, 1u), round_params.flat_grid, busy);
+    let patches = select(vec2(0u, 1u), round_params.patch_grid, busy);
+    atomicStore(&plan[CAVITY_PLAN_FLAT], flat.x);
+    atomicStore(&plan[CAVITY_PLAN_FLAT + 1u], flat.y);
+    atomicStore(&plan[CAVITY_PLAN_FLAT + 2u], 1u);
+    atomicStore(&plan[CAVITY_PLAN_PATCHES], patches.x);
+    atomicStore(&plan[CAVITY_PLAN_PATCHES + 1u], patches.y);
+    atomicStore(&plan[CAVITY_PLAN_PATCHES + 2u], 1u);
 }
 
 // Returns the number of requests, for skipping spare invocations.

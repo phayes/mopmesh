@@ -11,6 +11,8 @@ use wgpu::util::DeviceExt;
 
 /// Words per request: stage, acting patch, then four corner vertex IDs.
 pub(crate) const REQUEST_WORDS: usize = 6;
+/// The pending stage, which requests uploaded by tests start in.
+const CAVITY_PENDING: u32 = 1;
 /// Request stages, as `topology::cavity_rounds` names them; read by tests.
 #[cfg(test)]
 pub(crate) mod stage {
@@ -23,6 +25,11 @@ pub(crate) mod stage {
 }
 #[cfg(test)]
 pub(crate) use stage::*;
+/// Words in a batch's plan buffer, and the byte offsets of its indirect
+/// dispatch sizes, as `topology::cavity_rounds` lays them out.
+const PLAN_WORDS: u64 = 12;
+pub(crate) const PLAN_FLAT: u64 = 4 * 4;
+pub(crate) const PLAN_PATCHES: u64 = 4 * 8;
 /// Words per mesh vertex in a round's vertex records.
 const VERTEX_WORDS: u64 = 14;
 /// Words per patch in a round's patch words; the first is the patch's lock.
@@ -50,6 +57,7 @@ pub(crate) struct CavityRounds {
     state: wgpu::BindGroupLayout,
     stages: Vec<wgpu::ComputePipeline>,
     conclude: wgpu::ComputePipeline,
+    plan: wgpu::ComputePipeline,
     migrate: CavityMigrate,
 }
 
@@ -63,6 +71,12 @@ pub(crate) struct CavityState {
     taken: wgpu::Buffer,
     /// As long as the mesh's masks; used by `topology::cavity_migrate`.
     pub(super) scratch: wgpu::Buffer,
+    /// The pending count and each round's dispatch sizes, as the stages
+    /// keep them.
+    plan: wgpu::Buffer,
+    /// A copy of `plan` made after each round's plan stage, for indirect
+    /// dispatches: a dispatch can't also bind its size buffer as storage.
+    pub(super) args: wgpu::Buffer,
     request_count: u32,
     seed: u32,
 }
@@ -85,7 +99,7 @@ impl CavityRounds {
         let (state, _) = pipeline::buffer_layout(
             device,
             "MOPMesh cavity rounds state",
-            &[write, write, write, write, Uniform],
+            &[write, write, write, write, Uniform, write],
         );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("MOPMesh cavity rounds"),
@@ -107,6 +121,7 @@ impl CavityRounds {
             state,
             stages: STAGES.iter().map(|(entry, _)| stage(entry)).collect(),
             conclude: stage("conclude"),
+            plan: stage("plan"),
             migrate: CavityMigrate::new(device),
         }
     }
@@ -136,9 +151,19 @@ impl CavityRounds {
 
         // Bind the mesh and this round's parameters.
         let round_seed = state.seed ^ (round + 1).wrapping_mul(0x9e37_79b9);
+        let words = [
+            state.seed,
+            round_seed,
+            state.request_count,
+            0,
+            flat[0],
+            flat[1],
+            patches[0],
+            patches[1],
+        ];
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh cavity round parameters"),
-            contents: bytemuck::cast_slice(&[state.seed, round_seed, state.request_count, 0]),
+            contents: bytemuck::cast_slice(&words),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let empty = pipeline::bind_buffers(device, RESOURCE, &self.empty, &[]);
@@ -154,22 +179,40 @@ impl CavityRounds {
                 &state.patch_words,
                 &state.taken,
                 &params,
+                &state.plan,
             ],
         );
 
-        // Run the stages in order.
+        // Plan the round, then run the stages in order with the planned
+        // sizes: none at all once no request is pending.
         let groups = [&empty, &mesh_group, &state_group];
+        pipeline::dispatch_grid_groups(encoder, "plan", &self.plan, &groups, [1, 1]);
+        encoder.copy_buffer_to_buffer(&state.plan, 0, &state.args, 0, PLAN_WORDS * 4);
         for (pipeline, &(entry, per_patch)) in self.stages.iter().zip(&STAGES) {
-            let grid = if per_patch { patches } else { flat };
-            pipeline::dispatch_grid_groups(encoder, entry, pipeline, &groups, grid);
+            let offset = if per_patch { PLAN_PATCHES } else { PLAN_FLAT };
+            pipeline::dispatch_indirect_groups(
+                encoder,
+                entry,
+                pipeline,
+                &groups,
+                &state.args,
+                offset,
+            );
         }
 
         // Migrate, with failed requests concluded before anything is copied.
         if migrate {
             let (m, before, after) = (&self.migrate, BEFORE_CONCLUDE, AFTER_CONCLUDE);
-            m.encode(device, encoder, mesh, state, before)?;
-            pipeline::dispatch_grid_groups(encoder, "conclude", &self.conclude, &groups, flat);
-            m.encode(device, encoder, mesh, state, after)?;
+            m.encode(device, encoder, mesh, state, before, true)?;
+            pipeline::dispatch_indirect_groups(
+                encoder,
+                "conclude",
+                &self.conclude,
+                &groups,
+                &state.args,
+                PLAN_FLAT,
+            );
+            m.encode(device, encoder, mesh, state, after, true)?;
         }
         Ok(())
     }
@@ -264,7 +307,29 @@ impl CavityState {
             }
             _ => scratch("MOPMesh cavity requests", request_bytes),
         };
+        // The plan starts with the pending count of the given requests.
+        let pending = requests.map_or(0, |words| {
+            words
+                .chunks(REQUEST_WORDS)
+                .filter(|w| w[0] == CAVITY_PENDING)
+                .count() as u32
+        });
+        let mut plan_words = vec![0u32; PLAN_WORDS as usize];
+        plan_words[0] = pending;
+        let plan = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOPMesh cavity plan"),
+            contents: bytemuck::cast_slice(&plan_words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MOPMesh cavity round sizes"),
+            size: PLAN_WORDS * 4,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
+            plan,
+            args,
             requests: requests_buffer,
             vertex_records: scratch("MOPMesh cavity vertex records", record_bytes),
             patch_words: scratch("MOPMesh cavity patch words", patch_bytes),
@@ -273,6 +338,12 @@ impl CavityState {
             request_count,
             seed,
         })
+    }
+
+    /// The pending count, then the dispatch sizes `cavity_plan` writes.
+    /// Add each request you make pending on the GPU to the count.
+    pub fn plan(&self) -> &wgpu::Buffer {
+        &self.plan
     }
 
     /// One nonzero word per mesh vertex used by a selected request; the
