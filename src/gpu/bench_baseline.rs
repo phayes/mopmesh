@@ -119,6 +119,7 @@ pub(super) fn sample(
             set: t.set.clone(),
             capacity: MAX_PASSES,
             passes: 0,
+            labels: Vec::new(),
         }));
     }
     record(&mut encoder);

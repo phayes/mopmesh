@@ -97,16 +97,19 @@ pub(super) mod instrument {
         /// Passes recorded so far, including any beyond `capacity`, which
         /// are not timed.
         pub passes: u32,
+        /// The label of every pass recorded so far, in order.
+        pub labels: Vec<String>,
     }
 
-    /// Counts a pass and returns the query set and pass index to time it
-    /// with, if a set is installed and has room.
-    pub(super) fn next_pass() -> Option<(wgpu::QuerySet, u32)> {
+    /// Counts a pass labeled `label` and returns the query set and pass
+    /// index to time it with, if a set is installed and has room.
+    pub(super) fn next_pass(label: &str) -> Option<(wgpu::QuerySet, u32)> {
         DISPATCHES.with(|count| count.set(count.get() + 1));
         PASS_TIMESTAMPS.with_borrow_mut(|timestamps| {
             let t = timestamps.as_mut()?;
             let index = t.passes;
             t.passes += 1;
+            t.labels.push(label.to_owned());
             (index < t.capacity).then(|| (t.set.clone(), index))
         })
     }
@@ -116,7 +119,7 @@ pub(super) mod instrument {
 /// while benchmark timestamps are installed, time it.
 fn begin_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
     #[cfg(test)]
-    if let Some((set, index)) = instrument::next_pass() {
+    if let Some((set, index)) = instrument::next_pass(label) {
         return encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(label),
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {

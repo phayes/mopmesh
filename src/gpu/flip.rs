@@ -141,6 +141,8 @@ impl FlipPass {
 /// Create one per device and reuse it for subsequent batches.
 pub struct EdgeFlipQuery {
     requests: wgpu::BindGroupLayout,
+    /// Group 0 of `flip_selected`: the cavity requests and patch words.
+    selected: wgpu::BindGroupLayout,
     pass: wgpu::BindGroupLayout,
     flip: wgpu::ComputePipeline,
     /// Flips this round's selected cross-patch requests.
@@ -215,8 +217,20 @@ impl EdgeFlipQuery {
             Some(&pipeline_layout),
         );
 
-        // Cross-patch flips: the selected-request flip shares both layouts;
-        // gather, merge and finish bind their own buffers at group 0.
+        // Cross-patch flips: the selected-request flip binds the requests
+        // and the round's patch words at group 0 and shares group 1; gather,
+        // merge and finish bind their own buffers at group 0.
+        let read = Storage { read_only: true };
+        let (selected, _) = pipeline::buffer_layout(
+            device,
+            "MOPMesh selected cross-patch flip requests",
+            &[read, read],
+        );
+        let selected_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("MOPMesh selected cross-patch flips"),
+            bind_group_layouts: &[Some(&selected), Some(&pass)],
+            immediate_size: 0,
+        });
         let selected_module = pipeline::shader_module(
             device,
             "MOPMesh selected cross-patch flips",
@@ -227,9 +241,8 @@ impl EdgeFlipQuery {
             "MOPMesh selected cross-patch flips",
             &selected_module,
             "flip",
-            Some(&pipeline_layout),
+            Some(&selected_layout),
         );
-        let read = Storage { read_only: true };
         let (glue, glue_layout) = pipeline::buffer_layout(
             device,
             "MOPMesh cross-patch flips",
@@ -257,6 +270,7 @@ impl EdgeFlipQuery {
             finish: stage("finish"),
             glue,
             requests,
+            selected,
             pass,
             rounds: CavityRounds::new(device),
         }
@@ -418,8 +432,12 @@ impl EdgeFlipQuery {
                 state.plan(),
             ],
         );
-        let selected =
-            pipeline::bind_buffers(device, RESOURCE, &self.requests, &[state.requests()]);
+        let selected = pipeline::bind_buffers(
+            device,
+            RESOURCE,
+            &self.selected,
+            &[state.requests(), &state.patch_words],
+        );
         let round_pass = pipeline::bind_buffers(
             device,
             RESOURCE,

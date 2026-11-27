@@ -18,6 +18,17 @@ pub(crate) const STAGES: [&str; 8] = [
     "transfer",
     "cleanup",
 ];
+/// Pass labels for [`STAGES`], distinct from the scheduler's.
+const LABELS: [&str; 8] = [
+    "migrate ring",
+    "migrate claim",
+    "migrate preflight",
+    "migrate fill vertices",
+    "migrate fill edges",
+    "migrate fill faces",
+    "migrate transfer",
+    "migrate cleanup",
+];
 /// The stages to record before the scheduler's `conclude` stage; the rest
 /// come after it.
 pub(crate) const BEFORE_CONCLUDE: Range<usize> = 0..3;
@@ -104,18 +115,18 @@ impl CavityMigrate {
         );
         let groups = [&empty, &bindings];
         for i in stages {
-            let (pipeline, entry) = (&self.stages[i], STAGES[i]);
+            let (pipeline, label) = (&self.stages[i], LABELS[i]);
             if planned {
                 pipeline::dispatch_indirect_groups(
                     encoder,
-                    entry,
+                    label,
                     pipeline,
                     &groups,
                     &state.args,
                     PLAN_PATCHES,
                 );
             } else {
-                pipeline::dispatch_grid_groups(encoder, entry, pipeline, &groups, patches);
+                pipeline::dispatch_grid_groups(encoder, label, pipeline, &groups, patches);
             }
         }
         Ok(())
@@ -131,7 +142,7 @@ pub(super) mod tests {
     use crate::gpu::bench_migration::Sim;
     use crate::gpu::cavity_rounds::tests::predict_round;
     use crate::gpu::cavity_rounds::{
-        CavityRounds, FAILED, NONE, PATCH_WORDS, PENDING, REQUEST_WORDS,
+        CavityRounds, FAILED, INVOLVED_WORD, NONE, PATCH_WORDS, PENDING, REQUEST_WORDS,
     };
     use crate::gpu::editable::inspect::{
         PatchView, check_exact_ribbons, check_invariants, patch_views,
@@ -446,10 +457,14 @@ pub(super) mod tests {
                 let masks = read(&device, &queue, gpu.masks());
                 check_exact_ribbons(&arena, &masks);
 
-                // Lock every patch, so cleanup runs on all of them.
+                // Flag every patch as involved, so cleanup runs on all of them.
                 let state = CavityState::new(&device, &gpu, &[], 0).unwrap();
                 let mut words = vec![0u32; PATCH_WORDS * gpu.patch_count() as usize];
-                words.iter_mut().step_by(PATCH_WORDS).for_each(|w| *w = 1);
+                words
+                    .iter_mut()
+                    .skip(INVOLVED_WORD)
+                    .step_by(PATCH_WORDS)
+                    .for_each(|w| *w = 1);
                 queue.write_buffer(&state.patch_words, 0, bytemuck::cast_slice(&words));
                 let mut encoder = device.create_command_encoder(&Default::default());
                 migrate
@@ -457,8 +472,9 @@ pub(super) mod tests {
                     .unwrap();
                 queue.submit([encoder.finish()]);
 
-                // The arena and masks are unchanged, and the rebuilt maps
-                // still record exactly the active slots.
+                // The arena and masks are unchanged, and the maps, which
+                // cleanup leaves alone when it drops nothing, still record
+                // exactly the active slots.
                 assert_eq!(
                     read(&device, &queue, gpu.arena()),
                     arena,

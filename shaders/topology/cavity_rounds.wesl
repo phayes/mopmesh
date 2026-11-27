@@ -25,7 +25,9 @@
 //   6. `cavity_claim`, then `cavity_resolve`, one invocation per request
 //      each: among one acting patch's won requests, those holding the highest
 //      priority at all four corners become CAVITY_SELECTED and use up their
-//      corners; the others become pending again.
+//      corners; the others become pending again. Resolve also flags the
+//      acting patches and the owners of selected corners in the patch words
+//      (CAVITY_ACTING_WORD, CAVITY_RING_WORD).
 //
 // To carry out the selected edits, run the stages of
 // `topology::cavity_migrate` next; `cavity_conclude` runs among them and
@@ -79,13 +81,24 @@ public const CAVITY_VERTEX_WORDS: u32 = 14u;
 public const CAVITY_CORNER: u32 = 12u;
 public const CAVITY_RING: u32 = 13u;
 // Words per patch in the round's patch words.
-public const CAVITY_PATCH_WORDS: u32 = 5u;
+public const CAVITY_PATCH_WORDS: u32 = 8u;
 // Offsets within a patch's words: the highest bid on the patch; nonzero if
 // the patch's edits this round failed for lack of room; then how many new
 // vertex, edge and face copies they need.
 public const CAVITY_LOCK_WORD: u32 = 0u;
 public const CAVITY_FAILED_WORD: u32 = 1u;
 public const CAVITY_NEW_WORDS: u32 = 2u;
+// Nonzero if the patch owns a corner of a request selected this round.
+// Set by `cavity_resolve`.
+public const CAVITY_RING_WORD: u32 = 5u;
+// Nonzero if the patch is the acting patch of a request selected this
+// round. Set by `cavity_resolve`.
+public const CAVITY_ACTING_WORD: u32 = 6u;
+// Nonzero if the patch is an acting patch, or owns a face, edge or vertex
+// of a selected request's cavity faces: the only patches that
+// `topology::cavity_migrate` changes this round. Set by `cavity_resolve`
+// and `cavity_ring`.
+public const CAVITY_INVOLVED_WORD: u32 = 7u;
 // Owners counted around one vertex; a vertex with more is left out of
 // choosing acting patches.
 const LEADER_SLOTS: u32 = 4u;
@@ -299,18 +312,33 @@ fn relay(lane: u32, r: PatchRecord, forward: bool) {
     for (var f = lane; f < faces; f += PATCH_LANES) {
         if (!slot_active(r, FACE, f)) { continue; }
         let vertices = face_vertex_slots(r, f);
+
+        // The bids on the face's vertices that this patch owns.
+        var bids = vec3(0u);
+        var globals = vec3(0u);
         for (var i = 0u; i < 3u; i++) {
             if (!slot_owned(r, VERTEX, vertices[i])) { continue; }
-            let v = global_vertex(r, vertices[i]);
-            let bid = atomicLoad(&vertex_records[record_word(v, BID)]);
-            if (bid == 0u) { continue; }
-            let patches = face_footprint(r, f, vertices);
-            for (var k = 0u; k < 7u; k++) {
-                let lock = CAVITY_PATCH_WORDS * patches[k] + CAVITY_LOCK_WORD;
-                if (forward) {
-                    atomicMax(&patch_words[lock], bid);
-                } else if (atomicLoad(&patch_words[lock]) != bid) {
-                    atomicStore(&vertex_records[record_word(v, LOST)], 1u);
+            globals[i] = global_vertex(r, vertices[i]);
+            bids[i] = atomicLoad(&vertex_records[record_word(globals[i], BID)]);
+        }
+        let top = max(bids.x, max(bids.y, bids.z));
+        if (top == 0u) { continue; }
+
+        // Each distinct patch of the face's footprint once.
+        let patches = face_footprint(r, f, vertices);
+        for (var k = 0u; k < 7u; k++) {
+            var repeat = false;
+            for (var j = 0u; j < k; j++) { repeat = repeat || patches[j] == patches[k]; }
+            if (repeat) { continue; }
+            let lock = CAVITY_PATCH_WORDS * patches[k] + CAVITY_LOCK_WORD;
+            if (forward) {
+                atomicMax(&patch_words[lock], top);
+                continue;
+            }
+            let held = atomicLoad(&patch_words[lock]);
+            for (var i = 0u; i < 3u; i++) {
+                if (bids[i] != 0u && held != bids[i]) {
+                    atomicStore(&vertex_records[record_word(globals[i], LOST)], 1u);
                 }
             }
         }
@@ -365,11 +393,17 @@ public fn cavity_resolve(request: u32) {
     }
     requests[at] = CAVITY_SELECTED;
     atomicSub(&plan[CAVITY_PLAN_PENDING], 1u);
-    let tag = requests[at + 1u] + 1u;
+    let actor = requests[at + 1u];
     for (var i = 0u; i < 4u; i++) {
         atomicStore(&taken[c[i]], 1u);
-        atomicStore(&vertex_records[record_word(c[i], CAVITY_CORNER)], tag);
+        atomicStore(&vertex_records[record_word(c[i], CAVITY_CORNER)], actor + 1u);
+        let corner_owner = owner(VERTEX, c[i]).x;
+        atomicStore(&patch_words[CAVITY_PATCH_WORDS * corner_owner + CAVITY_RING_WORD], 1u);
     }
+
+    // Flag the acting patch, which every later stage of the round changes.
+    atomicStore(&patch_words[CAVITY_PATCH_WORDS * actor + CAVITY_ACTING_WORD], 1u);
+    atomicStore(&patch_words[CAVITY_PATCH_WORDS * actor + CAVITY_INVOLVED_WORD], 1u);
 }
 
 // After `cavity_preflight` from `topology::cavity_migrate`, for request

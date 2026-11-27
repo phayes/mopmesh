@@ -7,7 +7,9 @@
 // round's `cavity_resolve`, on the same vertex records and patch words:
 //
 //   1. `cavity_ring`: each corner's owner marks the vertices of the faces
-//      around the corner, the cavity faces.
+//      around the corner, the cavity faces, and flags every patch owning a
+//      cavity face, edge or vertex as involved. Only involved patches take
+//      part in the stages below; the rest return at once.
 //   2. `cavity_claim`: each marked vertex's owner adds the faces around the
 //      vertex, with their edges and vertices, to the acting patch's maps,
 //      counting the copies the acting patch lacks.
@@ -20,9 +22,10 @@
 //      acting patch.
 //   6. `cavity_transfer`: owners hand the cavity faces, and their edges and
 //      vertices, to the acting patch.
-//   7. `cavity_cleanup`: every patch the round locked keeps exactly the
-//      copies its owned faces need, rebuilds its maps, and recomputes its
-//      interior vertices.
+//   7. `cavity_cleanup`: every involved patch keeps exactly the copies its
+//      owned faces need, rebuilds its maps, and recomputes its interior
+//      vertices. Patches that are not involved are unchanged by the round,
+//      so they keep what the previous cleanup left.
 //
 // Every stage except conclude runs one workgroup of PATCH_LANES
 // invocations per patch, from uniform control flow.
@@ -45,8 +48,8 @@ import super::patch_map::{
 import super::directed_edge::directed_start;
 import super::flip::free_bit;
 import super::cavity_rounds::{
-    CAVITY_PATCH_WORDS, CAVITY_LOCK_WORD, CAVITY_FAILED_WORD, CAVITY_NEW_WORDS,
-    CAVITY_VERTEX_WORDS, CAVITY_CORNER, CAVITY_RING,
+    CAVITY_PATCH_WORDS, CAVITY_FAILED_WORD, CAVITY_NEW_WORDS, CAVITY_RING_WORD,
+    CAVITY_ACTING_WORD, CAVITY_INVOLVED_WORD, CAVITY_VERTEX_WORDS, CAVITY_CORNER, CAVITY_RING,
 };
 
 const INVALID: u32 = 0xffffffffu;
@@ -61,6 +64,8 @@ const INVALID: u32 = 0xffffffffu;
 @group(1) @binding(4) var<storage, read_write> scratch: array<atomic<u32>>;
 
 var<workgroup> shared_word: u32;
+// Bit k set if `cavity_cleanup` dropped a copy of kind k in this patch.
+var<workgroup> dropped_kinds: atomic<u32>;
 
 // Shares a value from the first invocation with the whole workgroup.
 fn broadcast(lane: u32, value: u32) -> u32 {
@@ -122,8 +127,19 @@ fn patch_word(p: u32, field: u32) -> u32 {
     return CAVITY_PATCH_WORDS * p + field;
 }
 
-fn locked(p: u32) -> bool {
-    return atomicLoad(&patch_words[patch_word(p, CAVITY_LOCK_WORD)]) != 0u;
+// Whether patch `p`'s word `field` (CAVITY_RING_WORD, CAVITY_ACTING_WORD or
+// CAVITY_INVOLVED_WORD) is set this round.
+fn flagged(p: u32, field: u32) -> bool {
+    return atomicLoad(&patch_words[patch_word(p, field)]) != 0u;
+}
+
+// The patch that owns element `global` of `kind`.
+fn owner_patch(kind: u32, global: u32) -> u32 {
+    return arena[owner_offset(arena[OWNERS_WORD + kind], global)];
+}
+
+fn flag_involved(p: u32) {
+    atomicStore(&patch_words[patch_word(p, CAVITY_INVOLVED_WORD)], 1u);
 }
 
 fn failed(p: u32) -> bool {
@@ -144,21 +160,33 @@ fn face_edge_slots(r: PatchRecord, face: u32) -> array<u32, 3> {
     return array(edge_slot(r, face, 0u), edge_slot(r, face, 1u), edge_slot(r, face, 2u));
 }
 
-// Stage 1 for patch `p`.
+// Stage 1 for patch `p`. Also flags the owners of every cavity face, its
+// edges and its vertices as involved.
 public fn cavity_ring(lane: u32, p: u32) {
-    if (!locked(p)) { return; }
+    if (!flagged(p, CAVITY_RING_WORD)) { return; }
     let r = record(p);
     for (var f = lane; f < used(r, FACE); f += PATCH_LANES) {
         if (!mask_bit(r.active_masks[FACE], f)) { continue; }
         let vertices = face_vertex_slots(r, f);
+        var cavity = false;
         for (var i = 0u; i < 3u; i++) {
             if (!owned(r, VERTEX, vertices[i])) { continue; }
             let tag = vertex_tag(global_id(r, VERTEX, vertices[i]), CAVITY_CORNER);
             if (tag == 0u) { continue; }
+            cavity = true;
             for (var j = 0u; j < 3u; j++) {
                 let w = global_id(r, VERTEX, vertices[j]);
                 atomicStore(&vertex_records[CAVITY_VERTEX_WORDS * w + CAVITY_RING], tag);
             }
+        }
+        if (!cavity) { continue; }
+
+        // The face's owners: the patches the later stages change.
+        flag_involved(owner_patch(FACE, global_id(r, FACE, f)));
+        let edges = face_edge_slots(r, f);
+        for (var i = 0u; i < 3u; i++) {
+            flag_involved(owner_patch(VERTEX, global_id(r, VERTEX, vertices[i])));
+            flag_involved(owner_patch(EDGE, global_id(r, EDGE, edges[i])));
         }
     }
 }
@@ -186,7 +214,7 @@ fn claim(actor: u32, kind: u32, global: u32) {
 
 // Stage 2 for patch `p`.
 public fn cavity_claim(lane: u32, p: u32) {
-    if (!locked(p)) { return; }
+    if (!flagged(p, CAVITY_INVOLVED_WORD)) { return; }
     let r = record(p);
     for (var f = lane; f < used(r, FACE); f += PATCH_LANES) {
         if (!mask_bit(r.active_masks[FACE], f)) { continue; }
@@ -204,7 +232,7 @@ public fn cavity_claim(lane: u32, p: u32) {
 
 // Stage 3 for patch `p`. Only the first invocation does any work.
 public fn cavity_preflight(lane: u32, p: u32) {
-    if (lane != 0u || !locked(p)) { return; }
+    if (lane != 0u || !flagged(p, CAVITY_ACTING_WORD)) { return; }
     let r = record(p);
     for (var k = 0u; k < 3u; k++) {
         let needed = atomicLoad(&patch_words[patch_word(p, CAVITY_NEW_WORDS + k)]);
@@ -272,7 +300,7 @@ fn fill(r: PatchRecord, kind: u32, slot: u32, actor: u32) {
 // Stage 5 for patch `p`, once per kind: VERTEX, then EDGE, then FACE, each
 // in its own dispatch.
 public fn cavity_fill(lane: u32, p: u32, kind: u32) {
-    if (!locked(p)) { return; }
+    if (!flagged(p, CAVITY_INVOLVED_WORD)) { return; }
     let r = record(p);
     for (var f = lane; f < used(r, FACE); f += PATCH_LANES) {
         if (!mask_bit(r.active_masks[FACE], f)) { continue; }
@@ -306,7 +334,7 @@ fn hand_over(r: PatchRecord, kind: u32, slot: u32, actor: u32) {
 
 // Stage 6 for patch `p`.
 public fn cavity_transfer(lane: u32, p: u32) {
-    if (!locked(p)) { return; }
+    if (!flagged(p, CAVITY_INVOLVED_WORD)) { return; }
     let r = record(p);
 
     // Cavity faces this patch owns, and the edges of every cavity face it
@@ -356,18 +384,20 @@ fn deactivate(r: PatchRecord, kind: u32, slot: u32) {
     atomicAnd(&masks[mask_word(r.owned_masks[kind], slot)], clear);
 }
 
-// Stage 7 for patch `p`. Does nothing unless the round locked the patch.
-// Afterwards the patch holds exactly its owned elements and every face at a
-// vertex of a face it owns, with their edges and vertices; its maps record
-// exactly its active slots; and its interior bits mark the vertices whose
-// faces it all owns.
+// Stage 7 for patch `p`. Does nothing unless the patch is involved this
+// round (CAVITY_INVOLVED_WORD). Afterwards the patch holds exactly its
+// owned elements and every face at a vertex of a face it owns, with their
+// edges and vertices; its maps record exactly its active slots; and its
+// interior bits mark the vertices whose faces it all owns.
 public fn cavity_cleanup(lane: u32, p: u32) {
-    let lock = atomicLoad(&patch_words[CAVITY_PATCH_WORDS * p + CAVITY_LOCK_WORD]);
-    if (broadcast(lane, lock) == 0u) { return; }
+    let involved = atomicLoad(&patch_words[patch_word(p, CAVITY_INVOLVED_WORD)]);
+    if (broadcast(lane, involved) == 0u) { return; }
     let r = record(p);
     let faces = used(r, FACE);
 
-    // Clear the interior bits and this patch's keep bits.
+    // Clear the interior bits, this patch's keep bits and the dropped kinds.
+    if (lane == 0u) { atomicStore(&dropped_kinds, 0u); }
+    workgroupBarrier();
     for (var k = 0u; k < 3u; k++) {
         let words = (r.capacity[k] + 31u) / 32u;
         for (var w = lane; w < words; w += PATCH_LANES) {
@@ -423,19 +453,30 @@ public fn cavity_cleanup(lane: u32, p: u32) {
     }
     storageBarrier();
 
-    // Drop every active copy not kept, and empty the maps.
+    // Drop every active copy not kept, noting the kinds dropped.
     for (var k = 0u; k < 3u; k++) {
         for (var s = lane; s < used(r, k); s += PATCH_LANES) {
             if (mask_bit(r.active_masks[k], s) && !scratch_bit(r.active_masks[k], s)) {
                 deactivate(r, k, s);
+                atomicOr(&dropped_kinds, 1u << k);
             }
         }
-        map_clear(p, k, lane, PATCH_LANES);
+    }
+    workgroupBarrier();
+
+    // A map still records exactly the active slots unless a copy of its
+    // kind was dropped, or this is a failed acting patch, whose maps hold
+    // claims that were never filled. Empty the others for a rebuild.
+    let failed_actor = flagged(p, CAVITY_ACTING_WORD) && failed(p);
+    let rebuild = broadcast(lane, atomicLoad(&dropped_kinds) | select(0u, 7u, failed_actor));
+    for (var k = 0u; k < 3u; k++) {
+        if ((rebuild & (1u << k)) != 0u) { map_clear(p, k, lane, PATCH_LANES); }
     }
     storageBarrier();
 
-    // Rebuild the maps from the active slots.
+    // Rebuild those maps from the active slots.
     for (var k = 0u; k < 3u; k++) {
+        if ((rebuild & (1u << k)) == 0u) { continue; }
         for (var s = lane; s < used(r, k); s += PATCH_LANES) {
             if (mask_bit(r.active_masks[k], s)) {
                 map_set(p, k, global_id(r, k, s), s);

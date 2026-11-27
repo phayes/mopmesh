@@ -33,7 +33,11 @@ pub(crate) const PLAN_PATCHES: u64 = 4 * 8;
 /// Words per mesh vertex in a round's vertex records.
 const VERTEX_WORDS: u64 = 14;
 /// Words per patch in a round's patch words; the first is the patch's lock.
-pub(crate) const PATCH_WORDS: usize = 5;
+pub(crate) const PATCH_WORDS: usize = 8;
+/// The patch word that marks a patch the round's migration changes, as
+/// `topology::cavity_rounds` names it (CAVITY_INVOLVED_WORD); set by tests.
+#[cfg(test)]
+pub(crate) const INVOLVED_WORD: usize = 7;
 
 /// Entry points in dispatch order, and whether each runs one workgroup per
 /// patch rather than one invocation per request.

@@ -308,15 +308,48 @@ RXMesh.
   of cross-patch rounds, and at 32 K faces 0.7–1 ms plus 17–22 ms. A
   Delaunay settle of 513x513 takes 14 batches and about 1.3 s. Every round
   makes full passes over all requests, vertices and patches while few are
-  pending. Candidates, to profile first:
-  - compact the pending requests and the locked patches into lists, and
+  pending.
+  - [x] Profiled (27 November 2026): `MOPMESH_BENCH_STAGES=1` prints each
+    pass label's GPU time, per-round totals and the GPU span (clears
+    included). At 524 K faces, cleanup took 27–33 ms, flip selected
+    12–14 ms, lead+bid+relay 20–35 ms, the fills 9–13 ms; each of the 8
+    rounds cost about the same, however few requests were selected.
+  - [x] Gate the per-patch stages on what the round selected, as RXMesh
+    blocks return at once when their patch has no cavities. Resolve flags
+    acting patches and owners of selected corners; ring flags the owners
+    of every cavity face, edge and vertex as involved. Ring, claim, fill,
+    transfer and cleanup run only on involved patches, preflight and flip
+    selected only on acting patches.
+  - [x] Cleanup rebuilds a patch's map only for kinds it dropped a copy of,
+    or all three on a failed acting patch.
+  - [x] Relay visits each face's footprint once, without repeats.
+  - Result, 524 K faces at patch size 512, all-edges batch, identical
+    statuses: cross-patch GPU time 78–109 ms → 54–73 ms (−27 to −38%);
+    gating gave most of it, the relay and map-rebuild changes about 5%
+    more. Delaunay settle of 513x513: 1113 ms before (one run); in an
+    interleaved A/B, 801–870 ms with gating alone and 745–761 ms with all
+    three. That benchmark times the host's submit to completion and once
+    read 910 ms for the final build, so compare GPU times where possible.
+    At 32 K faces nothing changed (11–16 ms): 154 passes of fixed cost
+    dominate there, so fusing stages is the lever for small meshes.
+    Remaining split at 524 K: cleanup 15–17 ms (most patches are involved
+    in every round of an all-edges batch), bid 7–10 ms, lead 4–6 ms, relay
+    7–11 ms, fills 7–10 ms.
+  - Shortcut: cleanup no longer rebuilds every involved patch's maps, so a
+    fill that skips silently (see the follow-ups below) now leaves a stale
+    map entry until that kind is next dropped.
+  Candidates left:
+  - cleanup's map rebuild is still most of its cost: erase dropped IDs
+    instead (needs a tombstone policy, since `map_claim` doesn't reuse
+    erased entries), or build maps in workgroup memory;
+  - `cavity_actor` makes up to ~320 atomic loads per pending request in
+    bid; load the four corners' leader records once;
+  - compact the pending requests and the flagged patches into lists, and
     size the flat and per-patch stages by them;
   - stop clearing 14 words per vertex every round (clear only touched
     records, or tag them with the round);
   - fuse small stages (bid with check, claim with resolve, the three
-    fills);
-  - start cleanup only on patches an acting patch wrote, not on patches
-    locked only by losing bids.
+    fills).
   The roadmap's earlier flip timings (Phase 4, the Delaunay settle) predate
   the cross-patch rounds and are stale until this rerun.
 - [ ] Step 6 (deferred 27 November 2026): review bid-then-act against

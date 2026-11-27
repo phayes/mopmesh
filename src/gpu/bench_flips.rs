@@ -9,6 +9,8 @@
 //! - `MOPMESH_BENCH_PATCHES`: comma-separated patch sizes, default `512`.
 //! - `MOPMESH_BENCH_RUNS`: timed runs per mesh, default 11, after the
 //!   warm-up runs.
+//! - `MOPMESH_BENCH_STAGES`: if set, also prints each row's median GPU time
+//!   per pass label, summed over the batch.
 use super::bench::{ms, wait};
 use super::bench_baseline::WARMUP;
 use super::bench_meshes::{self, BenchMesh};
@@ -56,14 +58,16 @@ impl PassTimer {
         }
     }
 
-    /// Records, submits and waits for `record`, returning the wall time and
-    /// the GPU time of each compute pass it recorded, in order.
+    /// Records, submits and waits for `record`. Returns the wall time; the
+    /// GPU span from the first compute pass's start to the last one's end,
+    /// which also covers buffer clears and copies between passes; and the
+    /// label and GPU time of each compute pass, in order.
     fn sample(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         record: impl FnOnce(&mut wgpu::CommandEncoder),
-    ) -> (Duration, Vec<Duration>) {
+    ) -> (Duration, Duration, Vec<(String, Duration)>) {
         // Time every pass the batch records.
         let start = Instant::now();
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -71,9 +75,12 @@ impl PassTimer {
             set: self.set.clone(),
             capacity: MAX_PASSES,
             passes: 0,
+            labels: Vec::new(),
         }));
         record(&mut encoder);
-        let passes = PASS_TIMESTAMPS.take().map_or(0, |t| t.passes);
+        let (passes, labels) = PASS_TIMESTAMPS
+            .take()
+            .map_or((0, Vec::new()), |t| (t.passes, t.labels));
         assert!(passes <= MAX_PASSES, "{passes} passes; raise MAX_PASSES");
         if passes > 0 {
             encoder.resolve_query_set(&self.set, 0..2 * passes, &self.resolve, 0);
@@ -89,21 +96,26 @@ impl PassTimer {
         wait(device);
         let wall = start.elapsed();
         if passes == 0 {
-            return (wall, Vec::new());
+            return (wall, Duration::ZERO, Vec::new());
         }
 
         // Read each pass's start and end after the wall clock stops.
         let slice = self.readback.slice(..16 * u64::from(passes));
         slice.map_async(wgpu::MapMode::Read, |result| result.unwrap());
         wait(device);
-        let times = bytemuck::cast_slice::<u8, [u64; 2]>(&slice.get_mapped_range().unwrap())
-            .iter()
-            .map(|[start, end]| {
-                Duration::from_nanos((end.saturating_sub(*start) as f64 * self.period_ns) as u64)
-            })
-            .collect();
+        let stamps =
+            bytemuck::cast_slice::<u8, [u64; 2]>(&slice.get_mapped_range().unwrap()).to_vec();
         self.readback.unmap();
-        (wall, times)
+        let duration = |start: u64, end: u64| {
+            Duration::from_nanos((end.saturating_sub(start) as f64 * self.period_ns) as u64)
+        };
+        let span = duration(stamps[0][0], stamps[stamps.len() - 1][1]);
+        let times = stamps
+            .iter()
+            .zip(labels)
+            .map(|([start, end], label)| (label, duration(*start, *end)))
+            .collect();
+        (wall, span, times)
     }
 }
 
@@ -161,13 +173,14 @@ fn gpu_flip_benchmark() {
         "one batch requesting every edge, fresh upload at the default capacity per run; \
          {runs} timed runs after {WARMUP} warm-up; medians in ms: GPU time of the \
          interior pass, of the cross-patch passes after it (with their count), \
-         their sum, and wall time"
+         their sum, the GPU span from the first pass's start to the last one's end \
+         (clears and copies included), and wall time"
     );
     println!(
         "| mesh | patch size | edges | flipped | lost claim | retry | out of room | \
-         interior | cross-patch | GPU sum | wall |"
+         interior | cross-patch | GPU sum | GPU span | wall |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|");
 
     // Each mesh, then a shuffled copy of it.
     for mesh in faces.into_iter().flat_map(bench_meshes::generated) {
@@ -203,23 +216,54 @@ fn row(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut cross_passes = 0;
     let mut words = Vec::new();
+    let mut stages: Vec<(String, Vec<Duration>)> = Vec::new();
+    let mut rounds: Vec<Vec<Duration>> = Vec::new();
+    let mut spans = Vec::new();
     for run in 0..WARMUP + runs {
         let mut editable = GpuEditableMesh::upload(device, &mesh, EditCapacity::default()).unwrap();
         wait(device);
         let statuses = RefCell::new(None);
-        let (wall, times) = timer.sample(device, queue, |encoder| {
+        let (wall, span, times) = timer.sample(device, queue, |encoder| {
             let result = query
                 .encode(device, encoder, &mut editable, &edges)
                 .unwrap();
             *statuses.borrow_mut() = Some(result);
         });
         if run >= WARMUP {
-            let (interior, cross) = times.split_first().expect("the batch records passes");
+            let ((_, interior), cross) = times.split_first().expect("the batch records passes");
             interiors.push(*interior);
-            crosses.push(cross.iter().sum::<Duration>());
+            crosses.push(cross.iter().map(|(_, t)| *t).sum::<Duration>());
             cross_passes = cross.len();
-            sums.push(times.iter().sum::<Duration>());
+            sums.push(times.iter().map(|(_, t)| *t).sum::<Duration>());
+            spans.push(span);
             walls.push(wall);
+
+            // Sum this run's passes by label, labels in first-recorded order,
+            // and by cross-patch round, each starting at its plan pass.
+            let mut run_stages: Vec<(String, Duration)> = Vec::new();
+            let mut run_rounds: Vec<Duration> = Vec::new();
+            for (label, time) in times {
+                if label == "plan" {
+                    run_rounds.push(Duration::ZERO);
+                }
+                if let Some(total) = run_rounds.last_mut() {
+                    *total += time;
+                }
+                match run_stages.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, total)) => *total += time,
+                    None => run_stages.push((label, time)),
+                }
+            }
+            for (label, total) in run_stages {
+                match stages.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, totals)) => totals.push(total),
+                    None => stages.push((label, vec![total])),
+                }
+            }
+            rounds.resize(rounds.len().max(run_rounds.len()), Vec::new());
+            for (totals, total) in rounds.iter_mut().zip(run_rounds) {
+                totals.push(total);
+            }
         }
         if run + 1 == WARMUP + runs {
             let statuses = statuses.into_inner().unwrap();
@@ -235,7 +279,7 @@ fn row(
             .count()
     };
     println!(
-        "| {} | {patch_size} | {} | {} | {} | {} | {} | {} | {} ({cross_passes}) | {} | {} |",
+        "| {} | {patch_size} | {} | {} | {} | {} | {} | {} | {} ({cross_passes}) | {} | {} | {} |",
         bench.name,
         edges.len(),
         count(FlipStatus::Flipped),
@@ -245,8 +289,20 @@ fn row(
         median(&mut interiors),
         median(&mut crosses),
         median(&mut sums),
+        median(&mut spans),
         median(&mut walls),
     );
+
+    // With MOPMESH_BENCH_STAGES, each pass label's median total per batch.
+    if std::env::var_os("MOPMESH_BENCH_STAGES").is_some() {
+        let breakdown: Vec<String> = stages
+            .iter_mut()
+            .map(|(label, times)| format!("{label} {}", median(times)))
+            .collect();
+        println!("  stages: {}", breakdown.join(", "));
+        let by_round: Vec<String> = rounds.iter_mut().map(|times| median(times)).collect();
+        println!("  rounds: {}", by_round.join(", "));
+    }
 }
 
 /// Copies the first `len` words of `buffer` back to the CPU.
