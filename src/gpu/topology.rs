@@ -95,9 +95,11 @@ pub trait GpuTopology: sealed::Sealed {
     fn edge_capacity(&self) -> u32;
     /// Returns the face ID capacity; see [`vertex_capacity`](Self::vertex_capacity).
     fn face_capacity(&self) -> u32;
-    /// Returns whether some IDs below the capacities may be unused. Results
-    /// hold `INVALID_ID` or zero for unused IDs. Always `false` for a
-    /// [`GpuMesh`], whose IDs are all in use.
+    /// Returns whether some IDs below the capacities may be unused. Query
+    /// results mark unused IDs: `INVALID_ID` in connectivity rows, zero in
+    /// geometry and flags, and empty neighbor lists; smoothing keeps their
+    /// input values. Always `false` for a [`GpuMesh`], whose IDs are all in
+    /// use.
     fn has_unused_ids(&self) -> bool;
     /// Returns the vertex, edge or face ID capacity.
     fn element_capacity(&self, kind: ElementKind) -> u32 {

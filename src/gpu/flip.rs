@@ -89,7 +89,8 @@ impl GpuFlipStatuses {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
-    /// Number of results to read: the mesh's edge count.
+    /// Number of results to read: one per edge ID, the mesh's edge ID
+    /// capacity.
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -524,7 +525,7 @@ impl EdgeFlipQuery {
     /// records no GPU work.
     ///
     /// Returns [`GpuError::ElementOutOfRange`] if an ID is not less than the
-    /// mesh's edge count, or [`GpuError::LimitsExceeded`] if the batch
+    /// mesh's edge ID capacity, or [`GpuError::LimitsExceeded`] if the batch
     /// exceeds the device's buffer or dispatch limits. On error, no work is
     /// recorded and the version is unchanged.
     pub fn encode(

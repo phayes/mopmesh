@@ -17,6 +17,8 @@ impl EdgeConnectivity {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
+    /// Returns the number of records: the mesh's edge ID capacity, which may
+    /// include unused IDs.
     pub fn edge_count(&self) -> u32 {
         self.edge_count
     }

@@ -189,7 +189,7 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     }
 
     /// Allocates a zeroed, unstamped output attribute of `len` elements for
-    /// mesh `mesh`. `len` must be the mesh's element count for `E`. Check the
+    /// mesh `mesh`. `len` must be the mesh's ID capacity for `E`. Check the
     /// size with [`check_output`](Self::check_output) first.
     pub(crate) fn output(device: &wgpu::Device, mesh: MeshId, len: u32, label: &str) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -268,8 +268,9 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         self.len == 0
     }
 
-    /// Queue a full replacement from a host attribute of the same mesh. Host
-    /// and GPU attributes are snapshots; neither automatically updates the other.
+    /// Queue a full replacement from a host attribute of the same mesh, with
+    /// zeros for the IDs past the CPU mesh's elements. Host and GPU
+    /// attributes are snapshots; neither automatically updates the other.
     /// Queue writes become visible on the next submission, including to commands
     /// already encoded. Submit earlier readers before calling this method.
     /// Returns [`GpuError::MeshMismatch`] if `attribute` belongs to another mesh
@@ -282,6 +283,13 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     ) -> Result<(), GpuError> {
         if self.mesh != attribute.mesh {
             return Err(GpuError::MeshMismatch);
+        }
+
+        // Pad with zeros for the IDs no CPU element has, as upload does.
+        if attribute.values.len() < self.len as usize {
+            let mut values = attribute.values.clone();
+            values.resize(self.len as usize, T::zeroed());
+            return self.write_values(queue, &values);
         }
         self.write_values(queue, &attribute.values)
     }

@@ -54,12 +54,16 @@ impl MeshAdjacency {
     pub fn topology(&self) -> TopologyStamp {
         self.edges.topology()
     }
+    /// Returns the number of vertex rows: the mesh's vertex ID capacity,
+    /// which may include unused IDs.
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
     }
+    /// Returns the number of face rows: the mesh's face ID capacity.
     pub fn face_count(&self) -> u32 {
         self.face_count
     }
+    /// Returns the number of edge rows: the mesh's edge ID capacity.
     pub fn edge_count(&self) -> u32 {
         self.edges.edge_count()
     }

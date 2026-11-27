@@ -318,6 +318,8 @@ impl FaceVertices {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
+    /// Returns the number of face rows: the mesh's face ID capacity, which
+    /// may include unused IDs.
     pub fn face_count(&self) -> u32 {
         self.face_count
     }
@@ -434,9 +436,14 @@ impl VertexFaceAdjacency {
     pub fn topology(&self) -> TopologyStamp {
         self.topology
     }
+    /// Returns the number of vertex rows: the mesh's vertex ID capacity,
+    /// which may include unused IDs.
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
     }
+    /// Returns the room for face IDs after the offsets: three per face ID.
+    /// The entries written number the last offset, which is smaller when
+    /// some face IDs are unused.
     pub fn entry_count(&self) -> u32 {
         self.entry_count
     }
