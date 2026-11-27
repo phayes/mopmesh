@@ -6,7 +6,7 @@
 //! Without `MOPMESH_BENCH` it returns at once. Settings, all optional:
 //! - `MOPMESH_BENCH_FACES`: comma-separated target face counts for the
 //!   generated meshes, default `32768,524288,2097152`.
-//! - `MOPMESH_BENCH_PATCHES`: comma-separated patch sizes, default `128`.
+//! - `MOPMESH_BENCH_PATCHES`: comma-separated patch sizes, default `512`.
 //! - `MOPMESH_BENCH_OBJ`: comma-separated OBJ paths, benchmarked with a
 //!   shuffled copy each.
 //! - `MOPMESH_BENCH_RUNS`: timed runs per query, default 11, after 2 warm-up runs.
@@ -230,7 +230,7 @@ fn gpu_baseline_benchmark() {
             .collect()
     };
     let faces = numbers("MOPMESH_BENCH_FACES", "32768,524288,2097152");
-    let patches = numbers("MOPMESH_BENCH_PATCHES", "128");
+    let patches = numbers("MOPMESH_BENCH_PATCHES", "512");
     let runs = numbers("MOPMESH_BENCH_RUNS", "11")[0] as usize;
     let bench = Bench::new(runs);
 

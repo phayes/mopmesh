@@ -104,7 +104,7 @@ impl Default for MeshBuilder<'_> {
         Self {
             positions: &[],
             triangles: &[],
-            patch_size: 128,
+            patch_size: 512,
             split: Split::Method(Partition::default()),
         }
     }
@@ -121,7 +121,7 @@ impl<'a> MeshBuilder<'a> {
         self.triangles = triangles;
         self
     }
-    /// Maximum owned faces per patch, excluding ribbons.
+    /// Maximum owned faces per patch, excluding ribbons; 512 by default.
     pub fn patch_size(mut self, size: usize) -> Self {
         self.patch_size = size;
         self

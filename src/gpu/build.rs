@@ -42,11 +42,11 @@ pub struct GpuMeshBuilder {
 }
 
 impl GpuMeshBuilder {
-    /// Creates a builder for `device` with the default patch size of 128 faces.
+    /// Creates a builder for `device` with the default patch size of 512 faces.
     pub fn new(device: &wgpu::Device) -> Self {
         Self {
             pipelines: GpuBuilder::new(device),
-            patch_size: 128,
+            patch_size: 512,
         }
     }
 

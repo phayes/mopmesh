@@ -50,7 +50,7 @@ Optional settings:
 | Variable | Default | Meaning |
 |---|---|---|
 | `MOPMESH_BENCH_FACES` | `32768,524288,2097152` | Target face counts for the generated meshes |
-| `MOPMESH_BENCH_PATCHES` | `128` | Patch sizes |
+| `MOPMESH_BENCH_PATCHES` | `512` | Patch sizes (`128` when this report was run) |
 | `MOPMESH_BENCH_OBJ` | none | OBJ files to add, each with a shuffled copy |
 | `MOPMESH_BENCH_RUNS` | `11` | Timed runs per query, after 2 warm-up runs |
 
@@ -280,7 +280,8 @@ At 523 K faces, on the grid (the other meshes follow the same pattern):
   the lowest time on every staged query and the least memory (65–75 B/face).
   Shuffled, its edge records run at 0.55–0.6x the flat path and batched
   adjacency at 0.68–0.69x; in input order they are 1.5–1.9x and 1.2–1.3x.
-  The default patch size is still 128.
+  The default patch size was 128 when this report was run; it is now 512
+  (decided 27 November 2026), matching RXMesh's default.
 - **Patch size 32 is about 3x slower than milestone 2** on staged edge
   records: at 523 K faces, 1.78 ms on the grid and 2.38 ms on the sphere,
   against 0.61 and 0.72 ms then. At 2.1 M faces it takes 8.8–11.0 ms. It is

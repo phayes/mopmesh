@@ -63,7 +63,7 @@ let triangles = [[0, 1, 2]];
 let mesh = MeshBuilder::new()
     .positions(&positions)
     .triangles(&triangles)
-    .patch_size(128)
+    .patch_size(512) // The default; smaller patches use more memory.
     .build()?;
 # Ok::<(), mopmesh::BuildError>(())
 ```
@@ -212,7 +212,7 @@ instead of with `MeshBuilder`:
 ```rust,ignore
 use mopmesh::gpu::{GpuMeshBuilder, GpuMeshInput};
 
-let builder = GpuMeshBuilder::new(&device).patch_size(128); // Cache once per device.
+let builder = GpuMeshBuilder::new(&device); // Patch size 512 by default. Cache once per device.
 let input = GpuMeshInput {
     positions: &positions,  // STORAGE buffer of [f32; 4], fourth lane ignored
     triangles: &triangles,  // STORAGE buffer of [u32; 4], fourth lane ignored

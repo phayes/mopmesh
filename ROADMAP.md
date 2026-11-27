@@ -327,8 +327,9 @@ local cavities. The current Cargo version does not mean that release scope is co
      - [ ] Profile the staged pass: still 2.6–3.2x the flat edge pass in
        input order, and most of the shuffled adjacency cost.
      - [ ] Patch size 32 is about 3x slower than in Milestone 2 (deferred).
-     - [ ] Decide the default patch size: 512 beat 128 on every staged query
-       and used 65–75 against 83–103 B/face.
+     - [x] Default patch size is now 512 (decided 27 November 2026), as in
+       RXMesh: it beat 128 on every staged query and used 65–75 against
+       83–103 B/face.
      - [ ] Per-face queries are 9–27% slower than in Milestone 2; an
        all-active static reader could recover 5–15%.
      - [ ] Give the benchmark's "VV, edge records given" row its own output,
