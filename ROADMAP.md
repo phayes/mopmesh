@@ -14,9 +14,12 @@ contracts in the README alongside the code.
 The prototype has the planned static adjacency families, canonical vertex
 attributes, hierarchical scans, and two runnable downstream WESL examples.
 Geometry algorithms have begun, and so has topology editing:
-`GpuEditableMesh` supports single and parallel interior edge flips, every
-query runs on edited meshes through `GpuTopology`, and results from before an
-edit are rejected with `GpuError::Stale`. Meshes can be built and partitioned
+`GpuEditableMesh` supports single and parallel interior edge flips. Each
+flip batch is one dispatch with one workgroup per patch; selection repeats
+until the set of flips is maximal, and flips rewrite their own edge and face
+slots, so they need no spare capacity and `EdgeFlipQuery` never reports
+`OutOfCapacity`. Every query runs on edited meshes through `GpuTopology`, and
+results from before an edit are rejected with `GpuError::Stale`. Meshes can be built and partitioned
 on the CPU (`MeshBuilder`, then `GpuMesh::upload`) or entirely on the GPU
 (`GpuMeshBuilder`); both run the same query suite against Alum. Static
 uploads (`GpuMesh`) are immutable.
@@ -25,9 +28,10 @@ The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run (27 November 2026, commit `746a47f`) passed
-61 tests: 27 hardware-independent tests and 34 opt-in GPU tests (two are the GPU build and baseline benchmarks, which
-return at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
+The last full verification run (27 November 2026, commit `2e9b6c5`) passed
+66 tests: 27 hardware-independent tests and 39 opt-in GPU tests (four are
+the GPU build, baseline, flip and Delaunay settle benchmarks, which return
+at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
 checks passed, and all four runnable examples ran (the Alum benchmark
 example was not run). GPU execution has only been verified on
