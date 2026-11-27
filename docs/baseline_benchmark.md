@@ -7,7 +7,8 @@ milestone 3 experiment.
 
 ## Bottom line
 
-- **The patch arena is slower than the flat baseline on every query today.**
+- **The patch arena is slower than the flat baseline on all five queries
+  that have a flat twin.**
   At 2.1 M faces in input order, edge records take 6.3 ms on the arena against
   1.1 ms flat (5.8x), and the batched adjacency takes 8.2 against 2.9 ms (2.9x).
   Edge records are the main cost: each owned edge scans every face its owner
@@ -17,18 +18,22 @@ milestone 3 experiment.
   while the arena's stay at 6.4 ms. Batched adjacency becomes 15.1 against
   13.1 ms (1.15x).
 - **The kernels after the edge records dominate on shuffled meshes, on both
-  paths.** They read global arrays (the VV transpose, FF, diamonds), and on
-  shuffled input they cost about 7.6 ms against 1.4 ms in input order. No
+  paths.** They read global arrays (the VV transpose, FF, diamonds). An
+  estimate, from subtracting the separately timed edge and face-vertex
+  queries from batched adjacency: about 7.6 ms on shuffled input against
+  1.4 ms in input order. Per-pass timestamps could measure it directly. No
   query uses patch locality there yet.
 - **The arena takes 3.6–4x the memory**: 129–145 bytes per face against 36.
   Patches hold 1.6–2.0 faces per face (ribbons included).
 - **Per-call overhead is large.** Wall time exceeds summed GPU pass time by
-  about 8 ms for batched adjacency at 2.1 M faces. That gap is host encoding,
-  the 16 buffers each call allocates (review finding P3), and gaps between
-  passes. At that size it is 73% of the flat path's wall time.
+  about 8 ms for batched adjacency at 2.1 M faces, 73% of the flat path's
+  wall time. It covers host encoding, the 16 buffers each call allocates
+  (review finding P3) and gaps between passes. How it splits between them is
+  not measured.
 - **The GPU build degrades badly on high-valence vertices.** A 2.1 M-face UV
   sphere (two poles of valence 1448) builds in 3.1 s, against 109 ms for a
   grid of the same size. The CPU build is unaffected (418 against 404 ms).
+  The cause is not yet profiled.
 - **Milestone 3 candidate: edge incidence**, as the roadmap suggested. It is
   the largest gap and is local by construction. The global VV/FF kernels are
   the second target, because only patch-local traversal can make them
@@ -86,8 +91,13 @@ the same kernels on both paths, because they read only global results.
   queries at pass boundaries. It leaves out gaps between passes. This
   adapter has no timestamps inside encoders.
 - Setup rows are 3 timed runs after 1 warm-up.
-- Tables show medians. The GPU min-to-max spread is under 2% for nearly every
-  row, so differences above a few percent are real.
+- Tables show medians. In the main run (338 rows with a median of at least
+  0.1 ms), the GPU median is within 2% of the minimum in 85% of rows and
+  within 4% in 90%. Maxima are noisier: single slow runs put min to max under
+  2% in only 46% of rows, and up to 6x the median for the two reductions at
+  2.1 M faces (0.14 ms median, 1.0 ms max). The patch-size sweep was noisier
+  still: median within 2% of minimum in 60% of rows, and 18% or more in a
+  tenth of them. Treat differences under about 5% as noise.
 
 **Counts.** Dispatches come from a test-only counter in the shared dispatch
 helper. Buffers and bind groups come from wgpu's internal counters (the
@@ -99,8 +109,8 @@ period 1 ns.
 
 ## Memory and setup
 
-At 2.1 M faces (medians). "Upload flat" includes deriving the global arrays on
-the host.
+At 2.1 M faces (medians). Both upload columns include laying out the data on
+the host from the CPU mesh.
 
 | Mesh | Arena B/face | Flat B/face | Faces held per face | CPU build | Upload arena | Upload flat | GPU build |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -118,8 +128,8 @@ the host.
   (1.79 against 1.64 faces held per face).
 - The sphere's GPU build is 28x slower than the grid's at this size, and 10x at
   522 K faces (327 against 32 ms). Its shuffled copy builds faster (775 ms),
-  so the cost depends on how the poles' fans land in patches, not on the
-  valence alone.
+  which suggests the cost depends on how the poles' fans land in patches,
+  not on the valence alone. This is not yet profiled.
 - The same pattern holds at 522 K faces at about a quarter of these times.
 
 ## Queries with a flat twin
@@ -155,8 +165,9 @@ What the columns show:
 - **Face vertices and centroids** cost 1.4–1.8x on the arena from indirection
   alone: arena offsets, then local IDs, then global IDs.
 - **Batched adjacency**, after the edge records, runs the same global kernels
-  on both paths (VV count, scan and scatter, then FF and diamonds). In input
-  order they take about 1.4 ms; shuffled, about 7.6 ms. This part is
+  on both paths (VV count, scan and scatter, then FF and diamonds). By
+  subtraction, they take about 1.4 ms in input order and about 7.6 ms
+  shuffled. This part is
   sensitive to element order, and patches do not help it today.
 - **Smoothing** reads the global VV rows, so it slows on shuffled meshes on
   both paths. On the sphere one invocation walks each pole's 1448 neighbors.
@@ -201,9 +212,12 @@ in ms, patched / flat.
 | sphere | 128 | 141.2 | 1.905 | 1.83 / 0.16 | 2.37 / 0.73 | 1.88 | 327 ms |
 | sphere | 512 | 119.6 | 1.432 | 5.53 / 0.16 | 8.28 / 0.74 | 5.49 | 100 ms |
 
-The torus and irregular grid follow the grid. The sweep's raw rows hold two
-outliers, irregular grid at patch size 64 (adjacency 2.60 / 0.94, boundary
-3.37), where the flat path also slowed, so they are drift rather than layout.
+The torus and irregular grid follow the grid, with one exception: the
+irregular grid at patch size 64. Its batched adjacency median (2.60 / 0.94 ms)
+is noise, since the minima are 1.60 / 0.68 ms and the flat path slowed too.
+Its boundary flags, though, take 3.37 ms with a minimum of 3.36 ms, against
+1.03 ms on the grid at that size. That one is consistent within the run and
+unexplained.
 
 - **Edge records grow linearly with patch size** on the arena, about
   0.01 ms per face of patch size at this mesh size, and stay flat on the flat
@@ -215,7 +229,8 @@ outliers, irregular grid at patch size 64 (adjacency 2.60 / 0.94, boundary
 - **Boundary flags track edge records** at every size, so they share the
   same bottleneck.
 - **The sphere's GPU build falls as patches grow** (1170 ms at 32, 100 ms at
-  512), so its cost comes from small patches around the high-valence poles.
+  512). That points to small patches around the high-valence poles, but the
+  cause is not yet profiled.
 
 ## Dispatches and allocations
 

@@ -268,7 +268,8 @@ local cavities. The current Cargo version does not mean that release scope is co
    with regression tests; the deferred findings are listed under
    [static API review follow-ups](#static-api-review-follow-ups) and feed the
    benchmark baseline.
-2. **Benchmark baseline — done.** The [baseline report](docs/baseline_benchmark.md)
+2. **Benchmark baseline — done on generated meshes; follow-ups below.** The
+   [baseline report](docs/baseline_benchmark.md)
    compares the patch arena with an unpartitioned WESL baseline (the same
    connectivity in global arrays) on generated grids, spheres, tori and
    irregular grids, each also with shuffled IDs, at 32 K–2.1 M faces and
@@ -278,17 +279,22 @@ local cavities. The current Cargo version does not mean that release scope is co
    2.9x at 2.1 M faces in input order, 1.8x and 1.15x shuffled. It uses
    3.6–4x the memory. Scratch bytes are not measured, because Metal does not
    report buffer memory. The [approximate comparison against Alum](docs/approximate_benchmark.md)
-   remains for the GPU build and single-thread CPU numbers.
+   remains for the GPU build and single-thread CPU numbers. Open:
+   - [ ] Report scratch bytes per query, from wgpu's buffer-memory counter
+     on Vulkan/DX12 or a test-only tally on Metal.
+   - [ ] Rerun on real scanned meshes (`MOPMESH_BENCH_OBJ`) once the Phase 0
+     benchmark meshes are curated.
+   - [ ] Rerun on a second adapter, ideally a discrete GPU.
 3. **Workgroup-local traversal experiment.** The baseline picks edge
    incidence. The arena's edge records scan every face of the owner patch for
    each owned edge, cost grows linearly with patch size, and boundary flags
    share the same scan. The order-sensitive global VV/FF kernels are the
-   second target. Following the Milestone 5 direction in
-   [the local dynamics plan](docs/local_dynamics_plan.md), build the staging
-   as WESL library functions that consumer kernels call. They must handle
-   per-patch capacity, tombstoned slots and active masks, so editing kernels
-   can use them too. Settle the accessor layer with the Milestone 5 work
-   before writing it. Compare staged and existing paths with identical
+   second target. Editing is a headline feature and the design follows
+   RXMesh, so the staging should also serve editing kernels. Proposed, not
+   yet decided: WESL library functions that consumer kernels call, handling
+   per-patch capacity, tombstoned slots and active masks (see
+   [the local dynamics plan](docs/local_dynamics_plan.md)). Settle the
+   accessor layer with the Milestone 5 work before writing it. Compare staged and existing paths with identical
    outputs. Acceptance: Alum parity and measured tradeoffs across mesh/patch
    sizes; retain or revise the approach based on evidence.
 4. **Complete useful static functionality — done.** Edge/face attributes,
