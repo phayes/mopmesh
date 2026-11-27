@@ -300,15 +300,14 @@ local cavities. The current Cargo version does not mean that release scope is co
    irregular grids, each also with shuffled IDs, at 32 K–2.1 M faces and
    patch sizes 32–512. It reports setup, bytes per face, ribbon overhead,
    wall and per-pass GPU time, dispatches, buffers and bind groups. It was
-   last rerun on 27 November 2026 at commit `ab98f19`. At 2.1 M faces and
+   last rerun on 27 November 2026 at commit `e6f8663`. At 2.1 M faces and
    patch size 128, the arena beats the flat layout on shuffled meshes for
-   batched adjacency (0.77–0.80x) and matches it for edge records
-   (0.96–1.07x). In input order it is still slower: edge records 2.6–3.2x
-   and batched adjacency 2.0–2.2x, from 5.8x and 2.9x in Milestone 2. At
-   the default patch size of 512, batched adjacency is 1.5–1.7x flat in
-   input order and 0.69–0.70x shuffled, and memory is 65–75 B/face against
-   36 flat. Batched adjacency regressed by about 1 ms in input order after
-   `ab98f19` (see the Milestone 3 follow-ups). Scratch bytes are not measured, because Metal does not
+   batched adjacency (0.74–0.76x) and matches it for edge records
+   (0.96–1.08x). In input order it is still slower: edge records 2.5–3.2x
+   and batched adjacency 1.6–1.9x, from 5.8x and 2.9x in Milestone 2. At
+   the default patch size of 512, batched adjacency is 1.2–1.4x flat in
+   input order and 0.68–0.69x shuffled, and memory is 65–75 B/face against
+   36 flat. Scratch bytes are not measured, because Metal does not
    report buffer memory. The [approximate comparison against Alum](docs/approximate_benchmark.md)
    remains for the GPU build and single-thread CPU numbers. Open:
    - [ ] Report scratch bytes per query, from wgpu's buffer-memory counter
@@ -345,13 +344,11 @@ local cavities. The current Cargo version does not mean that release scope is co
        83–103 B/face.
      - [ ] Per-face queries are 9–27% slower than in Milestone 2; an
        all-active static reader could recover 5–15%.
-     - [ ] Fix the batched adjacency regression from `ab98f19`: 1.1–1.2 ms
-       in input order and 0.4–0.5 ms shuffled at patch size 128. Its staged
-       pass now reads all three of a face's edge endpoints through
-       `local_query` where it read one.
-     - [ ] Explain the bimodal smoothing time on shuffled meshes (about 9 or
-       12–15 ms per ten steps between runs). Giving the benchmark's VV row
-       its own adjacency did not change it.
+     - [x] Batched adjacency regressed by 1.1–1.2 ms in input order at
+       `ab98f19`; `e6f8663` fixed it, confirmed by the rerun.
+     - [ ] Explain why smoothing on shuffled meshes takes about 9 or
+       11–15 ms per ten steps depending on the adjacency build. VV row
+       order, which the scatter leaves unspecified, is the likely factor.
      - [ ] Staging FE is untried.
 4. **Complete useful static functionality — done.** Edge/face attributes,
    normals, areas, boundary flags, reductions and smoothing landed with

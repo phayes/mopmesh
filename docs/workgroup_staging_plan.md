@@ -345,7 +345,9 @@ method. At 2.1 M faces and patch size 128:
 - The [baseline report](baseline_benchmark.md) was rerun at `ab98f19`, after
   the default patch size became 512. Batched adjacency had regressed there
   by 1.1–1.2 ms in input order and 0.4–0.5 ms shuffled, after the
-  adjacency kernel moved onto the shared `local_query` helpers.
+  adjacency kernel moved onto the shared `local_query` helpers. `e6f8663`
+  fixed that, and a third rerun there put adjacency back within noise of
+  `746a47f`.
 
 ## Steps
 
