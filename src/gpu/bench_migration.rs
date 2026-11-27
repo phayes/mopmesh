@@ -40,6 +40,8 @@
 //!     copies its owned faces need.
 use super::bench_meshes;
 use crate::MeshBuilder;
+
+mod growth;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const VERTEX: usize = 0;
