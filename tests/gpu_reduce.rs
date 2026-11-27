@@ -119,8 +119,8 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, queries: &Queries, mesh: &M
 
     // i32 face values on both sides of zero.
     let faces = mesh.face_count();
-    let ints: Vec<i32> = (0..faces as i32)
-        .map(|f| (f * 7919) % 20011 - 10005)
+    let ints: Vec<i32> = (0..faces as i64)
+        .map(|f| ((f * 7919) % 20011 - 10005) as i32)
         .collect();
     let attribute = gpu
         .upload_attribute(

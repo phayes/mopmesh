@@ -1,0 +1,244 @@
+# Milestone 5 plan: local dynamics
+
+Status: approved 26 November 2026. Nothing here is implemented yet.
+
+## Direction: in-kernel local queries
+
+Editing is the main feature of this crate, so the long-term query model for
+editable meshes is RXMesh-style in-kernel local queries: each kernel stages
+its patch's current EV/FE in workgroup memory and derives adjacency on the
+spot. Nothing is kept that could go stale, and the work stays local. Global
+query buffers stay as the simple static API and as the test oracle. The
+topology version check in this plan is a safeguard until local queries exist,
+not the end state.
+
+Revisit this when Milestone 3's workgroup staging lands. Design the WESL
+staging API so that editing kernels can use it: patch capacity, tombstoned
+slots, active masks, and a consumer-written kernel calling library staging
+functions, since WGSL has no callbacks.
+
+## Bottom line
+
+- **New type `GpuEditableMesh`.** It holds a read-write connectivity arena with
+  spare capacity per patch, active masks, owner tables and a topology version.
+  `GpuMesh` and its arena stay immutable and unchanged.
+- **Masks and capacity from the start.** A flip deletes two faces and one edge
+  in their patch's local slots and adds the replacements in fresh local slots,
+  in the RXMesh style. The global IDs are kept: the edge and both faces keep
+  theirs, so attributes indexed by global ID keep their slots. Phase 6 adds a
+  global free list for splits and collapses.
+- **Free local slots are reused, as in RXMesh.** A new element claims the first
+  inactive slot in its patch's active bitmask with an atomic try-set
+  (`atomicOr`, keeping the slot only if its bit was clear). Slots freed by a
+  batch become reusable from the next batch, so a rejected or interrupted edit
+  never overwrites rows it still needs. Capacity only has to cover one batch's
+  new elements, not every edit ever made.
+- **Global IDs with capacity.** Attributes and query results stay indexed by
+  global ID. The editable mesh reserves a global capacity per element kind and
+  keeps a global active mask. Inactive IDs are skipped by queries and hold
+  unspecified values. No flip changes global counts.
+- **Topology version, not just `MeshId`.** Each committed edit batch bumps a
+  version, every time an edit is encoded, because only the GPU knows whether
+  anything was accepted. Topology results (adjacency, edge connectivity, face
+  vertices) record `(MeshId, version)`. Queries that take them return a new
+  `GpuError::Stale` on a mismatch. Attributes the library computes from
+  topology (boundary flags, normals, areas, centroids) are `GpuAttribute`s and
+  get an optional topology stamp, checked the same way when one is present.
+  Attributes the caller uploads, such as positions, have no stamp, because edits
+  don't invalidate them.
+- **Edge ordering promise narrowed.** Ascending vertex-pair order holds only for
+  freshly built meshes. A flipped edge keeps its ID and attribute slot, and its
+  value is left as it was.
+- **Strictly interior flips only.** A flip is accepted only when every face
+  incident to any of the four diamond vertices is owned by one patch. Then no
+  other patch holds a ribbon copy of anything the flip reads or writes. Every
+  other flip is rejected with a status, never applied partially. Flips across
+  patch boundaries are Phase 5.
+- **Order of work.** First one correct flip, then parallel compatible flips in
+  one submission, with a claim pass. Stop there; migration and cross-patch
+  claims are out of scope.
+- **Coordination point.** Static query kernels must skip tombstoned local slots
+  and read per-patch counts from a header. That touches shared WESL accessors,
+  which the other session's Milestone 3 staging also changes. See
+  [Coordination](#coordination).
+
+## Why strict interior is enough to start
+
+A patch stores every face incident to a vertex of one of its owned faces
+(`MeshBuilder::build`). Suppose edge `ab` is flipped, with opposite vertices
+`c` and `d`. The old faces `abc` and `abd` become `acd` and `bcd`, and both
+use the same four vertices. Patch Q holds a copy of `abc` if Q owns a face at
+`a`, `b` or `c`. Q needs `acd` if Q owns a face at `a`, `c` or `d`. So if
+every face at `a`, `b`, `c` and `d` is owned by patch P:
+
+- no other patch holds a copy of the old faces or edge, or needs the new ones;
+- P's own ribbon set is unchanged, because the union of vertices of its owned
+  faces is unchanged;
+- ownership is unchanged: the new edge and faces are owned by P, and each
+  vertex's owner (the minimum patch over its star) is still P.
+
+A flip near a patch border fails this test even when the edge itself is owned
+by P. That case is the main rejection test.
+
+## Editable storage contract
+
+The arena is one storage buffer in `u32` words, like the static arena.
+
+- **Header:** global counts and capacities for vertices, edges and faces;
+  the patch count; offsets of the regions below.
+- **Patch records:** one fixed-size record per patch, holding local counts and
+  local capacities for vertices, edges and faces, and word offsets of that
+  patch's regions.
+- **Per-patch regions**, sized by capacity, not count: global vertex IDs, EV
+  (two local vertex IDs per edge), FE (three `(local edge, reversed)` pairs per
+  face), global edge IDs, global face IDs, and bitmasks of active and owned
+  local slots (one bit per slot, in `u32` words).
+- **Global owner tables:** for each global vertex, edge and face ID, the owner
+  `(patch, local)` handle, or `INVALID_ID` for inactive IDs.
+- **Global active masks**, one bit per global ID per kind.
+- **Query task lists:** the same owned-face and owned-edge tasks as the static
+  arena, with a global-ID → task-index table, so a commit can rewrite the task
+  of a face or edge that moved to a new local slot.
+
+Deleted local slots are tombstones: their active bit is cleared and their FE
+and EV rows are overwritten with `INVALID_ID`. Capacity per patch is
+`ceil(count * capacity_factor)`, where `capacity_factor` is set by the caller.
+The default is 1.5, as in RXMesh's `capacity_factor`; the real need is unmeasured.
+
+Several winning flips in one patch can set and clear bits in the same mask
+word, and disjoint vertex claims don't protect it. So the active and owned
+masks, both local and global, live in a separate mask buffer bound as
+`array<atomic<u32>>`, and are only changed with `atomicOr` and `atomicAnd`.
+Kernels that only read masks bind the same buffer read-only.
+
+Parallel invocations must never write different components of the same
+storage vector, such as the lanes of a `vec2<u32>` row. On Metal some of those
+writes were lost, as if the whole vector had been stored. EV, FE, owner tables
+and status outputs therefore use separate `u32` words, and every word that
+concurrent invocations share is updated with atomics.
+
+Each patch record also holds an interior-vertex bitmask, built at upload: a
+vertex is interior when its whole star is owned by that patch. Interior-only
+flips never change it, so the interior test is four bit lookups rather than a
+scan of each star.
+
+API sketch, names provisional:
+
+```rust
+pub struct EditCapacity { pub factor: f32 }
+pub struct GpuEditableMesh { /* arena, counts, capacities, MeshId, version */ }
+impl GpuEditableMesh {
+    pub fn upload(device: &wgpu::Device, mesh: &Mesh, capacity: EditCapacity)
+        -> Result<Self, GpuError>;
+    pub fn version(&self) -> u32;
+}
+pub struct EdgeFlipQuery { /* pipelines */ }
+impl EdgeFlipQuery {
+    /// Flips each edge whose request flag is nonzero; returns one status per edge.
+    pub fn encode(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        mesh: &mut GpuEditableMesh, requests: &GpuEdgeAttribute<u32>)
+        -> Result<GpuEdgeAttribute<u32>, GpuError>;
+}
+```
+
+Status values: not requested, flipped, boundary edge, not interior, opposite
+vertices already connected, degenerate (`c == d`, or a repeated face), lost a
+claim, and out of local capacity.
+
+Existing queries take a shared `GpuTopology` trait (arena, counts, `MeshId`,
+version), implemented by both mesh types. Whether editable meshes need
+separate pipeline variants or shared kernels can read both arenas depends on
+the accessor work below.
+
+## Steps
+
+1. **Topology version and `Stale`.** Add the version to topology results and
+   the optional stamp to derived attributes, and check both in the queries
+   that take them. `GpuMesh` is always version 0. This touches `src/gpu.rs`,
+   `GpuError` and `src/gpu/attribute.rs`, which are shared, so tell the other
+   session before starting.
+2. **Editable arena and upload.** Host-side layout builder with capacities,
+   masks and owner tables, plus `GpuEditableMesh::upload`. A test checks that
+   the arena round-trips: reading it back and rebuilding the topology gives the
+   source mesh.
+3. **Queries on the editable arena.** Shared WESL accessors that read per-patch
+   counts from the header and skip inactive slots. Run the full existing query
+   suite on an unedited editable mesh against Alum. Coordinate before starting.
+4. **Single flip.** One kernel validates and then commits:
+   - It finds the diamond from FE/EV in the owner patch, and rebuilds the
+     orientation explicitly, because diamonds are not cyclic.
+   - It checks boundary, interior, connected-opposites and degeneracy.
+   - It claims free slots with the mask try-set, skipping slots freed in this
+     batch.
+   - It tombstones the old slots, writes the new EV/FE rows, and updates the
+     owner tables, task lists and active masks.
+   - Rejections write a status and change nothing else. If a flip can't claim
+     all three slots, it releases the ones it got and reports out of capacity.
+5. **Parallel compatible flips.** Add a claim dispatch: each candidate does an
+   `atomicMin` of its priority on all four diamond vertices, and a later
+   dispatch keeps only the candidates that won all four. The priority is a
+   bijective hash of the global edge ID, reseeded on each call. Raw IDs would
+   make grid diagonals resolve as a wavefront, about one row per round.
+   Claiming vertices is conservative. It covers shared faces, shared edges and
+   two flips creating the same new edge. No CPU readback happens between
+   dispatches; the caller retries losers by calling again. Bounded retry
+   rounds are the caller's choice for now.
+6. **Example and docs.** A downstream example that flips grid diagonals by a
+   geometric rule, such as a Delaunay-style angle test, written in public WESL.
+   It runs queries before and after the flips. Update the README contracts and
+   the ROADMAP.
+
+## Tests
+
+- **Oracle.** Apply Alum's `swap_edge_ccw` to the same edges, then compare face
+  sets as vertex triples up to rotation. Then rebuild a fresh `Mesh` from the
+  flipped triangles, and compare every query on the edited mesh with the fresh
+  one. Compare by vertex pairs and sets, since edge IDs differ. Alum doesn't
+  reject flips whose opposite vertices are already connected, so we check that
+  case ourselves.
+- **Rejection is a no-op.** For each rejection kind, read the arena back
+  before and after. The bytes must be identical, apart from the status
+  output.
+- **Fixtures:**
+  - an interior grid edge;
+  - an edge next to a patch border at a small patch size, which is expected
+    to be rejected as not interior;
+  - a boundary edge;
+  - a tetrahedron, where the opposite vertices are already connected;
+  - every grid diagonal flipped in parallel on a single-patch mesh, retrying
+    until no lost-claim statuses remain. A multi-patch version computes the
+    expected not-interior set on the host;
+  - a flip, then a flip back, with the topology compared to the original;
+  - many rounds of flips at a capacity factor that only covers one batch,
+    which shows that freed slots are reused;
+  - running out of capacity at a factor of 1.0.
+- **Staleness.** A result from before an edit, passed to a query after it,
+  returns `Stale`.
+
+## Out of scope
+
+Cross-patch flips, ribbon repair, ownership migration, patch slicing, splits,
+collapses, the global free list and compaction (Phases 5 and 6). Arg-min/max and
+the other Milestone 4 leftovers are also out of scope.
+
+## Coordination
+
+Step 3 changes how static kernels address local slots: they read per-patch
+counts and skip tombstones. The other session's Milestone 3 workgroup staging
+reads the same patch data. Before step 3, agree on one accessor layer in
+`shaders/topology/` that both use. Steps 1 and 2 don't touch shared kernels.
+No GPU work runs while the other session is benchmarking.
+
+## Open questions
+
+- Should static `GpuMesh` adopt the editable arena's header and patch records,
+  so that there is a single kernel set? That would be simpler long-term, but it
+  changes the arena the other session benchmarks.
+- What does editable storage cost in memory? The static arena already uses
+  129–145 B/face, against 36 B/face for flat global arrays (baseline
+  benchmark, 2.1M faces). Capacity slack, masks, owner tables and the
+  interior bitmask add to that. Report B/face for the editable arena next to
+  the static one.
+- Is a default capacity factor of 1.5 right? With slot reuse, a batch needs one
+  free edge slot and two free face slots per flip in each patch. Measure
+  once flips run.
