@@ -165,7 +165,29 @@ the accessor work below.
 ## Steps
 
 The version check was step 1, but nothing can change a version before a flip
-exists, so it couldn't be tested. It now lands with the single flip.
+exists, so it couldn't be tested. The flip was then moved ahead of the query
+step: the queries wait on the shared accessor layer, and the flip only needs
+the editable arena. The version counter lands with the flip; `GpuError::Stale`
+and its test land with the queries, the first results to carry a version.
+
+**WESL first.** The WESL package is a standalone library, used as one stage
+of larger pipelines. Calls from other WESL code matter more than calls from
+Rust. So edit logic lives in public, value-based modules under `shaders/`
+(`topology/flip.wesl` for the flip). Runtime kernels and Rust wrappers are
+thin layers over those modules.
+
+Open decision: the commit step (writing the arena and masks) can't yet be a
+library function. Naga 30 doesn't implement WGSL's
+`unrestricted_pointer_parameters`, so a library function can't take a
+caller's storage buffer as a parameter. Any library function that writes
+the mesh would have to use bindings the library declares itself. The
+options are:
+- an opt-in module that declares the editable bindings at a group the
+  consumer picks (for example through a WESL `@if` or a generated variant);
+- a value-based commit that returns the words to write, which the consumer
+  stores itself;
+- leaving the commit in a library kernel and giving up a single-dispatch
+  predicate-plus-flip in consumer code.
 
 1. **Editable arena and upload.** A host-side layout builder with capacities,
    masks and owner tables, plus `GpuEditableMesh::upload`. One layout
@@ -177,23 +199,26 @@ exists, so it couldn't be tested. It now lands with the single flip.
    - the interior bitmask matches a brute-force scan of each star;
    - invalid capacity factors and device limits are rejected before
      anything is allocated.
-2. **Queries on the editable arena.** A shared `GpuTopology` trait carries the
-   arena, counts, `MeshId` and version, and results record the version. Shared
-   WESL accessors skip inactive slots. Run the full existing query suite on an
-   unedited editable mesh against Alum. Agree the accessor layer with the
-   other session before starting.
-3. **Single flip, version and `Stale`.** The version bump, `GpuError::Stale`,
-   the optional topology stamp on derived attributes, and the staleness test
-   all land here. One kernel validates and then commits:
+2. **Single flip and the version counter.** Public helpers `flip_quad` and
+   `flipped_faces` in `shaders/topology/flip.wesl`. `EdgeFlipQuery` flips one
+   edge per call and bumps `GpuEditableMesh::version`. One kernel validates
+   and then commits:
    - It finds the diamond from FE/EV in the owner patch, and rebuilds the
      orientation explicitly, because diamonds are not cyclic.
    - It checks boundary, interior, connected-opposites and degeneracy.
-   - It claims free slots with the mask try-set, skipping slots freed in this
-     batch.
+   - It picks free slots by reading the active masks. It doesn't reuse the
+     slots it frees, and raises the used counts only at commit.
    - It tombstones the old slots, writes the new EV/FE rows, and updates the
      owner tables and active masks.
-   - Rejections write a status and change nothing else. If a flip can't claim
-     all three slots, it releases the ones it got and reports out of capacity.
+   - Rejections write a status and change nothing else, used counts
+     included. In the parallel step, slots will be claimed with an atomic
+     try-set and released on failure.
+3. **Queries on the editable arena, and `Stale`.** A shared `GpuTopology`
+   trait carries the arena, counts, `MeshId` and version, and results record
+   the version. `GpuError::Stale`, the optional topology stamp on derived
+   attributes, and the staleness test land here. Build on the other
+   session's value-based accessors (`shaders/topology/patch.wesl`). Run the
+   full existing query suite on unedited and edited meshes against Alum.
 4. **Parallel compatible flips.** Add a claim dispatch: each candidate does an
    `atomicMin` of its priority on all four diamond vertices, and a later
    dispatch keeps only the candidates that won all four. The priority is a

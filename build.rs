@@ -19,6 +19,7 @@ fn main() {
         "boundary",
         "reduce",
         "smooth",
+        "edge_flip",
         "scan",
         "edges",
         "vertex_neighbors",

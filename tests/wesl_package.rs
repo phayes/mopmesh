@@ -1,6 +1,11 @@
 #[test]
 fn downstream_shader_can_link_packaged_library() {
-    for name in ["consumer", "scan_consumer", "geometry_consumer"] {
+    for name in [
+        "consumer",
+        "scan_consumer",
+        "geometry_consumer",
+        "flip_consumer",
+    ] {
         validate(&compile_consumer(name));
     }
     for name in ["weighted_boundary", "neighborhood", "bending"] {
@@ -71,6 +76,7 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         include_str!(concat!(env!("OUT_DIR"), "/boundary.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/reduce.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/smooth.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/edge_flip.wgsl")),
     ] {
         validate(wgsl);
     }

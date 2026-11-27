@@ -357,6 +357,7 @@ pub struct GpuEditableMesh {
     edge_count: u32,
     face_count: u32,
     mesh: MeshId,
+    version: u64,
 }
 
 impl GpuEditableMesh {
@@ -383,6 +384,7 @@ impl GpuEditableMesh {
             edge_count: words.arena[layout::EDGE_COUNT],
             face_count: words.arena[layout::FACE_COUNT],
             mesh: mesh.id(),
+            version: 0,
         })
     }
 
@@ -419,6 +421,15 @@ impl GpuEditableMesh {
     pub fn mesh_id(&self) -> MeshId {
         self.mesh
     }
+    /// Returns the topology version: 0 after upload, and one higher for each
+    /// edit recorded since, whether or not the GPU accepts it.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    /// Counts one recorded edit.
+    pub(super) fn bump_version(&mut self) {
+        self.version += 1;
+    }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
     }
@@ -427,6 +438,177 @@ impl GpuEditableMesh {
     }
     pub fn face_count(&self) -> u32 {
         self.face_count
+    }
+}
+
+/// Test helpers that read an editable arena back as sets of global vertex IDs,
+/// so an edited arena can be compared with one built from scratch.
+#[cfg(test)]
+pub(super) mod inspect {
+    use super::INVALID_ID;
+    use super::layout::{self, PatchRecord};
+    use std::collections::BTreeSet;
+
+    /// One patch's active elements, each as global vertex IDs. Faces are
+    /// rotated to start at their smallest vertex, keeping their winding;
+    /// edges are sorted.
+    #[derive(Debug, PartialEq, Eq, Default)]
+    pub struct PatchView {
+        pub vertices: BTreeSet<u32>,
+        pub edges: BTreeSet<[u32; 2]>,
+        pub faces: BTreeSet<[u32; 3]>,
+        pub owned_vertices: BTreeSet<u32>,
+        pub owned_edges: BTreeSet<[u32; 2]>,
+        pub owned_faces: BTreeSet<[u32; 3]>,
+        pub interior: BTreeSet<u32>,
+    }
+
+    fn bit(masks: &[u32], offset: u32, slot: u32) -> bool {
+        masks[(offset + slot / 32) as usize] & (1 << (slot % 32)) != 0
+    }
+
+    pub fn records(arena: &[u32]) -> Vec<PatchRecord> {
+        let start = arena[layout::RECORDS] as usize;
+        (0..arena[layout::PATCH_COUNT] as usize)
+            .map(|p| {
+                let at = start + p * layout::RECORD_WORDS;
+                PatchRecord::from_words(&arena[at..at + layout::RECORD_WORDS])
+            })
+            .collect()
+    }
+
+    fn rotate([a, b, c]: [u32; 3]) -> [u32; 3] {
+        let m = a.min(b).min(c);
+        if m == a {
+            [a, b, c]
+        } else if m == b {
+            [b, c, a]
+        } else {
+            [c, a, b]
+        }
+    }
+
+    /// Decodes every patch. Panics if a slot below a used count but inactive
+    /// holds anything other than `INVALID_ID`, or if an active slot is at or
+    /// above its used count.
+    pub fn patch_views(arena: &[u32], masks: &[u32]) -> Vec<PatchView> {
+        records(arena)
+            .iter()
+            .enumerate()
+            .map(|(p, r)| {
+                let used = [0, 1, 2].map(|k| masks[r.used as usize + k]);
+                let row_words = [1, layout::EV_WORDS, layout::FE_WORDS];
+                let rows = [r.vertex_ids, r.ev, r.fe];
+                let ids = [r.vertex_ids, r.edge_ids, r.face_ids];
+                for k in 0..3 {
+                    for slot in 0..r.capacity[k] {
+                        let active = bit(masks, r.active[k], slot);
+                        assert!(
+                            !active || slot < used[k],
+                            "patch {p}: active slot past used count"
+                        );
+                        if !active {
+                            let at = (rows[k] + row_words[k] * slot) as usize;
+                            let row = &arena[at..at + row_words[k] as usize];
+                            assert!(row.iter().all(|&w| w == INVALID_ID), "patch {p}: stale row");
+                            assert_eq!(
+                                arena[(ids[k] + slot) as usize],
+                                INVALID_ID,
+                                "patch {p}: stale ID"
+                            );
+                        }
+                    }
+                }
+                let vertex = |local: u32| arena[(r.vertex_ids + local) as usize];
+                let edge = |slot: u32| {
+                    let at = (r.ev + layout::EV_WORDS * slot) as usize;
+                    let [a, b] = [vertex(arena[at]), vertex(arena[at + 1])];
+                    [a.min(b), a.max(b)]
+                };
+                let face = |slot: u32| {
+                    rotate([0, 1, 2].map(|i| {
+                        let at = (r.fe + layout::FE_WORDS * slot + 2 * i) as usize;
+                        let ev = (r.ev + layout::EV_WORDS * arena[at] + arena[at + 1]) as usize;
+                        vertex(arena[ev])
+                    }))
+                };
+                let mut view = PatchView::default();
+                for slot in 0..used[0] {
+                    if bit(masks, r.active[0], slot) {
+                        view.vertices.insert(vertex(slot));
+                        if bit(masks, r.owned[0], slot) {
+                            view.owned_vertices.insert(vertex(slot));
+                        }
+                        if bit(masks, r.interior, slot) {
+                            view.interior.insert(vertex(slot));
+                        }
+                    }
+                }
+                for slot in 0..used[1] {
+                    if bit(masks, r.active[1], slot) {
+                        view.edges.insert(edge(slot));
+                        if bit(masks, r.owned[1], slot) {
+                            view.owned_edges.insert(edge(slot));
+                        }
+                    }
+                }
+                for slot in 0..used[2] {
+                    if bit(masks, r.active[2], slot) {
+                        view.faces.insert(face(slot));
+                        if bit(masks, r.owned[2], slot) {
+                            view.owned_faces.insert(face(slot));
+                        }
+                    }
+                }
+                view
+            })
+            .collect()
+    }
+
+    /// Returns the sorted global endpoints of global edge `edge`, found through
+    /// its owner-table entry.
+    pub fn edge_endpoints(arena: &[u32], edge: u32) -> [u32; 2] {
+        let at = (arena[layout::OWNERS[1]] + layout::OWNER_WORDS * edge) as usize;
+        let r = &records(arena)[arena[at] as usize];
+        let ev = (r.ev + layout::EV_WORDS * arena[at + 1]) as usize;
+        let [a, b] = [arena[ev], arena[ev + 1]].map(|v| arena[(r.vertex_ids + v) as usize]);
+        [a.min(b), a.max(b)]
+    }
+
+    /// Panics unless every owner-table entry points at an active, owned slot
+    /// holding that global ID, and every owned slot has an entry.
+    pub fn check_owner_tables(arena: &[u32], masks: &[u32]) {
+        let recs = records(arena);
+        let counts =
+            [layout::VERTEX_COUNT, layout::EDGE_COUNT, layout::FACE_COUNT].map(|i| arena[i]);
+        for k in 0..3 {
+            let mut owned = 0;
+            for global in 0..counts[k] {
+                let at = (arena[layout::OWNERS[k]] + layout::OWNER_WORDS * global) as usize;
+                let (p, slot) = (arena[at], arena[at + 1]);
+                let r = &recs[p as usize];
+                let ids = [r.vertex_ids, r.edge_ids, r.face_ids][k];
+                assert!(
+                    bit(masks, r.active[k], slot),
+                    "kind {k} ID {global}: owner slot inactive"
+                );
+                assert!(
+                    bit(masks, r.owned[k], slot),
+                    "kind {k} ID {global}: owner slot not owned"
+                );
+                assert_eq!(
+                    arena[(ids + slot) as usize],
+                    global,
+                    "kind {k}: owner slot holds another ID"
+                );
+            }
+            for r in &recs {
+                for slot in 0..r.capacity[k] {
+                    owned += u32::from(bit(masks, r.owned[k], slot));
+                }
+            }
+            assert_eq!(owned, counts[k], "kind {k}: one owned slot per global ID");
+        }
     }
 }
 
