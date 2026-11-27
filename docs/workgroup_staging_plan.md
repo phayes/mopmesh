@@ -338,9 +338,14 @@ method. At 2.1 M faces and patch size 128:
   adjacency 3.4–3.8 and 8.9–9.2 ms, 65–75 B/face. The default is still 128.
 - Patch size 32 is about 3x slower than in milestone 2 (follow-up, deferred).
 - Per-face queries on the arena are 9–27% slower than in milestone 2.
-- The "10 smoothing steps, adjacency given" row probably reads a buffer the
-  preceding VV row rewrites, which would make it unreliable on shuffled
-  meshes; see the report.
+- Smoothing on shuffled meshes takes either about 9 or 12–15 ms per ten
+  steps, varying between runs. A later rerun gave the VV row its own
+  adjacency, and the variation remained, so the shared buffer was not the
+  cause.
+- The [baseline report](baseline_benchmark.md) was rerun at `ab98f19`, after
+  the default patch size became 512. Batched adjacency had regressed there
+  by 1.1–1.2 ms in input order and 0.4–0.5 ms shuffled, after the
+  adjacency kernel moved onto the shared `local_query` helpers.
 
 ## Steps
 

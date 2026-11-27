@@ -431,6 +431,9 @@ impl Bench {
         // Inputs for the queries that start from other results.
         let mut encoder = d.create_command_encoder(&Default::default());
         let adjacency = self.adjacency.encode(d, &mut encoder, gpu).unwrap();
+        // The VV row rewrites this copy's vertex neighbors, so the rows that
+        // read `adjacency` always see the result of one complete query.
+        let vv_scratch = self.adjacency.encode(d, &mut encoder, gpu).unwrap();
         let areas = self
             .face_areas
             .encode(d, &mut encoder, gpu, &positions)
@@ -512,7 +515,7 @@ impl Bench {
                 "VV (edge records given)",
                 Box::new(|e| {
                     self.adjacency
-                        .record_vertex_neighbors(d, e, &adjacency_plan, &adjacency)
+                        .record_vertex_neighbors(d, e, &adjacency_plan, &vv_scratch)
                 }),
             ),
             (
