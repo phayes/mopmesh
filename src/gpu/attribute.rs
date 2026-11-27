@@ -1,5 +1,8 @@
 use super::pipeline::{self, check_binding, workgroups};
-use super::{FaceVertexQuery, FaceVertices, GpuError, GpuMesh};
+use super::{
+    FaceVertexQuery, FaceVertices, GpuEditableMesh, GpuError, GpuMesh, GpuTopology, PatchBuffers,
+    TopologyStamp, buffers,
+};
 use crate::{Attribute, EdgeHandle, Element, ElementKind, FaceHandle, MeshId, VertexHandle};
 use std::marker::PhantomData;
 use wgpu::util::DeviceExt;
@@ -31,9 +34,16 @@ impl<T: sealed::Sealed + bytemuck::Pod> GpuValue for T {}
 /// longer than the attribute. Direct writes must preserve the element layout
 /// and order. An empty attribute has a zero placeholder the size of one
 /// element, but its length is zero.
+///
+/// Attributes that a query computes from connectivity, such as boundary
+/// flags, normals, areas and centroids, carry the [`TopologyStamp`] of the
+/// mesh they came from; see [`topology`](Self::topology). Attributes you
+/// upload or replace, and smoothed positions, carry none, because edits
+/// don't change them.
 pub struct GpuAttribute<E: Element, T: GpuValue> {
     buffer: wgpu::Buffer,
     mesh: MeshId,
+    topology: Option<TopologyStamp>,
     len: u32,
     marker: PhantomData<(E, T)>,
 }
@@ -55,14 +65,23 @@ fn resource(kind: ElementKind) -> &'static str {
     }
 }
 
+/// Copies a CPU attribute of `mesh` to a new GPU buffer, after checking that
+/// both come from the same CPU mesh.
+fn upload_attribute<E: Element, T: GpuValue>(
+    device: &wgpu::Device,
+    mesh: &impl GpuTopology,
+    attribute: &Attribute<E, T>,
+) -> Result<GpuAttribute<E, T>, GpuError> {
+    if mesh.mesh_id() != attribute.mesh {
+        return Err(GpuError::MeshMismatch);
+    }
+    GpuAttribute::new(device, mesh, &attribute.values)
+}
+
 impl GpuMesh {
     /// Returns the number of vertices, edges or faces.
     pub fn element_count(&self, kind: ElementKind) -> u32 {
-        match kind {
-            ElementKind::Vertex => self.vertex_count,
-            ElementKind::Edge => self.edge_count,
-            ElementKind::Face => self.face_count,
-        }
+        GpuTopology::element_count(self, kind)
     }
 
     /// Copies a CPU attribute to a new GPU buffer. Later CPU changes do not
@@ -75,10 +94,26 @@ impl GpuMesh {
         device: &wgpu::Device,
         attribute: &Attribute<E, T>,
     ) -> Result<GpuAttribute<E, T>, GpuError> {
-        if self.mesh != attribute.mesh {
-            return Err(GpuError::MeshMismatch);
-        }
-        GpuAttribute::new(device, self, &attribute.values)
+        upload_attribute(device, self, attribute)
+    }
+}
+
+impl GpuEditableMesh {
+    /// Returns the number of vertices, edges or faces. Edge flips don't
+    /// change these counts.
+    pub fn element_count(&self, kind: ElementKind) -> u32 {
+        GpuTopology::element_count(self, kind)
+    }
+
+    /// Copies a CPU attribute to a new GPU buffer, as
+    /// [`GpuMesh::upload_attribute`] does. The attribute stays valid after
+    /// edits: flips keep every element ID.
+    pub fn upload_attribute<E: Element, T: GpuValue>(
+        &self,
+        device: &wgpu::Device,
+        attribute: &Attribute<E, T>,
+    ) -> Result<GpuAttribute<E, T>, GpuError> {
+        upload_attribute(device, self, attribute)
     }
 }
 
@@ -87,10 +122,14 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     /// GPU buffer with `STORAGE | COPY_SRC | COPY_DST` usage. Use this for
     /// meshes built with [`GpuMeshBuilder`](super::GpuMeshBuilder), which have
     /// no CPU attributes. Returns [`GpuError::InvalidBuffer`] unless `values`
-    /// has exactly [`GpuMesh::element_count`] entries, or
+    /// has exactly [`GpuTopology::element_count`] entries, or
     /// [`GpuError::LimitsExceeded`] if the buffer would be too large. Errors
     /// occur before GPU allocation.
-    pub fn new(device: &wgpu::Device, mesh: &GpuMesh, values: &[T]) -> Result<Self, GpuError> {
+    pub fn new(
+        device: &wgpu::Device,
+        mesh: &impl GpuTopology,
+        values: &[T],
+    ) -> Result<Self, GpuError> {
         let resource = resource(E::KIND);
         let len = mesh.element_count(E::KIND);
         if values.len() != len as usize {
@@ -119,7 +158,7 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     /// centroids. The buffer must hold one `T` per element in canonical order,
     /// starting at byte 0, and at least one `T` for an empty attribute. Returns
     /// [`GpuError::InvalidBuffer`] if it is smaller or lacks `STORAGE` usage.
-    pub fn from_buffer(mesh: &GpuMesh, buffer: &wgpu::Buffer) -> Result<Self, GpuError> {
+    pub fn from_buffer(mesh: &impl GpuTopology, buffer: &wgpu::Buffer) -> Result<Self, GpuError> {
         let len = mesh.element_count(E::KIND);
         let needed = std::mem::size_of::<T>() as u64 * u64::from(len.max(1));
         if buffer.size() < needed || !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
@@ -139,9 +178,9 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         check_binding(limits, Self::byte_size(len), resource)
     }
 
-    /// Allocates a zeroed output attribute of `len` elements for mesh `mesh`.
-    /// `len` must be the mesh's element count for `E`. Check the size with
-    /// [`check_output`](Self::check_output) first.
+    /// Allocates a zeroed, unstamped output attribute of `len` elements for
+    /// mesh `mesh`. `len` must be the mesh's element count for `E`. Check the
+    /// size with [`check_output`](Self::check_output) first.
     pub(crate) fn output(device: &wgpu::Device, mesh: MeshId, len: u32, label: &str) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -152,9 +191,34 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         Self {
             buffer,
             mesh,
+            topology: None,
             len,
             marker: PhantomData,
         }
+    }
+
+    /// Like [`output`](Self::output), for a result computed from the
+    /// connectivity stamped `topology`.
+    pub(crate) fn derived(
+        device: &wgpu::Device,
+        topology: TopologyStamp,
+        len: u32,
+        label: &str,
+    ) -> Self {
+        Self {
+            topology: Some(topology),
+            ..Self::output(device, topology.mesh_id(), len, label)
+        }
+    }
+
+    /// Checks that this attribute can be read by a query on connectivity
+    /// stamped `current`: it must belong to the same CPU mesh, and if it was
+    /// computed from connectivity, from the same upload and version.
+    pub(crate) fn check_for(&self, current: TopologyStamp) -> Result<(), GpuError> {
+        if self.mesh != current.mesh_id() {
+            return Err(GpuError::MeshMismatch);
+        }
+        self.topology.map_or(Ok(()), |t| t.check(current))
     }
 
     const USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
@@ -165,10 +229,11 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         std::mem::size_of::<T>() as u64 * u64::from(len.max(1))
     }
 
-    fn wrap(buffer: wgpu::Buffer, mesh: &GpuMesh, len: u32) -> Self {
+    fn wrap(buffer: wgpu::Buffer, mesh: &impl GpuTopology, len: u32) -> Self {
         Self {
             buffer,
-            mesh: mesh.mesh,
+            mesh: mesh.mesh_id(),
+            topology: None,
             len,
             marker: PhantomData,
         }
@@ -179,6 +244,12 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     }
     pub fn mesh_id(&self) -> MeshId {
         self.mesh
+    }
+    /// Returns the stamp of the connectivity this attribute was computed
+    /// from, or `None` for values you supplied. Queries reject a stamped
+    /// attribute with [`GpuError::Stale`] once its mesh has been edited.
+    pub fn topology(&self) -> Option<TopologyStamp> {
+        self.topology
     }
     pub fn len(&self) -> u32 {
         self.len
@@ -207,7 +278,8 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
 
     /// Queue a full replacement from one value per element, in canonical
     /// order. Use this for meshes from [`GpuMeshBuilder`](super::GpuMeshBuilder).
-    /// Visibility rules match [`write`](Self::write). Returns
+    /// Visibility rules match [`write`](Self::write). Both methods clear the
+    /// attribute's [`topology`](Self::topology) stamp. Returns
     /// [`GpuError::InvalidBuffer`] unless `values` has exactly
     /// [`len`](Self::len) entries and the buffer has `COPY_DST` usage.
     pub fn write_values(&mut self, queue: &wgpu::Queue, values: &[T]) -> Result<(), GpuError> {
@@ -221,6 +293,8 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         if !self.is_empty() {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(values));
         }
+        // The values are now the caller's, so edits no longer make them stale.
+        self.topology = None;
         Ok(())
     }
 }
@@ -261,13 +335,13 @@ impl FaceCentroidQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
         positions: &GpuVertexAttribute<[f32; 4]>,
     ) -> Result<GpuFaceAttribute<[f32; 4]>, GpuError> {
         face_kernel(
             device,
             encoder,
-            mesh,
+            buffers(mesh),
             positions,
             &self.face_vertices,
             &self.pipeline,
@@ -288,7 +362,7 @@ impl FaceCentroidQuery {
         const RESOURCE: &str = "face centroids";
         let groups = check_face_kernel::<[f32; 4]>(
             device,
-            faces.mesh,
+            faces.topology(),
             faces.face_count,
             positions,
             RESOURCE,
@@ -306,42 +380,45 @@ impl FaceCentroidQuery {
 }
 
 /// Records a per-face kernel that reads face vertices and positions and
-/// writes one `T` per face, after the shared mesh-ID and size checks.
+/// writes one `T` per face, after the shared mesh and size checks.
 pub(super) fn face_kernel<T: GpuValue>(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
-    mesh: &GpuMesh,
+    mesh: PatchBuffers,
     positions: &GpuVertexAttribute<[f32; 4]>,
     face_vertices: &FaceVertexQuery,
     pipeline: &wgpu::ComputePipeline,
     resource: &'static str,
 ) -> Result<GpuFaceAttribute<T>, GpuError> {
-    // Validate the mesh ID and sizes, including the temporary face-vertex
+    // Validate the inputs and sizes, including the temporary face-vertex
     // result, before allocating buffers or recording commands.
-    let groups = check_face_kernel::<T>(device, mesh.mesh, mesh.face_count, positions, resource)?;
+    let groups =
+        check_face_kernel::<T>(device, mesh.topology, mesh.face_count, positions, resource)?;
     if mesh.face_count == 0 {
-        return Ok(GpuFaceAttribute::<T>::output(
-            device, mesh.mesh, 0, resource,
+        return Ok(GpuFaceAttribute::<T>::derived(
+            device,
+            mesh.topology,
+            0,
+            resource,
         ));
     }
-    let faces = face_vertices.encode(device, encoder, mesh)?;
+    let faces = face_vertices.encode_patches(device, encoder, mesh)?;
     Ok(record_face_kernel(
         device, encoder, &faces, positions, pipeline, resource, groups,
     ))
 }
 
-/// Checks the mesh ID and the sizes a per-face kernel over `face_count`
-/// faces needs, and returns its workgroup count.
+/// Checks that `positions` can be read with connectivity stamped `current`,
+/// and the sizes a per-face kernel over `face_count` faces needs. Returns its
+/// workgroup count.
 pub(super) fn check_face_kernel<T: GpuValue>(
     device: &wgpu::Device,
-    mesh: MeshId,
+    current: TopologyStamp,
     face_count: u32,
     positions: &GpuVertexAttribute<[f32; 4]>,
     resource: &'static str,
 ) -> Result<u32, GpuError> {
-    if mesh != positions.mesh {
-        return Err(GpuError::MeshMismatch);
-    }
+    positions.check_for(current)?;
     let limits = device.limits();
     GpuFaceAttribute::<T>::check_output(&limits, face_count, resource)?;
     check_binding(&limits, (u64::from(face_count) * 12).max(4), resource)?;
@@ -359,7 +436,8 @@ pub(super) fn record_face_kernel<T: GpuValue>(
     resource: &'static str,
     groups: u32,
 ) -> GpuFaceAttribute<T> {
-    let result = GpuFaceAttribute::<T>::output(device, faces.mesh, faces.face_count, resource);
+    let result =
+        GpuFaceAttribute::<T>::derived(device, faces.topology(), faces.face_count, resource);
     if faces.face_count == 0 {
         return result;
     }

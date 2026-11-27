@@ -1,5 +1,5 @@
 use super::pipeline::{self, WORKGROUP_SIZE, check_binding, group_grid, workgroups};
-use super::{EdgeConnectivity, GpuError, GpuMesh, PatchBuffers, scan};
+use super::{EdgeConnectivity, GpuError, GpuTopology, PatchBuffers, TopologyStamp, buffers, scan};
 use crate::MeshId;
 use wgpu::util::DeviceExt;
 
@@ -21,9 +21,10 @@ impl MeshAdjacency {
         &self.vertices
     }
     /// Returns three packed `u32` neighbor face IDs per input face (12 bytes per face).
-    /// For input triangle `[a, b, c]`, the entries are the faces across edges
-    /// `(a, b)`, `(b, c)`, and `(c, a)`. A boundary edge has no neighbor and
-    /// uses [`super::INVALID_ID`].
+    /// For face vertices `[a, b, c]`, as reported by
+    /// [`FaceVertexQuery`](super::FaceVertexQuery), the entries are the faces
+    /// across edges `(a, b)`, `(b, c)`, and `(c, a)`. A boundary edge has no
+    /// neighbor and uses [`super::INVALID_ID`].
     pub fn face_neighbors(&self) -> &wgpu::Buffer {
         &self.faces
     }
@@ -41,6 +42,10 @@ impl MeshAdjacency {
     }
     pub fn mesh_id(&self) -> MeshId {
         self.edges.mesh_id()
+    }
+    /// Returns the stamp of the connectivity this result was computed from.
+    pub fn topology(&self) -> TopologyStamp {
+        self.edges.topology()
     }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
@@ -123,9 +128,9 @@ impl AdjacencyQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
     ) -> Result<MeshAdjacency, GpuError> {
-        self.encode_patches(device, encoder, mesh.buffers())
+        self.encode_patches(device, encoder, buffers(mesh))
     }
 
     /// Records the same queries as [`encode`](Self::encode), using the
@@ -144,7 +149,7 @@ impl AdjacencyQuery {
         let edges = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, "MOPMesh edge records", plan.edge_bytes),
             edge_count: mesh.edge_count,
-            mesh: mesh.mesh,
+            topology: mesh.topology,
         };
         let result = Self::outputs(device, &plan, edges);
         if plan.edge_count == 0 {

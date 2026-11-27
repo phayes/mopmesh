@@ -1,6 +1,6 @@
 //! Editable connectivity: patch storage with spare local slots and bitmasks.
 use super::pipeline::check_binding;
-use super::{GpuError, INVALID_ID};
+use super::{GpuError, INVALID_ID, TopologyStamp};
 use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
 
@@ -180,8 +180,18 @@ pub struct GpuEditableMesh {
     vertex_count: u32,
     edge_count: u32,
     face_count: u32,
+    patch_count: u32,
     mesh: MeshId,
+    /// Unique to this upload, so results from another upload are rejected.
+    upload: u64,
     version: u64,
+}
+
+/// Hands out a distinct nonzero identity to each editable upload.
+fn next_upload() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl GpuEditableMesh {
@@ -207,7 +217,9 @@ impl GpuEditableMesh {
             vertex_count: words.arena[layout::VERTEX_COUNT],
             edge_count: words.arena[layout::EDGE_COUNT],
             face_count: words.arena[layout::FACE_COUNT],
+            patch_count: words.arena[layout::PATCH_COUNT],
             mesh: mesh.id(),
+            upload: next_upload(),
             version: 0,
         })
     }
@@ -250,9 +262,18 @@ impl GpuEditableMesh {
     pub fn version(&self) -> u64 {
         self.version
     }
+    /// Returns the stamp that results computed now will carry. It changes
+    /// with every recorded edit, and differs between uploads.
+    pub fn topology(&self) -> TopologyStamp {
+        TopologyStamp::editable(self.mesh, self.upload, self.version)
+    }
     /// Counts one recorded edit.
     pub(super) fn bump_version(&mut self) {
         self.version += 1;
+    }
+    /// Returns the number of face groups used to process this mesh on the GPU.
+    pub fn patch_count(&self) -> u32 {
+        self.patch_count
     }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count

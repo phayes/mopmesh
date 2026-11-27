@@ -1,7 +1,8 @@
 use super::attribute::face_kernel;
 use super::pipeline::{self, workgroups};
 use super::{
-    FaceVertexQuery, GpuError, GpuFaceAttribute, GpuMesh, GpuVertexAttribute, VertexFaceQuery,
+    FaceVertexQuery, GpuError, GpuFaceAttribute, GpuTopology, GpuVertexAttribute, VertexFaceQuery,
+    buffers,
 };
 use wgpu::util::DeviceExt;
 
@@ -47,13 +48,13 @@ impl FaceNormalQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
         positions: &GpuVertexAttribute<[f32; 4]>,
     ) -> Result<GpuFaceAttribute<[f32; 4]>, GpuError> {
         face_kernel(
             device,
             encoder,
-            mesh,
+            buffers(mesh),
             positions,
             &self.face_vertices,
             &self.pipeline,
@@ -88,13 +89,13 @@ impl FaceAreaQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
         positions: &GpuVertexAttribute<[f32; 4]>,
     ) -> Result<GpuFaceAttribute<f32>, GpuError> {
         face_kernel(
             device,
             encoder,
-            mesh,
+            buffers(mesh),
             positions,
             &self.face_vertices,
             &self.pipeline,
@@ -140,20 +141,19 @@ impl VertexNormalQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
         positions: &GpuVertexAttribute<[f32; 4]>,
     ) -> Result<GpuVertexAttribute<[f32; 4]>, GpuError> {
-        // Validate the mesh ID and the result and dispatch sizes before GPU work.
+        // Validate the inputs and the result and dispatch sizes before GPU work.
         const RESOURCE: &str = "vertex normals";
-        if mesh.mesh != positions.mesh_id() {
-            return Err(GpuError::MeshMismatch);
-        }
+        let mesh = buffers(mesh);
+        positions.check_for(mesh.topology)?;
         let limits = device.limits();
         GpuVertexAttribute::<[f32; 4]>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
         let groups = workgroups(&limits, mesh.vertex_count, RESOURCE)?;
-        let result = GpuVertexAttribute::output(
+        let result = GpuVertexAttribute::derived(
             device,
-            mesh.mesh,
+            mesh.topology,
             mesh.vertex_count,
             "MOPMesh vertex normals",
         );
@@ -162,8 +162,8 @@ impl VertexNormalQuery {
         }
 
         // Gather each vertex's faces, then sum their area vectors.
-        let vertex_faces = self.vertex_faces.encode(device, encoder, mesh)?;
-        let faces = self.face_vertices.encode(device, encoder, mesh)?;
+        let vertex_faces = self.vertex_faces.encode_patches(device, encoder, mesh)?;
+        let faces = self.face_vertices.encode_patches(device, encoder, mesh)?;
         // Padded to 16 bytes, the minimum uniform struct size.
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh vertex normals sizes"),

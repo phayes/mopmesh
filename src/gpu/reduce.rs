@@ -263,7 +263,9 @@ impl DotQuery {
     }
 
     /// Records the dot product of `a` and `b`. Returns
-    /// [`GpuError::MeshMismatch`] if they belong to different meshes, or
+    /// [`GpuError::MeshMismatch`] if they belong to different meshes,
+    /// [`GpuError::Stale`] if both were computed from connectivity but from
+    /// different uploads or versions, or
     /// [`GpuError::LimitsExceeded`] if the scratch buffer or a dispatch is too
     /// large. Errors occur before allocating or recording commands. Empty
     /// attributes give zero.
@@ -276,6 +278,9 @@ impl DotQuery {
     ) -> Result<GpuReduction<f32>, GpuError> {
         if a.mesh_id() != b.mesh_id() {
             return Err(GpuError::MeshMismatch);
+        }
+        if let (Some(ta), Some(tb)) = (a.topology(), b.topology()) {
+            ta.check(tb)?;
         }
         self.kernels.encode(
             device,

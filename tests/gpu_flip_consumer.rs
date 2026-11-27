@@ -4,6 +4,8 @@
 //! flips on the CPU and testing the resulting triangles.
 #[path = "../examples/support/delaunay.rs"]
 mod delaunay;
+#[path = "support/replay.rs"]
+mod replay;
 use mopmesh::{
     Mesh, MeshBuilder,
     gpu::{EdgeFlipQuery, EditCapacity, FlipStatus, GpuEditableMesh},
@@ -94,7 +96,7 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
 #[ignore = "requires a GPU adapter; run cargo test --test gpu_flip_consumer -- --ignored --nocapture"]
 fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
     let (device, queue) = gpu_device();
-    let (mesh, positions, mut triangles) = delaunay::skewed_grid(11);
+    let (mesh, positions, mut triangles) = delaunay::skewed_grid(11, 256);
     let mut gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
     let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("delaunay positions"),
@@ -106,11 +108,7 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
 
     // Track edge endpoints on the CPU so reported GPU flips can be replayed
     // and checked without using the GPU mesh storage as the reference.
-    let p = &mesh.patches()[0];
-    let mut endpoints = vec![[0u32; 2]; mesh.edge_count()];
-    for (&id, ev) in p.edge_ids().iter().zip(p.edge_vertices()) {
-        endpoints[id as usize] = ev.map(|v| p.vertex_ids()[v as usize]);
-    }
+    let mut endpoints = replay::edge_endpoints(&mesh);
     assert!(
         violations(&triangles, &positions) > 0,
         "the fixture should start with non-Delaunay edges"
@@ -131,11 +129,10 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
             if FlipStatus::from_word(word) != Some(FlipStatus::Flipped) {
                 continue;
             }
-            let quad = host_flip(&mut triangles, endpoints[id]);
+            let quad = replay::replay(&mut triangles, &mut endpoints, id);
             for v in quad {
                 assert!(corners.insert(v), "two flips in one batch share vertex {v}");
             }
-            endpoints[id] = [quad[2], quad[3]];
         }
         flipped_total += round.flipped;
         if round == delaunay::Round::default() {
@@ -145,24 +142,6 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
         }
     }
     panic!("flipping did not settle within 64 rounds");
-}
-
-/// Applies one flip to the CPU triangles and returns `[a, b, c, d]`, with
-/// `[a, b]` the old edge and `[c, d]` the new edge. Requires one triangle in
-/// each direction along u-v; panics if either is missing.
-fn host_flip(triangles: &mut [[u32; 3]], [u, v]: [u32; 2]) -> [u32; 4] {
-    // Match both directed sides of the edge to preserve triangle orientation.
-    let runs = |t: &[u32; 3], a, b| (0..3).find(|&k| t[k] == a && t[(k + 1) % 3] == b);
-    let first = triangles.iter().position(|t| runs(t, u, v).is_some());
-    let second = triangles.iter().position(|t| runs(t, v, u).is_some());
-    let (first, second) = (first.unwrap(), second.unwrap());
-    let opposite = |t: &[u32; 3], a, b| *t.iter().find(|&&x| x != a && x != b).unwrap();
-    let (a, b) = (u, v);
-    let c = opposite(&triangles[first], a, b);
-    let d = opposite(&triangles[second], a, b);
-    triangles[first] = [a, d, c];
-    triangles[second] = [d, b, c];
-    [a, b, c, d]
 }
 
 /// Counts interior edges that fail the example's Delaunay angle test:

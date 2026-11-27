@@ -1,5 +1,5 @@
 use super::pipeline::{self, workgroups};
-use super::{GpuError, GpuVertexAttribute, MeshAdjacency};
+use super::{GpuError, GpuTopology, GpuVertexAttribute, MeshAdjacency};
 use wgpu::util::DeviceExt;
 
 /// Settings for [`SmoothQuery`].
@@ -56,31 +56,41 @@ impl SmoothQuery {
     /// Records `settings.iterations` smoothing steps and returns the new
     /// positions, leaving `positions` unchanged.
     ///
-    /// `adjacency` supplies each vertex's neighbors. `positions` holds
-    /// `[x, y, z, w]` per vertex; `w` is copied unchanged. A vertex whose
-    /// `fixed` flag is non-zero keeps its position; pass `None` to move every
-    /// vertex. Vertices with no neighbors never move.
+    /// `adjacency` supplies each vertex's neighbors and must have been
+    /// computed from `mesh` as it is now. `positions` holds `[x, y, z, w]` per
+    /// vertex; `w` is copied unchanged. A vertex whose `fixed` flag is
+    /// non-zero keeps its position; pass `None` to move every vertex. Vertices
+    /// with no neighbors never move. The result has no topology stamp, so it
+    /// stays usable after later edits.
     ///
-    /// Returns [`GpuError::MeshMismatch`] unless all inputs belong to the same
-    /// mesh, [`GpuError::InvalidBuffer`] if `iterations` is zero and
-    /// `positions` lacks `COPY_SRC` usage (the result is then a copy), or
-    /// [`GpuError::LimitsExceeded`] if a buffer or dispatch is too large.
-    /// Errors occur before allocating or recording commands.
+    /// Returns [`GpuError::MeshMismatch`] unless all inputs belong to `mesh`,
+    /// [`GpuError::Stale`] if `adjacency` or a computed `fixed` attribute
+    /// predates an edit of `mesh`, [`GpuError::InvalidBuffer`] if
+    /// `iterations` is zero and `positions` lacks `COPY_SRC` usage (the result
+    /// is then a copy), or [`GpuError::LimitsExceeded`] if a buffer or
+    /// dispatch is too large. Errors occur before allocating or recording
+    /// commands.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        mesh: &impl GpuTopology,
         adjacency: &MeshAdjacency,
         positions: &GpuVertexAttribute<[f32; 4]>,
         fixed: Option<&GpuVertexAttribute<u32>>,
         settings: Smoothing,
     ) -> Result<GpuVertexAttribute<[f32; 4]>, GpuError> {
-        // Validate mesh identity, usage and sizes before allocating.
+        // Validate the inputs against the mesh's current connectivity, then
+        // usage and sizes, before allocating.
         const RESOURCE: &str = "smoothing";
-        let mesh = adjacency.mesh_id();
-        if positions.mesh_id() != mesh || fixed.is_some_and(|f| f.mesh_id() != mesh) {
-            return Err(GpuError::MeshMismatch);
+        let current = mesh.topology();
+        adjacency.topology().check(current)?;
+        positions.check_for(current)?;
+        if let Some(fixed) = fixed {
+            fixed.check_for(current)?;
         }
+        let mesh = current.mesh_id();
         if settings.iterations == 0
             && !positions
                 .buffer()

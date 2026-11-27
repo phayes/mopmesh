@@ -10,7 +10,7 @@ fn downstream_shader_can_link_packaged_library() {
     ] {
         validate(&compile_consumer(name));
     }
-    for name in ["weighted_boundary", "neighborhood", "bending"] {
+    for name in ["weighted_boundary", "neighborhood", "bending", "delaunay"] {
         let mut resolver = wesl::resolver::StandardResolver::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/examples/shaders"

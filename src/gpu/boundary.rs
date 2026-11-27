@@ -1,5 +1,5 @@
 use super::pipeline::{self, group_grid};
-use super::{GpuEdgeAttribute, GpuError, GpuMesh, GpuVertexAttribute, PatchBuffers};
+use super::{GpuEdgeAttribute, GpuError, GpuTopology, GpuVertexAttribute, PatchBuffers, buffers};
 
 /// Which edges and vertices lie on the mesh boundary, as `u32` flags: 1 on
 /// the boundary, 0 elsewhere. A boundary edge has only one adjoining face; a
@@ -34,9 +34,9 @@ impl BoundaryQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
     ) -> Result<MeshBoundary, GpuError> {
-        self.encode_patches(device, encoder, mesh.buffers())
+        self.encode_patches(device, encoder, buffers(mesh))
     }
 
     /// Records the same query as [`encode`](Self::encode), using the shared
@@ -54,15 +54,15 @@ impl BoundaryQuery {
         GpuVertexAttribute::<u32>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
         let grid = group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = MeshBoundary {
-            edges: GpuEdgeAttribute::output(
+            edges: GpuEdgeAttribute::derived(
                 device,
-                mesh.mesh,
+                mesh.topology,
                 mesh.edge_count,
                 "MOPMesh boundary edges",
             ),
-            vertices: GpuVertexAttribute::output(
+            vertices: GpuVertexAttribute::derived(
                 device,
-                mesh.mesh,
+                mesh.topology,
                 mesh.vertex_count,
                 "MOPMesh boundary vertices",
             ),

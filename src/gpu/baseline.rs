@@ -7,7 +7,7 @@ use super::adjacency::AdjacencyPlan;
 use super::pipeline::{self, workgroups};
 use super::{
     AdjacencyQuery, EdgeConnectivity, FaceCentroidQuery, FaceVertices, GpuError, GpuFaceAttribute,
-    GpuVertexAttribute, MeshAdjacency,
+    GpuVertexAttribute, MeshAdjacency, TopologyStamp,
 };
 use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
@@ -143,7 +143,7 @@ impl FlatQueries {
         let result = FaceVertices {
             buffer: pipeline::output_buffer(device, RESOURCE, bytes),
             face_count: mesh.face_count,
-            mesh: mesh.mesh,
+            topology: TopologyStamp::fixed(mesh.mesh),
         };
         if mesh.face_count != 0 {
             let bindings = pipeline::bind_buffers(
@@ -173,7 +173,7 @@ impl FlatQueries {
         let result = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, RESOURCE, bytes),
             edge_count: mesh.edge_count,
-            mesh: mesh.mesh,
+            topology: TopologyStamp::fixed(mesh.mesh),
         };
         if mesh.edge_count != 0 {
             let bindings = pipeline::bind_buffers(

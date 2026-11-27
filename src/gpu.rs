@@ -31,6 +31,7 @@ mod smooth;
 mod staged;
 #[cfg(test)]
 mod test_support;
+mod topology;
 #[cfg(test)]
 mod validate;
 pub use adjacency::{AdjacencyQuery, MeshAdjacency};
@@ -47,6 +48,8 @@ pub use geometry::{FaceAreaQuery, FaceNormalQuery, VertexNormalQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 pub use reduce::{DotQuery, GpuReduction, ReduceOp, ReduceQuery, ReduceValue};
 pub use smooth::{SmoothQuery, Smoothing};
+use topology::buffers;
+pub use topology::{GpuTopology, TopologyStamp};
 
 /// Marks a missing element in GPU results, with the value `u32::MAX`.
 /// For example, an edge on the mesh boundary has no second face. Never use this
@@ -63,6 +66,11 @@ pub enum GpuError {
     LimitsExceeded { resource: &'static str },
     /// The inputs belong to different meshes. Use resources with matching mesh IDs.
     MeshMismatch,
+    /// A result passed in was computed from connectivity that has changed
+    /// since, such as an editable mesh before a later edit, or from a
+    /// different editable upload of the same mesh. Recompute it from the
+    /// mesh you pass. See [`TopologyStamp`].
+    Stale,
     /// A buffer or slice you passed in has too few values, the wrong length,
     /// or lacks a required buffer usage. `resource` identifies which one.
     InvalidBuffer { resource: &'static str },
@@ -75,6 +83,9 @@ impl std::fmt::Display for GpuError {
                 write!(f, "{resource} exceeds GPU buffer, index or dispatch limits")
             }
             Self::MeshMismatch => f.write_str("GPU resources belong to different meshes"),
+            Self::Stale => f.write_str(
+                "GPU result was computed from an older version or a different upload of the mesh",
+            ),
             Self::InvalidBuffer { resource } => {
                 write!(f, "{resource} has the wrong size or buffer usage")
             }
@@ -99,8 +110,8 @@ pub struct GpuMesh {
     mesh: MeshId,
 }
 
-/// Borrows connectivity buffers and mesh counts for queries that process one
-/// patch at a time. Static and editable meshes use the same buffer layout.
+/// Borrows connectivity buffers, mesh counts and the current topology stamp
+/// for queries. Static and editable meshes use the same buffer layout.
 #[derive(Clone, Copy)]
 pub(crate) struct PatchBuffers<'a> {
     pub arena: &'a wgpu::Buffer,
@@ -109,7 +120,7 @@ pub(crate) struct PatchBuffers<'a> {
     pub vertex_count: u32,
     pub face_count: u32,
     pub edge_count: u32,
-    pub mesh: MeshId,
+    pub topology: TopologyStamp,
 }
 
 /// CPU-side `u32` data for a static mesh's connectivity and slot masks.
@@ -255,18 +266,6 @@ impl GpuMesh {
     pub fn patch_count(&self) -> u32 {
         self.patch_count
     }
-    /// Borrows the connectivity buffers and counts needed by per-patch queries.
-    pub(crate) fn buffers(&self) -> PatchBuffers<'_> {
-        PatchBuffers {
-            arena: &self.arena,
-            masks: &self.masks,
-            patch_count: self.patch_count,
-            vertex_count: self.vertex_count,
-            face_count: self.face_count,
-            edge_count: self.edge_count,
-            mesh: self.mesh,
-        }
-    }
     /// Returns the ID of the CPU mesh used for this upload.
     pub fn mesh_id(&self) -> MeshId {
         self.mesh
@@ -283,13 +282,15 @@ impl GpuMesh {
 }
 
 /// The three input vertex IDs of each face, preserving the input triangle order.
+/// On an edited mesh, flipped faces follow the corner order given at
+/// [`FlipStatus::Flipped`].
 /// The buffer contains packed `u32` triples indexed by input face ID, with 12 bytes
 /// per face. It supports `STORAGE | COPY_SRC`. For an empty mesh, the buffer is a
 /// four-byte zero placeholder; `face_count()` is zero.
 pub struct FaceVertices {
     buffer: wgpu::Buffer,
     face_count: u32,
-    mesh: MeshId,
+    topology: TopologyStamp,
 }
 impl FaceVertices {
     pub fn buffer(&self) -> &wgpu::Buffer {
@@ -299,7 +300,11 @@ impl FaceVertices {
         self.face_count
     }
     pub fn mesh_id(&self) -> MeshId {
-        self.mesh
+        self.topology.mesh_id()
+    }
+    /// Returns the stamp of the connectivity this result was computed from.
+    pub fn topology(&self) -> TopologyStamp {
+        self.topology
     }
 }
 
@@ -334,9 +339,9 @@ impl FaceVertexQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
     ) -> Result<FaceVertices, GpuError> {
-        self.encode_patches(device, encoder, mesh.buffers())
+        self.encode_patches(device, encoder, buffers(mesh))
     }
 
     /// Records the same face-vertex query as [`encode`](Self::encode), using
@@ -355,7 +360,7 @@ impl FaceVertexQuery {
         let result = FaceVertices {
             buffer: pipeline::output_buffer(device, "MOPMesh face vertices result", bytes),
             face_count: mesh.face_count,
-            mesh: mesh.mesh,
+            topology: mesh.topology,
         };
         if mesh.face_count != 0 {
             pipeline::dispatch_patches(
@@ -382,7 +387,7 @@ pub struct VertexFaceAdjacency {
     buffer: wgpu::Buffer,
     vertex_count: u32,
     entry_count: u32,
-    mesh: MeshId,
+    topology: TopologyStamp,
 }
 
 impl VertexFaceAdjacency {
@@ -390,7 +395,11 @@ impl VertexFaceAdjacency {
         &self.buffer
     }
     pub fn mesh_id(&self) -> MeshId {
-        self.mesh
+        self.topology.mesh_id()
+    }
+    /// Returns the stamp of the connectivity this result was computed from.
+    pub fn topology(&self) -> TopologyStamp {
+        self.topology
     }
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
@@ -455,7 +464,17 @@ impl VertexFaceQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
+    ) -> Result<VertexFaceAdjacency, GpuError> {
+        self.encode_patches(device, encoder, buffers(mesh))
+    }
+
+    /// Records the same query as [`encode`](Self::encode) from borrowed buffers.
+    pub(crate) fn encode_patches(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: PatchBuffers,
     ) -> Result<VertexFaceAdjacency, GpuError> {
         // Validate result and temporary buffer sizes, plus dispatch limits, before GPU work.
         const RESOURCE: &str = "vertex-face CSR";
@@ -472,12 +491,12 @@ impl VertexFaceQuery {
             buffer: pipeline::output_buffer(device, "MOPMesh vertex faces CSR", words * 4),
             vertex_count: mesh.vertex_count,
             entry_count: entries as u32,
-            mesh: mesh.mesh,
+            topology: mesh.topology,
         };
         if mesh.face_count == 0 {
             return Ok(result);
         }
-        let faces = self.face_vertices.encode(device, encoder, mesh)?;
+        let faces = self.face_vertices.encode_patches(device, encoder, mesh)?;
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh vertex faces sizes"),
             contents: bytemuck::cast_slice(&[mesh.vertex_count, mesh.face_count]),

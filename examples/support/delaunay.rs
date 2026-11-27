@@ -18,9 +18,10 @@ pub fn compile_shader() -> String {
 }
 
 /// Builds a flat grid with `n` vertices along each side, distorted so it needs
-/// edge flips. Returns the mesh, positions as `[x, y, z, 1]` values, and triangles
-/// as mesh-wide vertex IDs. Use `n >= 2`; the example uses 11 to fit one patch.
-pub fn skewed_grid(n: u32) -> (Mesh, Vec<[f32; 4]>, Vec<[u32; 3]>) {
+/// edge flips, split into patches of about `patch_size` faces. Returns the
+/// mesh, positions as `[x, y, z, 1]` values, and triangles as mesh-wide vertex
+/// IDs. Use `n >= 2`; the example uses 11 with patch size 256 to fit one patch.
+pub fn skewed_grid(n: u32, patch_size: usize) -> (Mesh, Vec<[f32; 4]>, Vec<[u32; 3]>) {
     let mut positions = Vec::new();
     for y in 0..n {
         for x in 0..n {
@@ -38,7 +39,7 @@ pub fn skewed_grid(n: u32) -> (Mesh, Vec<[f32; 4]>, Vec<[u32; 3]>) {
         }
     }
     let mesh = MeshBuilder::new()
-        .patch_size(256)
+        .patch_size(patch_size)
         .positions(&positions)
         .triangles(&triangles)
         .build()

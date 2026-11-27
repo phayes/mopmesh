@@ -1,5 +1,5 @@
 use super::pipeline::{self, check_binding, group_grid};
-use super::{GpuError, GpuMesh, PatchBuffers};
+use super::{GpuError, GpuTopology, PatchBuffers, TopologyStamp, buffers};
 use crate::MeshId;
 
 /// Edge endpoints and the faces that touch each edge.
@@ -10,7 +10,7 @@ use crate::MeshId;
 pub struct EdgeConnectivity {
     pub(super) buffer: wgpu::Buffer,
     pub(super) edge_count: u32,
-    pub(super) mesh: MeshId,
+    pub(super) topology: TopologyStamp,
 }
 impl EdgeConnectivity {
     pub fn buffer(&self) -> &wgpu::Buffer {
@@ -20,7 +20,11 @@ impl EdgeConnectivity {
         self.edge_count
     }
     pub fn mesh_id(&self) -> MeshId {
-        self.mesh
+        self.topology.mesh_id()
+    }
+    /// Returns the stamp of the connectivity this result was computed from.
+    pub fn topology(&self) -> TopologyStamp {
+        self.topology
     }
 }
 
@@ -55,9 +59,9 @@ impl EdgeQuery {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuMesh,
+        mesh: &impl GpuTopology,
     ) -> Result<EdgeConnectivity, GpuError> {
-        self.encode_patches(device, encoder, mesh.buffers())
+        self.encode_patches(device, encoder, buffers(mesh))
     }
 
     /// Records the same edge query as [`encode`](Self::encode), using the
@@ -76,7 +80,7 @@ impl EdgeQuery {
         let result = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, "MOPMesh edge records", bytes),
             edge_count: mesh.edge_count,
-            mesh: mesh.mesh,
+            topology: mesh.topology,
         };
         if mesh.edge_count != 0 {
             pipeline::dispatch_patches(

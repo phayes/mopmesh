@@ -471,11 +471,17 @@ impl Bench {
                 "adjacency + smooth x10",
                 Box::new(|e| {
                     let a = self.adjacency.encode(d, e, gpu).unwrap();
-                    drop(self.smooth.encode(d, e, &a, &positions, None, SMOOTHING));
+                    drop(
+                        self.smooth
+                            .encode(d, e, gpu, &a, &positions, None, SMOOTHING),
+                    );
                 }),
                 Box::new(|e| {
                     let a = self.flat.adjacency(d, e, flat).unwrap();
-                    drop(self.smooth.encode(d, e, &a, &positions, None, SMOOTHING));
+                    drop(
+                        self.smooth
+                            .encode(d, e, gpu, &a, &positions, None, SMOOTHING),
+                    );
                 }),
             ),
         ];
@@ -514,7 +520,7 @@ impl Bench {
                 Box::new(|e| {
                     drop(
                         self.smooth
-                            .encode(d, e, &adjacency, &positions, None, SMOOTHING)
+                            .encode(d, e, gpu, &adjacency, &positions, None, SMOOTHING)
                             .unwrap(),
                     )
                 }),

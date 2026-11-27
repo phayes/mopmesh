@@ -231,7 +231,10 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   (`examples/delaunay_flips.rs`). Cavity discovery/staging is not started.
 - [x] Test failure/rollback behavior and topology preservation against Alum operations.
   Attribute preservation waits until attributes can be edited.
-- [ ] Run queries on editable meshes and reject results from before an edit (`GpuError::Stale`).
+- [x] Run queries on editable meshes and reject results from before an edit (`GpuError::Stale`).
+  Queries take `&impl GpuTopology`; topology results and derived attributes
+  carry a `TopologyStamp`. `tests/gpu_edited.rs` compares every query after
+  many flips with a fresh upload of the replayed triangles.
 
 ### 5 — Boundary dynamics: not started
 

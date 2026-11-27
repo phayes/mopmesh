@@ -26,7 +26,7 @@ work, acceptance criteria and next steps, and the
 - Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
 - GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
 - GPU boundary flags, whole-attribute reductions (sum, min, max, dot) and uniform Laplacian smoothing with optional fixed vertices, plus a downstream smoothing example.
-- An editable GPU mesh with spare per-patch slots and masks, parallel edge flips inside a patch verified against Alum, and WESL flip APIs that let downstream kernels flip edges by their own rule, one at a time or in parallel batches (see `examples/delaunay_flips.rs`).
+- An editable GPU mesh with spare per-patch slots and masks, parallel edge flips inside a patch verified against Alum, and WESL flip APIs that let downstream kernels flip edges by their own rule, one at a time or in parallel batches (see `examples/delaunay_flips.rs`). Every query runs on edited meshes, checked against a fresh upload of the flipped triangles, and rejects results from before an edit as stale.
 - GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
@@ -472,7 +472,7 @@ use mopmesh::gpu::{BoundaryQuery, ReduceOp, ReduceQuery, SmoothQuery, Smoothing}
 let boundary = BoundaryQuery::new(&device).encode(&device, &mut encoder, &gpu_mesh)?;
 // boundary.edges: GpuEdgeAttribute<u32>; boundary.vertices: GpuVertexAttribute<u32>.
 let smoothed = SmoothQuery::new(&device).encode(
-    &device, &mut encoder, &adjacency, &positions,
+    &device, &mut encoder, &gpu_mesh, &adjacency, &positions,
     Some(&boundary.vertices), // keep boundary vertices in place
     Smoothing { step: 0.5, iterations: 10 },
 )?;
@@ -555,7 +555,18 @@ Slots freed by a flip are reused by flips in later calls, so capacity only has
 to cover one call's flips. Calls recorded one after another apply in order.
 Each `encode` call increases `GpuEditableMesh::version()`, even when the GPU
 rejects every flip. Results computed before an edit are not updated; recompute
-them afterwards. Static queries don't accept a `GpuEditableMesh` yet.
+them afterwards.
+
+**Querying an edited mesh.** Every query takes `&impl GpuTopology`, so pass a
+`GpuEditableMesh` wherever a `GpuMesh` goes. Results computed from connectivity
+(face vertices, edge connectivity, vertex faces, adjacency, boundary flags,
+normals, areas and centroids) carry a `TopologyStamp`. A query that takes such
+a result, such as `SmoothQuery` with its adjacency, returns `GpuError::Stale`
+if the mesh was edited after the result was computed, or if the result came
+from another editable upload. Positions and other attributes you upload carry
+no stamp and stay valid, as do smoothed positions and any attribute you
+overwrite with `write`. Stamps are taken when commands are recorded, so
+submit recorded commands in the order you recorded them.
 
 **Flipping from your own WESL kernel.** `topology::flip` exposes the flip as
 plain functions, so a pipeline can test its own condition and flip in the same

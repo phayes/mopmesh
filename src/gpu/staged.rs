@@ -1,22 +1,8 @@
 //! Tests that the patch queries give exactly the results of the global
 //! kernels they replace, and the same results for static and editable
 //! uploads, including editable meshes with spare storage slots.
-use super::{GpuEditableMesh, PatchBuffers};
+use super::{GpuEditableMesh, PatchBuffers, buffers};
 use crate::Mesh;
-
-/// Borrows an editable upload's patch buffers, checking that it belongs to `mesh`.
-fn editable_buffers<'a>(mesh: &Mesh, gpu: &'a GpuEditableMesh) -> PatchBuffers<'a> {
-    assert_eq!(mesh.id(), gpu.mesh_id());
-    PatchBuffers {
-        arena: gpu.arena(),
-        masks: gpu.masks(),
-        patch_count: mesh.patches().len() as u32,
-        vertex_count: gpu.vertex_count(),
-        face_count: gpu.face_count(),
-        edge_count: gpu.edge_count(),
-        mesh: gpu.mesh_id(),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -146,7 +132,7 @@ mod tests {
         gpu: &GpuMesh,
     ) -> (Vec<u32>, Vec<u32>) {
         let limits = device.limits();
-        let buffers = gpu.buffers();
+        let buffers = buffers(gpu);
         let plan = AdjacencyPlan::new(
             &limits,
             buffers.vertex_count,
@@ -194,7 +180,7 @@ mod tests {
     fn check(device: &wgpu::Device, queue: &wgpu::Queue, q: &Queries, mesh: &Mesh, context: &str) {
         // Staged adjacency and boundary flags match the kernels they replace.
         let gpu = GpuMesh::upload(device, mesh).unwrap();
-        let expected = run(device, queue, q, gpu.buffers());
+        let expected = run(device, queue, q, buffers(&gpu));
         let (edge_count, vertex_count) = (gpu.edge_count(), gpu.vertex_count());
         if edge_count != 0 {
             assert_eq!(
@@ -220,7 +206,7 @@ mod tests {
         for factor in [1.0, 1.5] {
             let capacity = EditCapacity::new(factor).unwrap();
             let editable = GpuEditableMesh::upload(device, mesh, capacity).unwrap();
-            let actual = run(device, queue, q, editable_buffers(mesh, &editable));
+            let actual = run(device, queue, q, buffers(&editable));
             assert_eq!(actual, expected, "{context}, capacity {factor}");
         }
     }

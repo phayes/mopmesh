@@ -1,9 +1,21 @@
 # Milestone 5 plan: local dynamics
 
-Status: approved 26 November 2026. Steps 1, 2 and 4 are implemented, and
-step 5 apart from running queries before and after the flips; step 3 waits
-on static meshes moving to the patch-record layout, and that part of step 5
-waits on step 3.
+Status: approved 26 November 2026. All five steps are implemented.
+
+Step 3 as built: a sealed `GpuTopology` trait, implemented by `GpuMesh` and
+`GpuEditableMesh`, replaces `&GpuMesh` in every query. `TopologyStamp` is
+`(MeshId, upload, version)`; static uploads share upload 0, so they stay
+interchangeable, and each editable upload gets its own identity. Topology
+results always carry a stamp, derived attributes carry an optional one, and
+uploaded, overwritten and smoothed attributes carry none. `SmoothQuery` now
+takes the mesh, so it can check its adjacency. `GpuError::Stale` follows
+`MeshMismatch` in precedence. Fixing the oracle comparison exposed two flip
+contract gaps, both now fixed: flipped edges store ascending endpoints, and
+`flip_candidate` passes the face running the edge in stored order first, so
+each new face starts at a documented corner. `tests/gpu_edited.rs` replays
+Delaunay flips on a renumbered multi-patch grid with slot reuse, then
+compares every query against a fresh upload. Edges are matched by endpoint
+pair, lists as sorted vectors keeping associations, face corners exactly.
 
 Step 5 as built: `topology::flip_pass` binds the arena, masks, claims, slots
 and batch parameters at group 1 and exposes `flip_candidate`, `flip_claim`,

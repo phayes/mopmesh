@@ -146,6 +146,7 @@ fn gpu_smoothing_matches_reference() {
                         .encode(
                             &device,
                             &mut encoder,
+                            &gpu,
                             &adjacency,
                             &gpu_positions,
                             fixed,
@@ -219,6 +220,7 @@ fn smoothing_rejects_mismatched_inputs() {
             .encode(
                 &device,
                 &mut encoder,
+                &gpu,
                 &adjacency,
                 positions,
                 fixed,

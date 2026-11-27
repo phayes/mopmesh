@@ -72,6 +72,7 @@ async fn run() {
         .encode(
             &device,
             &mut encoder,
+            &gpu,
             &adjacency,
             &before,
             Some(&boundary.vertices),
