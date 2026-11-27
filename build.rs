@@ -17,6 +17,8 @@ fn main() {
         "face_areas",
         "vertex_normals",
         "boundary",
+        "reduce",
+        "smooth",
         "scan",
         "edges",
         "vertex_neighbors",

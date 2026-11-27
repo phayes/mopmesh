@@ -22,11 +22,11 @@ The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run passed 29 tests: 18 hardware-independent tests
-and 11 opt-in GPU tests (one is the GPU build benchmark, which returns at
+The last full verification run passed 39 tests: 21 hardware-independent tests
+and 18 opt-in GPU tests (one is the GPU build benchmark, which returns at
 once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
-checks passed, and both examples ran. GPU execution has only been verified on
+checks passed, and all three examples ran. GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
 
 Evidence lives in [host topology tests](tests/static_topology.rs),
@@ -182,7 +182,7 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 - [ ] **`missing_docs` (D-1).** Enable it for the public API in the release
   phase.
 
-### 3 — Static algorithms: started
+### 3 — Static algorithms: operators implemented; costs unmeasured
 
 - [x] Implement face centroids and a reusable edge-length helper.
 - [x] Validate weighted boundary lengths and neighborhood statistics in downstream examples.
@@ -192,9 +192,17 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   edge-length weights instead. Their sum order follows the unordered VF row,
   so results may differ in the last bits between runs; measure the cost of
   a fixed order before promising more. Measured costs are still open.
-- [ ] Add reductions and smoothing, including boundary policies and reference checks.
+- [x] Add reductions and smoothing, including boundary policies and reference checks.
+  Following RXMesh: whole-attribute `ReduceQuery` (sum/min/max for f32, u32,
+  i32) and `DotQuery`, like its `ReduceHandle`; `SmoothQuery` takes an
+  optional fixed-vertex mask, and `BoundaryQuery` supplies boundary flags for
+  it, like the `v_boundary` attribute in RXMesh's remesh smoothing. Arg-min/max
+  and tangent-plane projection are not implemented. Smoothing reads the global
+  VV transpose; revisit if Milestone 3 changes traversal.
 - [ ] Decide whether a standalone edge-length batch API is useful; the WESL primitive already exists.
-- [ ] Add runnable downstream examples alongside each new operator family.
+- [x] Add runnable downstream examples alongside each new operator family.
+  `examples/smoothing.rs` composes boundary flags, smoothing, vertex normals,
+  areas and reductions with its own bending shader.
 
 ### 4 — Local dynamics: not started
 
@@ -259,9 +267,11 @@ local cavities. The current Cargo version does not mean that release scope is co
    faces per owned edge. Compare staged and existing paths with identical
    outputs. Acceptance: Alum parity and measured tradeoffs across mesh/patch
    sizes; retain or revise the approach based on evidence.
-4. **Complete useful static functionality.** Add edge/face attributes and the
-   remaining Phase 3 operators, with public WESL implementations and downstream
-   examples. Acceptance: documented contracts, reference checks and measured costs.
+4. **Complete useful static functionality — implemented; costs unmeasured.**
+   Edge/face attributes, normals, areas, boundary flags, reductions and
+   smoothing landed with documented contracts, reference checks and the
+   `smoothing` example. Measured costs wait on the benchmark baseline
+   (milestone 2). Still open from Phase 3: the edge-length batch API decision.
 5. **Begin local dynamics.** Use the reviewed storage/synchronization contracts
    for Phase 4. Acceptance starts with a correct single interior flip before
    parallel claims or cross-patch editing.

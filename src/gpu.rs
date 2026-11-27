@@ -15,7 +15,9 @@ mod build;
 mod edge;
 mod geometry;
 mod pipeline;
+mod reduce;
 mod scan;
+mod smooth;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -25,11 +27,13 @@ pub use attribute::{
     FaceCentroidQuery, GpuAttribute, GpuEdgeAttribute, GpuFaceAttribute, GpuValue,
     GpuVertexAttribute,
 };
-pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
 pub use boundary::{BoundaryQuery, MeshBoundary};
+pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
 pub use edge::{EdgeConnectivity, EdgeQuery};
 pub use geometry::{FaceAreaQuery, FaceNormalQuery, VertexNormalQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
+pub use reduce::{DotQuery, GpuReduction, ReduceOp, ReduceQuery, ReduceValue};
+pub use smooth::{SmoothQuery, Smoothing};
 
 /// Marks a missing element in GPU results, with the value `u32::MAX`.
 /// For example, an edge on the mesh boundary has no second face. Never use this

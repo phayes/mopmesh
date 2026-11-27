@@ -42,12 +42,22 @@ impl BoundaryQuery {
         // Check sizes, then allocate zeroed flags.
         const RESOURCE: &str = "boundary flags";
         let limits = device.limits();
-        GpuEdgeAttribute::<u32>::check_output(&limits, mesh, RESOURCE)?;
-        GpuVertexAttribute::<u32>::check_output(&limits, mesh, RESOURCE)?;
+        GpuEdgeAttribute::<u32>::check_output(&limits, mesh.edge_count, RESOURCE)?;
+        GpuVertexAttribute::<u32>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
         let groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
         let result = MeshBoundary {
-            edges: GpuEdgeAttribute::output(device, mesh, "MOPMesh boundary edges"),
-            vertices: GpuVertexAttribute::output(device, mesh, "MOPMesh boundary vertices"),
+            edges: GpuEdgeAttribute::output(
+                device,
+                mesh.mesh,
+                mesh.edge_count,
+                "MOPMesh boundary edges",
+            ),
+            vertices: GpuVertexAttribute::output(
+                device,
+                mesh.mesh,
+                mesh.vertex_count,
+                "MOPMesh boundary vertices",
+            ),
         };
         if mesh.edge_count == 0 {
             return Ok(result);
@@ -72,7 +82,13 @@ impl BoundaryQuery {
                 result.vertices.buffer(),
             ],
         );
-        pipeline::dispatch(encoder, "MOPMesh boundary", &self.pipeline, &bindings, groups);
+        pipeline::dispatch(
+            encoder,
+            "MOPMesh boundary",
+            &self.pipeline,
+            &bindings,
+            groups,
+        );
         Ok(result)
     }
 }

@@ -149,9 +149,14 @@ impl VertexNormalQuery {
             return Err(GpuError::MeshMismatch);
         }
         let limits = device.limits();
-        GpuVertexAttribute::<[f32; 4]>::check_output(&limits, mesh, RESOURCE)?;
+        GpuVertexAttribute::<[f32; 4]>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
         let groups = workgroups(&limits, mesh.vertex_count, RESOURCE)?;
-        let result = GpuVertexAttribute::output(device, mesh, "MOPMesh vertex normals");
+        let result = GpuVertexAttribute::output(
+            device,
+            mesh.mesh,
+            mesh.vertex_count,
+            "MOPMesh vertex normals",
+        );
         if mesh.vertex_count == 0 {
             return Ok(result);
         }

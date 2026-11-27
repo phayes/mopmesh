@@ -1,11 +1,12 @@
-//! GPU geometry queries (face normals, face areas, vertex normals) checked
-//! against Alum and an f64 reference, on uploaded and GPU-built meshes.
+//! GPU geometry queries (face normals, face areas, vertex normals) and
+//! boundary flags checked against Alum and an f64 reference, on uploaded and
+//! GPU-built meshes.
 use alum::{Handle, HasTopology, PolyMeshF32, Vec3};
 use mopmesh::{
     FaceAttribute, MeshBuilder,
     gpu::{
-        FaceAreaQuery, FaceNormalQuery, GpuError, GpuFaceAttribute, GpuMesh, GpuMeshBuilder,
-        GpuMeshInput, GpuVertexAttribute, VertexNormalQuery,
+        BoundaryQuery, FaceAreaQuery, FaceNormalQuery, GpuError, GpuFaceAttribute, GpuMesh,
+        GpuMeshBuilder, GpuMeshInput, GpuVertexAttribute, VertexNormalQuery,
     },
 };
 use wgpu::util::DeviceExt;
@@ -17,6 +18,7 @@ struct Queries {
     face_normals: FaceNormalQuery,
     face_areas: FaceAreaQuery,
     vertex_normals: VertexNormalQuery,
+    boundary: BoundaryQuery,
 }
 
 // Explicit opt-in: a missing adapter is a failure, never a silent successful test.
@@ -28,6 +30,7 @@ fn gpu_geometry_matches_reference() {
         face_normals: FaceNormalQuery::new(&device),
         face_areas: FaceAreaQuery::new(&device),
         vertex_normals: VertexNormalQuery::new(&device),
+        boundary: BoundaryQuery::new(&device),
     };
     let mut builder = GpuMeshBuilder::new(&device);
     for fixture in geometry_fixtures() {
@@ -213,6 +216,39 @@ fn check(
     let normals: Vec<f32> = bits(read(device, queue, vertex_normals.buffer()));
     for (v, expected) in reference_vertex_normals(fixture).into_iter().enumerate() {
         assert_vector(&normals[4 * v..4 * v + 4], expected, "vertex normal", v);
+    }
+
+    // Boundary flags against Alum. Canonical edge IDs number the edges in
+    // ascending (smaller, larger) vertex-pair order.
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let boundary = queries.boundary.encode(device, &mut encoder, gpu).unwrap();
+    queue.submit([encoder.finish()]);
+    assert_eq!(boundary.edges.len() as usize, reference.edges().len());
+    assert_eq!(boundary.vertices.len() as usize, fixture.positions.len());
+    let edge_flags = read(device, queue, boundary.edges.buffer());
+    let mut pairs: Vec<[u32; 2]> = reference
+        .edges()
+        .map(|e| {
+            let (a, b) = e.vertices(reference);
+            [a.index().min(b.index()), a.index().max(b.index())]
+        })
+        .collect();
+    let alum_edges: Vec<_> = reference.edges().collect();
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_by_key(|&i| pairs[i]);
+    pairs.sort();
+    for (id, &i) in order.iter().enumerate() {
+        let expected = u32::from(alum_edges[i].is_boundary(reference));
+        assert_eq!(edge_flags[id], expected, "boundary edge {:?}", pairs[id]);
+    }
+    let vertex_flags = read(device, queue, boundary.vertices.buffer());
+    for v in reference.vertices() {
+        let expected = u32::from(v.is_boundary(reference));
+        assert_eq!(
+            vertex_flags[v.index() as usize],
+            expected,
+            "boundary vertex {v:?}"
+        );
     }
 }
 

@@ -25,6 +25,7 @@ work, acceptance criteria and next steps, and the
 - A hierarchical GPU prefix scan and an importable 64-lane WESL scan collective.
 - Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
 - GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
+- GPU boundary flags, whole-attribute reductions (sum, min, max, dot) and uniform Laplacian smoothing with optional fixed vertices, plus a downstream smoothing example.
 - GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
@@ -39,6 +40,7 @@ cargo clippy --all-targets -- -D warnings
 # The following require a GPU adapter; missing hardware is a failure.
 cargo run --example weighted_boundary
 cargo run --example neighborhood
+cargo run --example smoothing
 # Rough timing against Alum; see docs/approximate_benchmark.md:
 cargo run --release --example bench_alum
 cargo test --test gpu_topology -- --ignored --nocapture
@@ -130,8 +132,8 @@ the Rust runtime's buffer bindings and dispatch layouts.
 
 Common mesh operations will be implemented in the public WESL library, with the
 Rust runtime using those same implementations. This includes connectivity
-traversal, geometry primitives and parallel primitives. Centroids, edge length
-and scans exist; normals, areas, general reductions and smoothing remain planned.
+traversal, geometry primitives and parallel primitives. Centroids, edge length,
+normals, areas, boundary flags, scans, reductions and smoothing exist.
 Allocation, concrete bindings,
 pipeline configuration and dispatch scheduling belong in the runtime layer.
 
@@ -164,6 +166,17 @@ ordinary `GpuVertexAttribute<f32>`. It uses five storage bindings and chooses
 its own bindings, entry point and output policy. Both example operators assert
 that their inputs report the same `mesh_id()`. Its actual operator code is
 exercised against Alum in the GPU tests; only the final results are read back.
+
+`examples/smoothing.rs` composes the geometry operators. It smooths a bumpy
+33 x 33 grid for 20 steps with the boundary fixed, using `BoundaryQuery`'s
+vertex flags. Its own shader (`examples/shaders/bending.wesl`) imports the
+public CSR helpers and `normalize_or_zero` and rates how far each vertex's
+edges leave its tangent plane, from VV rows and `VertexNormalQuery` normals.
+It wraps its output buffer with `GpuAttribute::from_buffer`, so the library's
+`ReduceQuery` can total it, together with `FaceAreaQuery` areas. Everything
+runs in one submission and only four totals are read back; it reports mean
+bending falling from about 0.117 to 0.022 and total area from 1119 to 1035.
+GPU tests check the bending operator against an f64 reference.
 
 ## GPU usage
 
@@ -439,6 +452,50 @@ without dispatch. Finite, reasonably scaled f32 positions are expected;
 extreme coordinates remain subject to floating-point overflow and rounding.
 The matching WESL helpers are `triangle_area_vector`, `triangle_normal`,
 `triangle_area` and `normalize_or_zero` in `mopmesh::geometry::triangle`.
+
+### Boundary flags, reductions and smoothing
+
+```rust,ignore
+use mopmesh::gpu::{BoundaryQuery, ReduceOp, ReduceQuery, SmoothQuery, Smoothing};
+
+let boundary = BoundaryQuery::new(&device).encode(&device, &mut encoder, &gpu_mesh)?;
+// boundary.edges: GpuEdgeAttribute<u32>; boundary.vertices: GpuVertexAttribute<u32>.
+let smoothed = SmoothQuery::new(&device).encode(
+    &device, &mut encoder, &adjacency, &positions,
+    Some(&boundary.vertices), // keep boundary vertices in place
+    Smoothing { step: 0.5, iterations: 10 },
+)?;
+let total = ReduceQuery::<f32>::new(&device, ReduceOp::Sum)
+    .encode(&device, &mut encoder, &face_areas)?;
+// total.buffer() holds one f32 at byte 0.
+```
+
+`BoundaryQuery` flags each edge and vertex with 1 on the boundary and 0
+elsewhere: a boundary edge has one adjoining face, and a boundary vertex
+touches a boundary edge. Closed meshes have no boundary.
+
+`ReduceQuery<T>` combines every value of an `f32`, `u32` or `i32` attribute of
+any element kind with `ReduceOp::Sum`, `Min` or `Max`; `DotQuery` sums the
+element-wise product of two `f32` attributes of the same mesh. The result is a
+`GpuReduction<T>`, one value at byte 0 of a 4-byte buffer with STORAGE,
+COPY_SRC and COPY_DST usage, so later GPU work can read it without a
+readback. Integer sums wrap. Empty attributes give 0 for sums and dot
+products, +infinity or the largest integer for `Min`, and -infinity, 0 or
+the smallest `i32` for `Max`. The combination order is fixed for a given
+length, so repeated `f32` results on one device agree. NaN inputs give
+unspecified results. Reductions combine 64 values per workgroup per level,
+use a two-dimensional dispatch grid when needed, and allocate a scratch
+buffer and one uniform per level on each call.
+
+`SmoothQuery` runs uniform Laplacian steps: each step moves every free vertex
+`step` of the way toward the average of its edge neighbors, read from a
+`MeshAdjacency`. Vertices whose `fixed` flag is non-zero, and vertices with no
+neighbors, stay in place; `w` lanes are copied unchanged. The input positions
+are not modified. Zero iterations return a copy, which needs `COPY_SRC` usage
+on the input. Smoothing shrinks surfaces and, without fixed boundary
+vertices, open boundaries too. Neighbors are summed in an unspecified order,
+so results may differ in the last bits between runs. Tests compare against an
+f64 host reference after up to four steps, with and without fixed boundaries.
 
 ## Validation coverage
 

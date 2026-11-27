@@ -3,7 +3,7 @@ fn downstream_shader_can_link_packaged_library() {
     for name in ["consumer", "scan_consumer", "geometry_consumer"] {
         validate(&compile_consumer(name));
     }
-    for name in ["weighted_boundary", "neighborhood"] {
+    for name in ["weighted_boundary", "neighborhood", "bending"] {
         let mut resolver = wesl::resolver::StandardResolver::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/examples/shaders"
@@ -69,6 +69,8 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         include_str!(concat!(env!("OUT_DIR"), "/face_areas.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/vertex_normals.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/boundary.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/reduce.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/smooth.wgsl")),
     ] {
         validate(wgsl);
     }

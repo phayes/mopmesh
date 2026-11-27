@@ -133,30 +133,36 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     /// Checks that an output attribute for `mesh` fits the device limits.
     pub(crate) fn check_output(
         limits: &wgpu::Limits,
-        mesh: &GpuMesh,
+        len: u32,
         resource: &'static str,
     ) -> Result<(), GpuError> {
-        check_binding(limits, Self::byte_size(mesh), resource)
+        check_binding(limits, Self::byte_size(len), resource)
     }
 
-    /// Allocates an uninitialized output attribute for `mesh`. Check the size
-    /// with [`check_output`](Self::check_output) first.
-    pub(crate) fn output(device: &wgpu::Device, mesh: &GpuMesh, label: &str) -> Self {
+    /// Allocates a zeroed output attribute of `len` elements for mesh `mesh`.
+    /// `len` must be the mesh's element count for `E`. Check the size with
+    /// [`check_output`](Self::check_output) first.
+    pub(crate) fn output(device: &wgpu::Device, mesh: MeshId, len: u32, label: &str) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: Self::byte_size(mesh),
+            size: Self::byte_size(len),
             usage: Self::USAGE,
             mapped_at_creation: false,
         });
-        Self::wrap(buffer, mesh, mesh.element_count(E::KIND))
+        Self {
+            buffer,
+            mesh,
+            len,
+            marker: PhantomData,
+        }
     }
 
     const USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
         .union(wgpu::BufferUsages::COPY_SRC)
         .union(wgpu::BufferUsages::COPY_DST);
 
-    fn byte_size(mesh: &GpuMesh) -> u64 {
-        std::mem::size_of::<T>() as u64 * u64::from(mesh.element_count(E::KIND).max(1))
+    fn byte_size(len: u32) -> u64 {
+        std::mem::size_of::<T>() as u64 * u64::from(len.max(1))
     }
 
     fn wrap(buffer: wgpu::Buffer, mesh: &GpuMesh, len: u32) -> Self {
@@ -287,12 +293,12 @@ pub(super) fn face_kernel<T: GpuValue>(
         return Err(GpuError::MeshMismatch);
     }
     let limits = device.limits();
-    GpuFaceAttribute::<T>::check_output(&limits, mesh, resource)?;
+    GpuFaceAttribute::<T>::check_output(&limits, mesh.face_count, resource)?;
     check_binding(&limits, (u64::from(mesh.face_count) * 12).max(4), resource)?;
     let groups = workgroups(&limits, mesh.face_count, resource)?;
 
     // Allocate the result, then run the face-vertex query and the kernel.
-    let result = GpuFaceAttribute::<T>::output(device, mesh, resource);
+    let result = GpuFaceAttribute::<T>::output(device, mesh.mesh, mesh.face_count, resource);
     if mesh.face_count == 0 {
         return Ok(result);
     }
