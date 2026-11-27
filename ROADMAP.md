@@ -478,7 +478,28 @@ Steps:
     stop at the next unused edge ID, which made no measurable difference.
     Single stages vary by up to 2x between runs of the same commit, so an
     interleaved A/B belongs with Phase 5 step 5's profiling.
+  Full tables: [docs/growth_simulation.md](docs/growth_simulation.md).
 - [ ] Step 2: ID allocator and single-patch splits (`EdgeSplitQuery`).
+  Design reviewed with the advisor (Codex had run out of credits); not
+  started in code:
+  - Keep `flip_finish` and the flip layout as they are; add a
+    `split_finish` in `flip_pass.wesl` with its own layout, which adds the
+    maps binding. `flip_selected` is already at the limit of 8 storage
+    buffers, so flips must not gain one; check that the emitted flip WGSL
+    has no binding 7. Pass "check connected" to `select_round` as a
+    call-site constant.
+  - Decide admission before claiming anything: count the patch's selected
+    splits, compare with free slots per kind (capacity minus active
+    popcount) and ID room (compare-and-swap on the next-unused-ID words),
+    and admit that many, so slot claims can't fail and need no release.
+  - The commit loop must skip `INVALID_ID` when it reads a slot another
+    lane has just claimed.
+  - Provenance: the new vertex, the first new edge and the first new face
+    (bump allocation makes each split's IDs consecutive) in state words
+    0–2, keeping the four corners in words 3–6. This breaks once free
+    lists arrive in step 5.
+  - The CPU predictor must take its new IDs from the GPU's provenance,
+    because priorities hash edge IDs.
 - [ ] Step 3: cross-patch splits.
 - [ ] Step 4: patch slicing, with the patch capacity decision above.
 - [ ] Step 5: collapses (footprint lists, link condition, free lists).
