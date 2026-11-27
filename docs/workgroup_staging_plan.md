@@ -3,10 +3,12 @@
 Status: complete (27 November 2026). Steps 1 to 3 and 5 are done and step 4
 was skipped; see [Step 1 results](#step-1-results),
 [Step 2 results](#step-2-results), [Step 3 results](#step-3-results) and
-[Step 5 results](#step-5-results). The step 2 and 3 speed tables are the
-measurements taken at the time; the
-[baseline report](baseline_benchmark.md) has the clean rerun. Decisions and
-remaining defaults are listed at the end.
+[Step 5 results](#step-5-results). A later
+[profile of the staged pass](#staged-pass-profile) led to 128-lane
+workgroups, 512 staged edges and no workgroup zero-fill (`2dcee78`). The
+step 2 and 3 speed tables are the measurements taken at the time; the
+[baseline report](baseline_benchmark.md) has the latest clean rerun.
+Decisions and remaining defaults are listed at the end.
 
 The direction behind it: follow RXMesh, editing a mesh is a headline feature,
 and in-kernel local queries should be revisited for editing. The Milestone 5
@@ -419,8 +421,8 @@ would hold about 15 KB per workgroup. If those kernels show the same
 pattern, the per-patch flip and editing kernels likely pay the same cost.
 Not measured.
 
-All three fixes were applied together, agreed with the Milestone 5
-session; benchmark results are pending:
+All three fixes were applied together in `2dcee78`, agreed with the
+Milestone 5 session:
 
 1. The crate's compute pipelines no longer zero-fill workgroup memory
    (`pipeline::NO_ZERO_FILL`). Every kernel was checked to write its
@@ -432,6 +434,27 @@ session; benchmark results are pending:
    `patch_staging`, `patch_edge_staging`, `patch_queries`, `local_query`
    and `flip_pass`, and is used by boundary flags, edge records,
    adjacency, edge flips and the consumer examples.
+
+Results, from three clean runs of the
+[baseline benchmark](baseline_benchmark.md) at 2.1 M faces:
+
+- Edge records are 1.4–3.2x faster than before, boundary flags 1.2–2.6x
+  and batched adjacency 1.4–2.5x in input order. Shuffled adjacency is 5%
+  faster at patch size 128 and 1–2% slower at 512.
+- At patch size 512, edge records run at 0.92–1.16x of the flat layout in
+  input order and 0.37–0.43x shuffled, and batched adjacency at 0.85–0.96x
+  and 0.69–0.71x.
+- Patch size 32 recovered most of its loss: edge records take 2.7–4.4 ms,
+  from 8.8–11.0 ms.
+- One flip batch requesting every edge is 13–40% faster, with identical
+  outcomes, from the flip benchmark before and after (three runs each).
+  The 2.1 M-face grid went from 37.3 to 28.4 ms.
+- A side-by-side run with zero-fill turned back on put its share at about
+  5%: edge records on the grid at patch size 512 took 1.00 ms with it and
+  0.95 ms without. The lane count and smaller array give the rest.
+- Smoothing, which uses no workgroup memory, measured slower in some runs.
+  Alternating builds of the old code, this code and this code with
+  zero-fill on gave overlapping ranges, so the change is not the cause.
 
 ## Steps
 

@@ -28,13 +28,13 @@ The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run (27 November 2026, commit `2e9b6c5`) passed
+The last full verification run (27 November 2026, commit `2dcee78`) passed
 66 tests: 27 hardware-independent tests and 39 opt-in GPU tests (four are
 the GPU build, baseline, flip and Delaunay settle benchmarks, which return
 at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
-sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
-checks passed, and all four runnable examples ran (the Alum benchmark
-example was not run). GPU execution has only been verified on
+sizes; the count is not a measure of exhaustive coverage. Clippy,
+formatting checks and doctests passed, and all four runnable examples ran
+(the Alum benchmark example was not run). GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
 
 Evidence lives in [host topology tests](tests/static_topology.rs),
@@ -309,14 +309,13 @@ local cavities. The current Cargo version does not mean that release scope is co
    irregular grids, each also with shuffled IDs, at 32 K–2.1 M faces and
    patch sizes 32–512. It reports setup, bytes per face, ribbon overhead,
    wall and per-pass GPU time, dispatches, buffers and bind groups. It was
-   last rerun on 27 November 2026 at commit `e6f8663`. At 2.1 M faces and
-   patch size 128, the arena beats the flat layout on shuffled meshes for
-   batched adjacency (0.74–0.76x) and matches it for edge records
-   (0.96–1.08x). In input order it is still slower: edge records 2.5–3.2x
-   and batched adjacency 1.6–1.9x, from 5.8x and 2.9x in Milestone 2. At
-   the default patch size of 512, batched adjacency is 1.2–1.4x flat in
-   input order and 0.68–0.69x shuffled, and memory is 65–75 B/face against
-   36 flat. Scratch bytes are not measured, because Metal does not
+   last rerun on 27 November 2026 at commit `2dcee78`, after the staged
+   kernels moved to 128-lane workgroups and 512 staged edges. At 2.1 M faces
+   and the default patch size of 512, the arena beats the flat layout on
+   shuffled meshes (edge records 0.37–0.43x, batched adjacency 0.69–0.71x)
+   and is level with it in input order (0.92–1.16x and 0.85–0.96x), from
+   5.8x and 2.9x for edge records and adjacency in Milestone 2. Memory is
+   65–75 B/face against 36 flat. Scratch bytes are not measured, because Metal does not
    report buffer memory. The [approximate comparison against Alum](docs/approximate_benchmark.md)
    remains for the GPU build and single-thread CPU numbers. Open:
    - [ ] Report scratch bytes per query, from wgpu's buffer-memory counter
@@ -345,9 +344,20 @@ local cavities. The current Cargo version does not mean that release scope is co
    - [x] Step 5: clean benchmark rerun (three runs) and
      [report](docs/baseline_benchmark.md) update.
    - Follow-ups, not scheduled:
-     - [ ] Profile the staged pass: still 2.6–3.2x the flat edge pass in
-       input order, and most of the shuffled adjacency cost.
-     - [ ] Patch size 32 is about 3x slower than in Milestone 2 (deferred).
+     - [x] Profile the staged pass (27 November 2026): workgroup memory,
+       not staging work, cost most of its time. Per-patch kernels now run
+       128-lane workgroups with 512 staged edges and no zero-fill
+       (`2dcee78`): edge records, boundary flags and input-order adjacency
+       1.2–3.2x faster, flip batches 13–40% faster.
+       See the [profile](docs/workgroup_staging_plan.md#staged-pass-profile).
+     - [ ] Shuffled adjacency barely improved (9.0–9.6 ms against 13.1 ms
+       flat). The staged pass's scattered global writes of FF and diamonds
+       are the likely cost; not profiled.
+     - [x] Patch size 32 recovered most of its loss with the profile fix:
+       edge records 0.69 ms on the 523 K-face grid, against 0.61 ms in
+       Milestone 2.
+     - [ ] `local_query` declares about 7 KB of workgroup memory; check
+       whether its users pay the same occupancy cost.
      - [x] Default patch size is now 512 (decided 27 November 2026), as in
        RXMesh: it beat 128 on every staged query and used 65–75 against
        83–103 B/face.
@@ -355,9 +365,10 @@ local cavities. The current Cargo version does not mean that release scope is co
        all-active static reader could recover 5–15%.
      - [x] Batched adjacency regressed by 1.1–1.2 ms in input order at
        `ab98f19`; `e6f8663` fixed it, confirmed by the rerun.
-     - [ ] Explain why smoothing on shuffled meshes takes about 9 or
-       11–15 ms per ten steps depending on the adjacency build. VV row
-       order, which the scatter leaves unspecified, is the likely factor.
+     - [ ] Explain why smoothing takes different times depending on the
+       adjacency build (on shuffled meshes, about 9 to 15 ms per ten
+       steps). VV row order, which the scatter leaves unspecified, is the
+       likely factor.
      - [ ] Staging FE is untried.
 4. **Complete useful static functionality — done.** Edge/face attributes,
    normals, areas, boundary flags, reductions and smoothing landed with

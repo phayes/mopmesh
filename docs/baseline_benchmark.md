@@ -5,44 +5,44 @@ unpartitioned GPU baseline on the same adapter. No speedup is assumed; the
 point is to find where the patch layout costs or pays. The baseline was
 first run for milestone 2 (26 November 2026), rerun after milestone 3's
 workgroup staging (commit `746a47f`), and rerun on 27 November 2026 at
-`ab98f19` and again at `e6f8663`, after the default patch size became 512
-and the in-kernel local queries landed. This report gives the `e6f8663`
-run, with earlier figures where they show what changed.
+`ab98f19`, `e6f8663` and `2dcee78`. This report gives the `2dcee78` run, the
+first after staged kernels moved to 128-lane workgroups, 512 staged edges
+and no zero-filling of workgroup memory (see the
+[staged pass profile](workgroup_staging_plan.md#staged-pass-profile)).
+Earlier figures appear where they show what changed.
 
 ## Bottom line
 
-- **On shuffled meshes the arena beats the flat layout for adjacency.**
-  At 2.1 M faces and patch size 128, batched adjacency (VV, FF, diamonds and
-  edge records) takes 9.7–10.1 ms on the arena against 13.1–13.3 ms flat
-  (0.74–0.76x). Edge records are level (0.96–1.08x). In milestone 2 the
-  arena was slower on both (1.15–1.2x and 1.8–2.0x).
-- **In input order the arena is still slower**: edge records 2.5–3.2x (from
-  5.8–6.9x in milestone 2) and batched adjacency 1.6–1.9x (from 2.9–3.2x).
-  Edge records take 2.7–3.3 ms against 1.0–1.1 ms flat.
-- **Patch size 512, now the default, is the fastest setting measured.** At
-  2.1 M faces, edge records take 1.6–1.9 ms in input order (1.6–1.9x flat)
-  and 2.0–2.2 ms shuffled (0.55–0.6x flat); batched adjacency takes 3.5–3.9
-  and 8.9–9.2 ms (1.2–1.4x and 0.68–0.69x flat). Patch size 32 is the slow
-  case: edge records 8.8–11.0 ms. Its cause is not profiled.
+- **The staged queries are much faster than at `e6f8663`.** The profile
+  found that workgroup memory, not staging work, cost most of their time.
+  Across meshes and patch sizes at 2.1 M faces, edge records are 1.4–3.2x
+  faster, boundary flags 1.2–2.6x, and batched adjacency (VV, FF, diamonds
+  and edge records) 1.4–2.5x in input order. Shuffled adjacency gained
+  little: 5% faster at patch size 128 and 1–2% slower at 512.
+- **On shuffled meshes the arena beats the flat layout clearly.** At patch
+  size 128, edge records run at 0.43–0.50x of flat and batched adjacency
+  at 0.71–0.73x. At patch size 512 they run at 0.37–0.43x and 0.69–0.71x.
+- **In input order the arena is now level with flat for adjacency.**
+  Batched adjacency is 0.91–1.08x of flat at patch size 128 and 0.85–0.96x
+  at 512. Edge records are 1.05–1.42x at 128 and 0.92–1.16x at 512, where
+  the grid, torus and irregular grid are within 8% of flat and the sphere
+  is 16% slower. At `e6f8663` they were 1.6–1.9x and 2.5–3.2x at 128.
+- **Patch size 32 recovered most of its loss**: edge records take 2.7–4.4 ms
+  at 2.1 M faces, from 8.8–11.0 ms, and 0.69 ms on the grid at 523 K faces,
+  against 0.61 ms in milestone 2. It is still the slowest and largest
+  setting.
 - **Memory is 65–75 bytes per face at patch size 512 and 83–103 at 128**,
-  against 36 flat. Milestone 2 took 129–145 at 128.
-- **Boundary flags no longer cost a second pass**: 2.4–3.0 ms in input order
-  and 3.6–4.4 ms shuffled at patch size 128, from 6.5–7.4 ms.
-- **A regression came and went.** At `ab98f19` batched adjacency was
-  1.1–1.2 ms slower in input order, because its staged pass read all three
-  of a face's edge endpoints through the new `local_query` helpers.
-  `e6f8663` restored the single read, and the times are back within noise
-  of `746a47f`'s.
-- **Per-face queries on the arena are 9–27% slower than in milestone 2** in
-  input order (face vertices, centroids, normals, areas), from the per-patch
-  dispatch and the active and owned checks. Shuffled face normals and areas
-  varied by up to 50% between runs. The flat path's GPU times are within 5%
-  of milestone 2's, so this is not machine drift.
-- **VV alone is 0.86–0.93 ms in input order and 2.5–2.7 ms shuffled**, about
-  a quarter of shuffled adjacency. Staging VV was skipped for that reason.
+  against 36 flat. Milestone 2 took 129–145 at 128. Unchanged by this run.
+- **Per-face queries are unchanged** (face vertices, centroids, normals,
+  areas), still 9–27% slower than in milestone 2 in input order. VV alone
+  is 0.86–0.96 ms in input order and 2.5–2.9 ms shuffled, as before.
+- **Smoothing time depends on the adjacency build.** It measured higher in
+  this run than at `e6f8663`, but a side-by-side run of both builds found
+  overlapping ranges; see [Queries without a twin](#queries-without-a-twin).
 - **The GPU build still degrades on high-valence vertices.** The 2.1 M-face
-  UV sphere builds in 2.3 s at patch size 128, 6.7 s at 32 and 0.47 s at
-  512, against 126 ms for a grid of the same size at 128. Not yet profiled.
+  UV sphere builds in 1.6 s at patch size 128 (2.3 s at `e6f8663`), 6.6 s
+  at 32 and 0.57 s at 512, against 123 ms for a grid of the same size at
+  128. Not yet profiled.
 
 ## Running it
 
@@ -89,9 +89,11 @@ the edge records and face vertices. VV, centroids and smoothing run the same
 kernels on both paths, because they read only global results.
 
 **Arena path.** Edge records, batched adjacency's edge, FF and diamond
-pass, and boundary flags run one workgroup per patch, staging each edge's
-faces in workgroup memory. Face vertices and the per-face queries also run
-one workgroup per patch, over its active, owned faces.
+pass, and boundary flags run one workgroup of 128 invocations per patch,
+staging each edge's faces in 4 KB of workgroup memory, 512 edges at a time.
+Face vertices and the per-face queries also run one workgroup per patch,
+over its active, owned faces. No pipeline on either path zero-fills
+workgroup memory.
 
 **Timing.**
 
@@ -105,16 +107,16 @@ one workgroup per patch, over its active, owned faces.
 - Setup rows are 3 timed runs after 1 warm-up.
 - The whole benchmark ran three times. Slow stretches came in bursts that
   raised even the minimum of a row, so each figure here is the lowest of
-  the three runs' medians. Of the 1,048 rows with a median of at least
-  0.1 ms, 86% have at least two runs within 5% of that figure, and the three
-  medians span under 10% in 78%. Treat differences under about 10% as noise.
+  the three runs' medians. Of the 1,030 rows with a median of at least
+  0.1 ms, 84% have at least two runs within 5% of that figure, and the three
+  medians span under 10% in 81%. Treat differences under about 10% as noise.
 
 **Counts.** Dispatches come from a test-only counter in the shared dispatch
 helper. Buffers and bind groups come from wgpu's internal counters (the
 `counters` feature, enabled for tests only).
 
 **Machine.** Apple M1 Max, Metal, release build, 2026-11-27, commit
-`e6f8663`. Storage binding limit 4 GiB, 65535 workgroups per dimension,
+`2dcee78`. Storage binding limit 4 GiB, 65535 workgroups per dimension,
 timestamp period 1 ns.
 
 ## Memory and setup
@@ -125,28 +127,31 @@ CPU mesh.
 
 | Mesh | Arena B/face | Milestone 2 | Flat B/face | Faces held per face | CPU build | Upload arena | Upload flat | GPU build |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| grid | 83.3 | 128.7 | 36.0 | 1.636 | 476 ms | 89.3 ms | 33.4 ms | 126 ms |
-| grid, shuffled | 91.8 | 135.5 | 36.0 | 1.786 | 2176 ms | 126.7 ms | 57.6 ms | 406 ms |
-| sphere | 98.1 | 141.0 | 36.0 | 1.902 | 507 ms | 102.5 ms | 33.9 ms | 2277 ms |
-| sphere, shuffled | 102.9 | 144.9 | 36.0 | 1.982 | 2240 ms | 138.5 ms | 59.3 ms | 753 ms |
-| torus | 89.9 | 134.1 | 36.0 | 1.758 | 517 ms | 98.1 ms | 35.9 ms | 166 ms |
-| torus, shuffled | 92.0 | 135.7 | 36.0 | 1.791 | 2200 ms | 127.5 ms | 57.9 ms | 452 ms |
-| irregular | 87.6 | 132.3 | 36.0 | 1.713 | 634 ms | 100.9 ms | 40.4 ms | 157 ms |
-| irregular, shuffled | 92.5 | 136.2 | 36.0 | 1.798 | 2500 ms | 126.8 ms | 58.9 ms | 421 ms |
+| grid | 83.3 | 128.7 | 36.0 | 1.636 | 478 ms | 89.6 ms | 33.2 ms | 123 ms |
+| grid, shuffled | 91.8 | 135.5 | 36.0 | 1.786 | 2190 ms | 127.2 ms | 57.8 ms | 406 ms |
+| sphere | 98.1 | 141.0 | 36.0 | 1.902 | 509 ms | 102.9 ms | 34.4 ms | 1599 ms |
+| sphere, shuffled | 102.9 | 144.9 | 36.0 | 1.982 | 2266 ms | 138.2 ms | 59.4 ms | 758 ms |
+| torus | 89.9 | 134.1 | 36.0 | 1.758 | 515 ms | 97.9 ms | 36.5 ms | 166 ms |
+| torus, shuffled | 92.0 | 135.7 | 36.0 | 1.791 | 2195 ms | 127.7 ms | 58.0 ms | 453 ms |
+| irregular | 87.6 | 132.3 | 36.0 | 1.713 | 636 ms | 101.5 ms | 40.7 ms | 155 ms |
+| irregular, shuffled | 92.5 | 136.2 | 36.0 | 1.798 | 2525 ms | 126.5 ms | 59.0 ms | 424 ms |
 
 - The arena holds the shared patch layout: an 8-word header, a 16-word
   record per patch, the patch regions, and a mask buffer of used counts,
-  active masks and owned masks. The per-face task lists are gone.
-- Both builds slow down on shuffled input: the CPU build by 3.9–4.6x and
-  the GPU build by 2.7–3.2x (sphere aside). Patches stay almost as good
+  active masks and owned masks.
+- Both builds slow down on shuffled input: the CPU build by 4.0–4.6x and
+  the GPU build by 2.7–3.3x (sphere aside). Patches stay almost as good
   (1.79 against 1.64 faces held per face).
-- Host-side setup ran 10–24% slower than in milestone 2 for the CPU build
-  and 2–17% for the flat upload, neither of which changed, so the machine
-  was slower on the CPU. The arena upload took 8–52% longer, more than that
-  accounts for; it now also lays out the mask buffer.
-- The sphere's GPU build is 18x slower than the grid's at this size, and
-  9x at 523 K faces (262 against 28 ms). Its shuffled copy builds faster
-  (753 ms). This is not yet profiled.
+- Host-side setup is within a few percent of `e6f8663`. It runs 10–24%
+  slower than in milestone 2 for the CPU build and the flat upload, neither
+  of which changed, so the machine has been slower on the CPU since then.
+  The arena upload takes 8–52% longer than in milestone 2; it now also lays
+  out the mask buffer.
+- The sphere's GPU build is 13x slower than the grid's at this size, and
+  12x at 523 K faces (329 against 28 ms). It took 2.3 s at `e6f8663`. The
+  build kernels now also skip zero-filling workgroup memory, but that is
+  not shown to explain the drop. Its shuffled copy builds faster (758 ms).
+  Not yet profiled.
 
 ## Queries with a flat twin
 
@@ -156,49 +161,48 @@ The ratio is patched divided by flat; above 1 means the arena is slower.
 | Query | Grid | Grid, shuffled | Sphere | Sphere, shuffled |
 |---|---|---|---|---|
 | Face vertices | 0.65 / 0.34 (1.9x) | 1.23 / 0.86 (1.4x) | 0.73 / 0.34 (2.1x) | 1.25 / 0.86 (1.5x) |
-| Edge records | 2.67 / 1.05 (2.5x) | 3.67 / 3.66 (1.0x) | 3.26 / 1.02 (3.2x) | 3.93 / 3.65 (1.1x) |
-| Face centroids | 0.88 / 0.59 (1.5x) | 1.95 / 1.58 (1.2x) | 0.95 / 0.59 (1.6x) | 1.96 / 1.58 (1.2x) |
-| VV + FF + diamonds + edges | 4.55 / 2.83 (1.6x) | 9.83 / 13.12 (0.75x) | 5.37 / 2.84 (1.9x) | 10.10 / 13.24 (0.76x) |
-| Adjacency + 10 smoothing steps | 9.22 / 7.50 (1.2x) | 18.93 / 22.22 (0.85x) | 13.62 / 11.09 (1.2x) | 25.14 / 28.29 (0.89x) |
+| Edge records | 1.09 / 1.04 (1.05x) | 1.64 / 3.66 (0.45x) | 1.45 / 1.02 (1.4x) | 1.83 / 3.64 (0.50x) |
+| Face centroids | 0.88 / 0.59 (1.5x) | 1.95 / 1.58 (1.2x) | 0.95 / 0.59 (1.6x) | 1.96 / 1.57 (1.2x) |
+| VV + FF + diamonds + edges | 2.56 / 2.82 (0.91x) | 9.31 / 13.11 (0.71x) | 3.04 / 2.82 (1.08x) | 9.63 / 13.20 (0.73x) |
+| Adjacency + 10 smoothing steps | 7.23 / 7.49 (0.97x) | 18.39 / 22.18 (0.83x) | 11.29 / 11.07 (1.02x) | 24.65 / 28.26 (0.87x) |
 
 | Query | Torus | Torus, shuffled | Irregular | Irregular, shuffled |
 |---|---|---|---|---|
 | Face vertices | 0.76 / 0.34 (2.2x) | 1.23 / 0.86 (1.4x) | 0.70 / 0.34 (2.1x) | 1.21 / 0.86 (1.4x) |
-| Edge records | 3.21 / 1.03 (3.1x) | 3.67 / 3.66 (1.0x) | 2.90 / 1.03 (2.8x) | 3.54 / 3.67 (0.96x) |
-| Face centroids | 0.98 / 0.59 (1.7x) | 1.95 / 1.58 (1.2x) | 0.92 / 0.59 (1.6x) | 1.92 / 1.58 (1.2x) |
-| VV + FF + diamonds + edges | 5.27 / 2.81 (1.9x) | 9.94 / 13.26 (0.75x) | 5.05 / 2.92 (1.7x) | 9.71 / 13.16 (0.74x) |
-| Adjacency + 10 smoothing steps | 9.97 / 7.53 (1.3x) | 19.03 / 22.33 (0.85x) | 10.37 / 8.23 (1.3x) | 18.70 / 22.14 (0.84x) |
+| Edge records | 1.27 / 1.02 (1.25x) | 1.65 / 3.66 (0.45x) | 1.16 / 1.04 (1.12x) | 1.58 / 3.66 (0.43x) |
+| Face centroids | 0.97 / 0.58 (1.7x) | 1.95 / 1.58 (1.2x) | 0.92 / 0.59 (1.6x) | 1.92 / 1.58 (1.2x) |
+| VV + FF + diamonds + edges | 2.85 / 2.82 (1.01x) | 9.43 / 13.24 (0.71x) | 2.79 / 2.91 (0.96x) | 9.27 / 13.13 (0.71x) |
+| Adjacency + 10 smoothing steps | 7.55 / 7.52 (1.00x) | 18.50 / 22.32 (0.83x) | 8.10 / 8.23 (0.98x) | 18.26 / 22.14 (0.82x) |
 
 Median wall time for the same runs, grid in input order: face vertices 1.80 /
-1.48 ms, edge records 4.70 / 3.10 ms, centroids 3.28 / 2.97 ms, batched
-adjacency 11.5 / 10.6 ms, and adjacency plus smoothing 17.9 / 17.0 ms.
+1.50 ms, edge records 3.15 / 3.21 ms, centroids 3.27 / 3.00 ms, batched
+adjacency 9.63 / 10.70 ms, and adjacency plus smoothing 16.0 / 17.1 ms.
 
-Earlier runs, same queries, patched: edge records 6.29–7.22 ms in input
-order and 6.42–7.49 ms shuffled in milestone 2, and the same as now at
-`746a47f`. Batched adjacency took 8.22–9.29 and 15.09–16.28 ms in milestone
-2, 4.47–5.24 and 9.67–10.07 ms at `746a47f`, and 5.53–6.35 and
-10.13–10.58 ms at `ab98f19`. The flat path's GPU times are within 5% of
-milestone 2's.
+Earlier runs, same queries, patched: edge records took 6.29–7.22 ms in
+input order and 6.42–7.49 ms shuffled in milestone 2, and 2.67–3.26 and
+3.54–3.93 ms at `e6f8663`. Batched adjacency took 8.22–9.29 and
+15.09–16.28 ms in milestone 2, and 4.55–5.37 and 9.71–10.10 ms at
+`e6f8663`. The flat path's GPU times are within 5% of milestone 2's.
 
-At 523 K faces the arena is slower on every twin query (edge records
-3.5–5.4x, batched adjacency 1.4–2.2x), because the flat path's penalty for
-shuffled input is smaller there: flat edge records take 0.27–0.29 ms
-shuffled against 0.15–0.16 ms in input order. At 32 K faces every query
-takes under 1 ms of GPU time and at most about 2 ms wall, and the fixed
-per-call cost dominates.
+At 523 K faces the arena is still slower on most twin queries, because the
+flat path's penalty for shuffled input is smaller there: flat edge records
+take 0.27–0.29 ms shuffled against 0.15 ms in input order. Edge records are
+1.9–2.3x flat in input order and 1.5–1.8x shuffled, and batched adjacency
+1.1–1.2x and 0.88–1.06x. At 32 K faces every query takes under 1 ms of GPU
+time and at most about 2 ms wall, and the fixed per-call cost dominates.
 
 What the columns show:
 
 - **Edge records** cost O(1) per face: each face writes its local slot into
   its edges' entries in workgroup memory, then each owned edge reads its two
-  entries. The arena's remaining input-order gap is the staged pass itself
-  (patch records, masks, local-to-global lookups). Shuffling barely moves
-  it, because its reads stay inside one patch.
+  entries. Staging is still most of the pass; the record writes take about
+  0.3 ms at this size. Shuffling barely moves it, because its reads stay
+  inside one patch.
 - **Batched adjacency** is one staged pass for edge records, FF and
   diamonds, then the global VV count, scan and scatter. VV alone is
-  0.86–0.93 ms in input order and 2.5–2.7 ms shuffled; the staged pass is
-  most of the rest, and its global writes of FF and diamonds land scattered
-  on shuffled meshes.
+  0.86–0.96 ms in input order and 2.5–2.9 ms shuffled. On shuffled meshes
+  the staged pass's global writes of FF and diamonds land scattered, and
+  that cost did not improve.
 - **Face vertices and centroids** cost 1.2–2.2x on the arena from
   indirection (record, local IDs, global IDs) and the active and owned
   checks; they are 9–27% slower than in milestone 2.
@@ -211,29 +215,30 @@ Median GPU time (wall) in ms, patched, at 2.1 M faces and patch size 128.
 
 | Query | Grid | Grid, shuffled | Sphere | Sphere, shuffled | Torus | Torus, shuffled | Irregular | Irregular, shuffled |
 |---|---|---|---|---|---|---|---|---|
-| Vertex faces | 1.32 (3.97) | 4.46 (7.22) | 1.42 (4.10) | 4.34 (7.03) | 1.41 (4.06) | 4.88 (7.78) | 1.45 (4.13) | 4.71 (7.55) |
-| Face normals | 0.88 (3.26) | 2.42 (4.88) | 0.95 (3.33) | 1.96 (4.25) | 0.97 (3.35) | 2.67 (5.61) | 0.92 (3.30) | 2.53 (5.11) |
-| Face areas | 0.81 (2.34) | 2.49 (4.02) | 0.89 (2.39) | 1.91 (3.35) | 0.91 (2.44) | 3.05 (4.71) | 0.85 (2.36) | 2.46 (4.10) |
-| Vertex normals | 2.61 (7.00) | 12.89 (18.31) | 3.36 (7.79) | 11.78 (16.28) | 2.79 (7.07) | 13.77 (18.51) | 2.94 (7.18) | 13.78 (19.14) |
-| Boundary flags | 2.40 (3.43) | 4.41 (5.56) | 2.95 (3.95) | 3.57 (4.58) | 2.91 (3.88) | 4.42 (5.48) | 2.60 (3.61) | 4.23 (5.29) |
-| VV, edge records given | 0.86 (1.64) | 2.54 (3.38) | 0.90 (1.66) | 2.54 (3.31) | 0.87 (1.64) | 2.70 (3.44) | 0.93 (1.70) | 2.58 (3.33) |
-| 10 smoothing steps, adjacency given | 5.70 (7.69) | 11.18 (13.64) | 8.34 (10.32) | 15.17 (17.23) | 4.86 (6.89) | 12.35 (14.55) | 5.43 (7.50) | 12.42 (14.67) |
-| Sum of face areas | 0.18 (0.76) | 0.23 (0.91) | 0.14 (0.70) | 0.14 (0.73) | 0.14 (0.73) | 0.23 (0.93) | 0.18 (0.77) | 0.23 (0.89) |
-| Dot of face areas | 0.18 (0.75) | 0.18 (0.88) | 0.14 (0.69) | 0.14 (0.71) | 0.14 (0.72) | 0.19 (0.83) | 0.14 (0.72) | 0.23 (0.90) |
+| Vertex faces | 1.32 (4.03) | 4.32 (7.09) | 1.42 (4.12) | 4.34 (7.07) | 1.40 (4.12) | 4.54 (7.38) | 1.45 (4.13) | 4.63 (7.44) |
+| Face normals | 0.88 (3.30) | 1.95 (4.37) | 0.95 (3.37) | 1.96 (4.33) | 0.97 (3.37) | 2.56 (5.09) | 0.92 (3.26) | 2.52 (5.10) |
+| Face areas | 0.81 (2.33) | 1.90 (3.44) | 0.89 (2.40) | 1.91 (3.39) | 0.91 (2.42) | 2.49 (4.14) | 0.85 (2.41) | 2.46 (4.20) |
+| Vertex normals | 2.59 (7.20) | 11.49 (16.06) | 3.34 (7.88) | 11.76 (16.43) | 2.79 (7.35) | 13.55 (18.42) | 2.94 (7.45) | 13.49 (18.63) |
+| Boundary flags | 1.16 (2.08) | 1.70 (2.67) | 1.28 (2.20) | 1.50 (2.43) | 1.33 (2.32) | 2.13 (3.10) | 1.05 (1.99) | 2.01 (2.95) |
+| VV, edge records given | 0.89 (1.66) | 2.57 (3.35) | 0.89 (1.64) | 2.54 (3.29) | 0.86 (1.62) | 2.86 (3.62) | 0.96 (1.70) | 2.59 (3.51) |
+| 10 smoothing steps, adjacency given | 5.85 (7.92) | 13.32 (16.04) | 8.33 (10.36) | 15.12 (17.17) | 5.76 (7.76) | 14.48 (17.03) | 6.81 (8.78) | 13.85 (16.44) |
+| Sum of face areas | 0.17 (0.70) | 0.25 (0.94) | 0.13 (0.71) | 0.13 (0.73) | 0.17 (0.80) | 0.25 (0.95) | 0.17 (0.80) | 0.22 (0.93) |
+| Dot of face areas | 0.18 (0.67) | 0.22 (0.87) | 0.13 (0.72) | 0.13 (0.73) | 0.18 (0.75) | 0.22 (0.81) | 0.17 (0.78) | 0.22 (0.82) |
 
 - **Boundary flags** run one staged pass and write the flags directly, with
-  no edge records: 6.5–7.4 ms in milestone 2.
+  no edge records: 2.4–3.0 and 3.6–4.4 ms at `e6f8663`, and 6.5–7.4 ms in
+  milestone 2.
 - **Vertex normals** slow 3.5–4.9x on shuffled input. They gather over VF
-  rows of scattered faces. On the shuffled grid they take 12.89 ms against
-  10.42 ms in milestone 2 (24%); not investigated.
-- **Smoothing on shuffled meshes depends on the adjacency it reads.** This
-  row reuses one adjacency built at setup and took 11–14 ms on the shuffled
-  grid, torus and irregular grid. "Adjacency + 10 smoothing steps", which
-  rebuilds the adjacency every round, implies about 9 ms for the same
-  smoothing in most runs, with occasional 12–14 ms rounds. The sphere is
-  steady at about 15 ms. VV row order is unspecified and differs between
-  builds, which is the likely factor; not verified. Giving the benchmark's
-  VV row its own adjacency did not change this.
+  rows of scattered faces.
+- **Smoothing depends on the adjacency it reads.** This row reuses one
+  adjacency built at setup, so each benchmark run measures one build. At
+  patch size 128 it measured 13.3–14.5 ms on the shuffled grid, torus and
+  irregular grid, against 11.2–12.4 ms at `e6f8663`, and 5.8 against 4.9 ms
+  on the torus. A side-by-side run at patch size 512, alternating builds
+  of `e6f8663`'s code and this code, gave overlapping ranges (for example
+  4.8 against 4.9 ms on the torus), so the difference is not attributed to
+  this change. VV row order is unspecified and differs between builds,
+  which is the likely factor; not verified.
 - Reductions read one attribute linearly and are unaffected by mesh shape.
 
 ## Patch size
@@ -246,60 +251,58 @@ At 2.1 M faces:
 
 | Mesh | Patch size | Arena B/face | Faces held per face | Edge records | Batched adjacency | Boundary flags | VV | GPU build |
 |---|---:|---:|---:|---|---|---:|---:|---:|
-| grid | 32 | 123.5 | 2.338 | 8.82 / 1.05 | 11.18 / 2.82 | 8.39 | 0.84 | 157 ms |
-| grid | 128 | 83.3 | 1.636 | 2.67 / 1.05 | 4.55 / 2.83 | 2.40 | 0.86 | 126 ms |
-| grid | 512 | 65.2 | 1.307 | 1.64 / 1.04 | 3.48 / 2.81 | 1.38 | 0.84 | 145 ms |
-| grid, shuffled | 32 | 146.2 | 2.725 | 10.59 / 3.65 | 15.71 / 13.12 | 12.86 | 2.41 | 454 ms |
-| grid, shuffled | 128 | 91.8 | 1.786 | 3.67 / 3.66 | 9.83 / 13.12 | 4.41 | 2.54 | 406 ms |
-| grid, shuffled | 512 | 69.2 | 1.382 | 2.01 / 3.66 | 8.92 / 13.12 | 2.18 | 2.58 | 403 ms |
-| sphere | 32 | 158.7 | 2.953 | 10.33 / 1.02 | 12.91 / 2.85 | 9.84 | 0.89 | 6666 ms |
-| sphere | 128 | 98.1 | 1.902 | 3.26 / 1.02 | 5.37 / 2.84 | 2.95 | 0.90 | 2277 ms |
-| sphere | 512 | 72.2 | 1.435 | 1.93 / 1.02 | 3.90 / 2.84 | 1.66 | 0.90 | 470 ms |
-| sphere, shuffled | 32 | 168.6 | 3.118 | 11.02 / 3.66 | 16.14 / 13.23 | 10.51 | 2.55 | 1395 ms |
-| sphere, shuffled | 128 | 102.9 | 1.982 | 3.93 / 3.65 | 10.10 / 13.24 | 3.57 | 2.54 | 753 ms |
-| sphere, shuffled | 512 | 75.2 | 1.487 | 2.20 / 3.65 | 9.18 / 13.23 | 1.86 | 2.54 | 524 ms |
-| torus | 32 | 136.7 | 2.575 | 9.61 / 1.02 | 12.08 / 2.83 | 9.17 | 0.87 | 197 ms |
-| torus | 128 | 89.9 | 1.758 | 3.21 / 1.03 | 5.27 / 2.81 | 2.91 | 0.87 | 166 ms |
-| torus | 512 | 67.5 | 1.354 | 1.84 / 1.02 | 3.78 / 2.81 | 1.56 | 0.86 | 182 ms |
-| torus, shuffled | 32 | 146.7 | 2.733 | 10.64 / 3.67 | 15.84 / 13.24 | 12.10 | 2.52 | 536 ms |
-| torus, shuffled | 128 | 92.0 | 1.791 | 3.67 / 3.66 | 9.94 / 13.26 | 4.42 | 2.70 | 452 ms |
-| torus, shuffled | 512 | 69.5 | 1.387 | 2.02 / 3.65 | 9.01 / 13.22 | 2.23 | 2.71 | 438 ms |
-| irregular | 32 | 132.6 | 2.500 | 9.14 / 1.05 | 11.70 / 2.92 | 8.73 | 0.93 | 193 ms |
-| irregular | 128 | 87.6 | 1.713 | 2.90 / 1.03 | 5.05 / 2.92 | 2.60 | 0.93 | 157 ms |
-| irregular | 512 | 67.4 | 1.347 | 1.84 / 1.04 | 3.88 / 2.92 | 1.56 | 0.94 | 161 ms |
-| irregular, shuffled | 32 | 145.6 | 2.715 | 10.31 / 3.67 | 15.45 / 13.14 | 11.74 | 2.42 | 499 ms |
-| irregular, shuffled | 128 | 92.5 | 1.798 | 3.54 / 3.67 | 9.71 / 13.16 | 4.23 | 2.58 | 421 ms |
-| irregular, shuffled | 512 | 69.4 | 1.383 | 2.03 / 3.65 | 8.91 / 13.14 | 2.42 | 2.59 | 412 ms |
+| grid | 32 | 123.5 | 2.338 | 2.72 / 1.04 | 4.47 / 2.81 | 3.55 | 0.90 | 144 ms |
+| grid | 128 | 83.3 | 1.636 | 1.09 / 1.04 | 2.56 / 2.82 | 1.16 | 0.89 | 123 ms |
+| grid | 512 | 65.2 | 1.307 | 0.95 / 1.03 | 2.38 / 2.80 | 0.82 | 0.83 | 146 ms |
+| grid, shuffled | 32 | 146.2 | 2.725 | 4.10 / 3.66 | 10.63 / 13.10 | 5.20 | 2.56 | 458 ms |
+| grid, shuffled | 128 | 91.8 | 1.786 | 1.64 / 3.66 | 9.31 / 13.11 | 1.70 | 2.57 | 406 ms |
+| grid, shuffled | 512 | 69.2 | 1.382 | 1.38 / 3.68 | 9.05 / 13.12 | 1.75 | 2.72 | 403 ms |
+| sphere | 32 | 158.7 | 2.953 | 3.95 / 1.02 | 5.93 / 2.84 | 4.42 | 0.93 | 6611 ms |
+| sphere | 128 | 98.1 | 1.902 | 1.45 / 1.02 | 3.04 / 2.82 | 1.28 | 0.89 | 1599 ms |
+| sphere | 512 | 72.2 | 1.435 | 1.18 / 1.02 | 2.72 / 2.84 | 1.05 | 0.89 | 566 ms |
+| sphere, shuffled | 32 | 168.6 | 3.118 | 4.37 / 3.65 | 10.99 / 13.22 | 4.00 | 2.53 | 1394 ms |
+| sphere, shuffled | 128 | 102.9 | 1.982 | 1.83 / 3.64 | 9.63 / 13.20 | 1.50 | 2.54 | 758 ms |
+| sphere, shuffled | 512 | 75.2 | 1.487 | 1.58 / 3.65 | 9.37 / 13.20 | 1.27 | 2.53 | 530 ms |
+| torus | 32 | 136.7 | 2.575 | 3.30 / 1.02 | 5.19 / 2.82 | 4.04 | 0.90 | 198 ms |
+| torus | 128 | 89.9 | 1.758 | 1.27 / 1.02 | 2.85 / 2.82 | 1.33 | 0.86 | 166 ms |
+| torus | 512 | 67.5 | 1.354 | 1.06 / 1.02 | 2.56 / 2.80 | 0.93 | 0.87 | 185 ms |
+| torus, shuffled | 32 | 146.7 | 2.733 | 4.11 / 3.65 | 10.74 / 13.23 | 5.09 | 2.69 | 535 ms |
+| torus, shuffled | 128 | 92.0 | 1.791 | 1.65 / 3.66 | 9.43 / 13.24 | 2.13 | 2.86 | 453 ms |
+| torus, shuffled | 512 | 69.5 | 1.387 | 1.39 / 3.66 | 9.14 / 13.23 | 1.65 | 2.69 | 436 ms |
+| irregular | 32 | 132.6 | 2.500 | 2.96 / 1.04 | 4.89 / 2.91 | 3.59 | 0.99 | 186 ms |
+| irregular | 128 | 87.6 | 1.713 | 1.16 / 1.04 | 2.79 / 2.91 | 1.05 | 0.96 | 155 ms |
+| irregular | 512 | 67.4 | 1.347 | 1.04 / 1.03 | 2.61 / 2.90 | 0.91 | 0.93 | 162 ms |
+| irregular, shuffled | 32 | 145.6 | 2.715 | 3.85 / 3.65 | 10.30 / 13.11 | 5.13 | 2.58 | 501 ms |
+| irregular, shuffled | 128 | 92.5 | 1.798 | 1.58 / 3.66 | 9.27 / 13.13 | 2.01 | 2.59 | 424 ms |
+| irregular, shuffled | 512 | 69.4 | 1.383 | 1.38 / 3.64 | 9.02 / 13.12 | 1.77 | 2.59 | 414 ms |
 
 At 523 K faces, on the grid (the other meshes follow the same pattern):
 
 | Mesh | Patch size | Arena B/face | Faces held per face | Edge records | Batched adjacency | Boundary flags | VV | GPU build |
 |---|---:|---:|---:|---|---|---:|---:|---:|
-| grid | 32 | 123.5 | 2.337 | 1.78 / 0.16 | 2.46 / 0.64 | 1.66 | 0.25 | 33 ms |
-| grid | 128 | 83.3 | 1.635 | 0.69 / 0.16 | 1.24 / 0.64 | 0.60 | 0.25 | 28 ms |
-| grid | 512 | 65.4 | 1.311 | 0.45 / 0.15 | 1.00 / 0.65 | 0.36 | 0.25 | 32 ms |
-| grid, shuffled | 32 | 146.1 | 2.722 | 3.10 / 0.34 | 3.71 / 1.33 | 2.49 | 0.55 | 53 ms |
-| grid, shuffled | 128 | 91.5 | 1.780 | 1.17 / 0.29 | 1.88 / 1.34 | 0.82 | 0.55 | 46 ms |
-| grid, shuffled | 512 | 69.2 | 1.381 | 0.51 / 0.27 | 1.48 / 1.32 | 0.41 | 0.55 | 43 ms |
+| grid | 32 | 123.5 | 2.337 | 0.69 / 0.15 | 1.18 / 0.64 | 0.62 | 0.25 | 34 ms |
+| grid | 128 | 83.3 | 1.635 | 0.29 / 0.15 | 0.72 / 0.64 | 0.24 | 0.25 | 28 ms |
+| grid | 512 | 65.4 | 1.311 | 0.27 / 0.15 | 0.69 / 0.64 | 0.22 | 0.25 | 32 ms |
+| grid, shuffled | 32 | 146.1 | 2.722 | 1.36 / 0.29 | 1.93 / 1.45 | 1.13 | 0.57 | 53 ms |
+| grid, shuffled | 128 | 91.5 | 1.780 | 0.52 / 0.29 | 1.43 / 1.35 | 0.45 | 0.57 | 46 ms |
+| grid, shuffled | 512 | 69.2 | 1.381 | 0.35 / 0.27 | 1.27 / 1.31 | 0.28 | 0.54 | 43 ms |
 
-- **Staged edge records get faster as patches grow.** In milestone 2 they
-  grew linearly with patch size (0.61 ms at patch size 32 and 5.00 ms at
-  512, grid at 523 K faces); now they fall (1.78 and 0.45 ms). Larger
-  patches have fewer workgroups and fewer ribbon copies per face, which
-  plausibly explains it; not profiled.
+- **Staged queries get faster as patches grow**, with the largest gain
+  between 32 and 128. Larger patches have fewer workgroups and fewer
+  ribbon copies per face.
 - **Patch size 512 is the best setting measured**, and the default since
   27 November 2026, as in RXMesh. At 2.1 M faces it gives the lowest time
-  on every staged query and the least memory (65–75 B/face).
-- **Patch size 32 is about 3x slower than milestone 2** on staged edge
-  records: at 523 K faces, 1.78 ms on the grid and 2.38 ms on the sphere,
-  against 0.61 and 0.72 ms then. At 2.1 M faces it takes 8.8–11.0 ms. It is
-  the most memory-hungry setting too (124–169 B/face). The cause is not
-  profiled.
+  on every staged query except boundary flags on the shuffled grid (within
+  noise of 128), and the least memory (65–75 B/face).
+- **Patch size 32 is now close to milestone 2** on staged edge records: at
+  523 K faces, 0.69 ms on the grid and 0.97 ms on the sphere, against 0.61
+  and 0.72 ms then (1.78 and 2.38 ms at `e6f8663`). At 2.1 M faces it takes
+  2.7–4.4 ms. It is the most memory-hungry setting too (124–169 B/face).
 - **Boundary flags track edge records** at every size, since they run the
   same staging.
 - **VV does not depend on patch size**, because it is a global pass over
   the edge records.
-- **The sphere's GPU build falls as patches grow** (6.7 s at 32, 0.47 s at
+- **The sphere's GPU build falls as patches grow** (6.6 s at 32, 0.57 s at
   512, 2.1 M faces). That points to small patches around the high-valence
   poles, but the cause is not yet profiled.
 
@@ -326,7 +329,8 @@ pass count grows with the vertex count, so the adjacency dispatch counts are
 ## Limits of this baseline
 
 - One adapter (Apple M1 Max, a unified-memory GPU). Discrete GPUs may weigh
-  memory traffic and per-call overhead differently.
+  memory traffic and per-call overhead differently, and the best lane count
+  and staging size may differ there.
 - Generated meshes only. Scanned meshes have irregular valence and density;
   pass them with `MOPMESH_BENCH_OBJ`.
 - Summed pass time leaves out gaps between passes, so it understates GPU
@@ -338,6 +342,3 @@ pass count grows with the vertex count, so the adjacency dispatch counts are
   smoothing. It is not an independent GPU mesh library, and a different flat
   layout (for example one that also stores face vertices) would be faster
   still.
-- Only static meshes are measured. Editable meshes use the same layout and
-  kernels, plus spare slots; flips are timed separately by the flip
-  benchmark.
