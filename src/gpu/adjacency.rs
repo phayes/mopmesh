@@ -1,5 +1,5 @@
 use super::pipeline::{self, WORKGROUP_SIZE, check_binding, workgroups};
-use super::{EdgeConnectivity, EdgeQuery, FaceVertexQuery, GpuError, GpuMesh, scan};
+use super::{EdgeConnectivity, EdgeQuery, FaceVertexQuery, FaceVertices, GpuError, GpuMesh, scan};
 use crate::MeshId;
 use wgpu::util::DeviceExt;
 
@@ -129,40 +129,53 @@ impl AdjacencyQuery {
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
     ) -> Result<MeshAdjacency, GpuError> {
-        // Validate sizes for results and temporary buffers before allocating or recording work.
-        const RESOURCE: &str = "mesh adjacency";
-        let limits = device.limits();
-        let plan = scan::ScanPlan::new(mesh.vertex_count, &limits)?;
-        let vertex_bytes = 4 * (u64::from(mesh.vertex_count) + 1 + 4 * u64::from(mesh.edge_count));
-        let face_bytes = (12 * u64::from(mesh.face_count)).max(4);
-        let edge_bytes = (16 * u64::from(mesh.edge_count)).max(16);
-        for bytes in [vertex_bytes, face_bytes, edge_bytes] {
-            check_binding(&limits, bytes, RESOURCE)?;
-        }
-        let edge_groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
-        workgroups(&limits, mesh.face_count, RESOURCE)?;
-        let vertex_groups = mesh.vertex_count.div_ceil(WORKGROUP_SIZE);
-
-        let vertices =
-            pipeline::output_buffer(device, "MOPMesh vertex edge/neighbor CSR", vertex_bytes);
-        let faces = pipeline::output_buffer(device, "MOPMesh face neighbors", face_bytes);
-        let diamonds = pipeline::output_buffer(device, "MOPMesh edge diamonds", edge_bytes);
+        // Validate every size first; the edge and face-vertex queries then
+        // check sizes already covered here, so they cannot fail after recording.
+        let plan = AdjacencyPlan::new(
+            &device.limits(),
+            mesh.vertex_count,
+            mesh.face_count,
+            mesh.edge_count,
+        )?;
         let edges = self.edges.encode(device, encoder, mesh)?;
+        let fv = self.faces.encode(device, encoder, mesh)?;
+        Ok(self.record(device, encoder, &plan, edges, &fv))
+    }
+
+    /// Records the VE/VV, FF and diamond passes from already-recorded edge
+    /// records and face vertices, which must describe the mesh `plan` was
+    /// checked for. Records no GPU work for a mesh without edges.
+    pub(super) fn record(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdjacencyPlan,
+        edges: EdgeConnectivity,
+        fv: &FaceVertices,
+    ) -> MeshAdjacency {
+        let vertices = pipeline::output_buffer(
+            device,
+            "MOPMesh vertex edge/neighbor CSR",
+            plan.vertex_bytes,
+        );
+        let faces = pipeline::output_buffer(device, "MOPMesh face neighbors", plan.face_bytes);
+        let diamonds = pipeline::output_buffer(device, "MOPMesh edge diamonds", plan.edge_bytes);
         let result = MeshAdjacency {
             edges,
             vertices,
             faces,
             diamonds,
-            vertex_count: mesh.vertex_count,
-            face_count: mesh.face_count,
+            vertex_count: plan.vertex_count,
+            face_count: plan.face_count,
         };
-        if mesh.edge_count == 0 {
-            return Ok(result);
+        if plan.edge_count == 0 {
+            return result;
         }
+        let edge_groups = plan.edge_groups;
+        let vertex_groups = plan.vertex_count.div_ceil(WORKGROUP_SIZE);
 
         // For each edge, find the neighboring faces and their opposite vertices.
         // Write the neighbor entry for each face that touches the edge.
-        let fv = self.faces.encode(device, encoder, mesh)?;
         let bindings = pipeline::bind_buffers(
             device,
             "MOPMesh face neighbors bindings",
@@ -186,12 +199,12 @@ impl AdjacencyQuery {
         // into row offsets, then fill the rows with edge and neighbor vertex IDs.
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh vertex neighbors sizes"),
-            contents: bytemuck::cast_slice(&[mesh.vertex_count, mesh.edge_count]),
+            contents: bytemuck::cast_slice(&[plan.vertex_count, plan.edge_count]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let cursors = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("MOPMesh vertex neighbors cursors"),
-            size: plan.byte_size(),
+            size: plan.scan.byte_size(),
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -209,7 +222,7 @@ impl AdjacencyQuery {
             &bindings,
             edge_groups,
         );
-        self.scan.encode(device, encoder, &cursors, &plan);
+        self.scan.encode(device, encoder, &cursors, &plan.scan);
         pipeline::dispatch(
             encoder,
             "MOPMesh vertex neighbors initialize",
@@ -224,6 +237,50 @@ impl AdjacencyQuery {
             &bindings,
             edge_groups,
         );
-        Ok(result)
+        result
+    }
+}
+
+/// Result sizes and dispatch counts for one [`AdjacencyQuery`] run, checked
+/// against the device limits.
+pub(super) struct AdjacencyPlan {
+    scan: scan::ScanPlan,
+    vertex_bytes: u64,
+    face_bytes: u64,
+    edge_bytes: u64,
+    edge_groups: u32,
+    vertex_count: u32,
+    face_count: u32,
+    edge_count: u32,
+}
+impl AdjacencyPlan {
+    /// Checks the results, temporary buffers and dispatches for a mesh with
+    /// these counts. Returns [`GpuError::LimitsExceeded`] if any is too large.
+    pub(super) fn new(
+        limits: &wgpu::Limits,
+        vertex_count: u32,
+        face_count: u32,
+        edge_count: u32,
+    ) -> Result<Self, GpuError> {
+        const RESOURCE: &str = "mesh adjacency";
+        let scan = scan::ScanPlan::new(vertex_count, limits)?;
+        let vertex_bytes = 4 * (u64::from(vertex_count) + 1 + 4 * u64::from(edge_count));
+        let face_bytes = (12 * u64::from(face_count)).max(4);
+        let edge_bytes = (16 * u64::from(edge_count)).max(16);
+        for bytes in [vertex_bytes, face_bytes, edge_bytes] {
+            check_binding(limits, bytes, RESOURCE)?;
+        }
+        let edge_groups = workgroups(limits, edge_count, RESOURCE)?;
+        workgroups(limits, face_count, RESOURCE)?;
+        Ok(Self {
+            scan,
+            vertex_bytes,
+            face_bytes,
+            edge_bytes,
+            edge_groups,
+            vertex_count,
+            face_count,
+            edge_count,
+        })
     }
 }

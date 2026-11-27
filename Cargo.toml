@@ -14,6 +14,8 @@ bytemuck = "1"
 wesl = { version = "0.6.0", features = ["package"] }
 
 [dev-dependencies]
+# `counters` lets the benchmarks count the GPU buffers and bind groups each query creates.
+wgpu = { version = "30.0.2", features = ["counters"] }
 pollster = "0.4"
 naga = { version = "30.0.2", features = ["wgsl-in"] }
 alum = { version = "0.7.1", default-features = false }

@@ -3,7 +3,8 @@
 A rough wall-clock comparison of MOPMesh's GPU queries against the same data
 built by [Alum](https://crates.io/crates/alum) on one CPU thread. This is a
 sanity check, not the full baseline in ROADMAP milestone 2: no real-world
-meshes, no GPU timestamp queries, no allocation counts.
+meshes, no GPU timestamp queries, no allocation counts. That baseline is in
+[the baseline report](baseline_benchmark.md).
 
 ```sh
 cargo run --release --example bench_alum            # grids 128, 512, 1024

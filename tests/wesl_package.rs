@@ -90,6 +90,8 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         include_str!(concat!(env!("OUT_DIR"), "/build_arena.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/build_split.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/radix_sort.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/baseline_face_vertices.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/baseline_edges.wgsl")),
     ] {
         validate(wgsl);
     }

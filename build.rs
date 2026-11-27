@@ -31,6 +31,8 @@ fn main() {
         "build_arena",
         "build_split",
         "radix_sort",
+        "baseline_face_vertices",
+        "baseline_edges",
     ] {
         let resolver = wesl::resolver::StandardResolver::new(".");
         let compiled = wesl::Compiler::default()

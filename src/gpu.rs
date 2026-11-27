@@ -9,7 +9,13 @@ use wgpu::util::DeviceExt;
 mod adjacency;
 mod attribute;
 #[cfg(test)]
+mod baseline;
+#[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod bench_baseline;
+#[cfg(test)]
+mod bench_meshes;
 mod boundary;
 mod build;
 mod edge;

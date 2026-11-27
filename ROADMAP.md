@@ -22,9 +22,9 @@ The static API review is complete. Its contract decisions are in the README's
 shared contracts; its deferred findings are listed under
 [static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run passed 39 tests: 21 hardware-independent tests
-and 18 opt-in GPU tests (one is the GPU build benchmark, which returns at
-once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
+The last full verification run passed 42 tests: 22 hardware-independent tests
+and 20 opt-in GPU tests (two are the GPU build and baseline benchmarks, which
+return at once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
 checks passed, and all three examples ran. GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
@@ -108,6 +108,9 @@ evidence of production readiness.
 - [x] Review the static API and buffer contracts before expanding them further.
 - [ ] Stage topology in workgroup memory and evaluate patch-local traversal.
 - [ ] Demonstrate locality benefits against an unpartitioned GPU baseline.
+  The [baseline](docs/baseline_benchmark.md) exists. It shows no benefit yet:
+  only the edge and face-vertex kernels read patches, and both are slower
+  than their flat twins.
 
 ### GPU construction follow-ups
 
@@ -152,9 +155,16 @@ The GPU build is public as `GpuMeshBuilder` (see the
   Alum. Do the profiling item below before the next round.
 - [ ] **Profile the GPU build per kernel.** The benchmark's stage breakdown
   submits and waits per stage, which hides which kernel inside a stage is
-  slow. Use wgpu timestamp queries (where the adapter supports them) around
-  each dispatch, for each grid size and split, and record the results in the
-  benchmark doc before choosing the next optimization.
+  slow. Test builds can now time every compute pass: install
+  `pipeline::instrument::PASS_TIMESTAMPS`, as the baseline benchmark does.
+  Record per-kernel times for each grid size and split in the benchmark doc
+  before choosing the next optimization.
+- [ ] **Fix the GPU build's slowdown on high-valence vertices.** A 2.1 M-face
+  UV sphere (two poles of valence 1448) builds in 3.1 s against 109 ms for a
+  grid, while the CPU build is unaffected. It falls with patch size (522 K
+  faces: 1170 ms at patch size 32, 100 ms at 512) and on shuffled input, so
+  it likely comes from patches whose ribbons hold a pole's whole fan.
+  Profile per kernel on the sphere first.
 - [ ] **Maybe: a fully deterministic GPU path that matches the CPU exactly.**
   An optional mode keeping every intermediate in canonical order (sorted
   corner and patch rows) with a split the CPU can reproduce bit for bit
@@ -172,7 +182,11 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   shared-intermediate inputs.
 - [ ] **Per-call allocation (P3).** Every `encode` allocates outputs,
   scratch and uniform buffers; the scan allocates one uniform per level.
-  Measure the cost, then decide on reusable buffers.
+  Measured in the [baseline](docs/baseline_benchmark.md): batched adjacency
+  creates 16 buffers per call, and at 2.1 M faces its wall time exceeds
+  summed GPU pass time by about 8 ms on either path. That is 73% of the
+  flat path's wall time. The gap also includes encoding and inter-pass gaps.
+  Measure reusable buffers against it.
 - [ ] **Selective adjacency (P4).** `AdjacencyQuery` always computes VE/VV,
   FF and diamonds together. Measure selective execution.
 - [ ] **Explicit counts in two shaders (L3).** `face_centroids.wesl` and
@@ -182,7 +196,7 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 - [ ] **`missing_docs` (D-1).** Enable it for the public API in the release
   phase.
 
-### 3 — Static algorithms: operators implemented; costs unmeasured
+### 3 — Static algorithms: operators implemented and measured
 
 - [x] Implement face centroids and a reusable edge-length helper.
 - [x] Validate weighted boundary lengths and neighborhood statistics in downstream examples.
@@ -191,7 +205,9 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   over VF rows because WGSL has no float atomics; RXMesh scatters with
   edge-length weights instead. Their sum order follows the unordered VF row,
   so results may differ in the last bits between runs; measure the cost of
-  a fixed order before promising more. Measured costs are still open.
+  a fixed order before promising more. Costs are in the
+  [baseline report](docs/baseline_benchmark.md#queries-without-a-twin):
+  2.4 ms at 2.1 M faces, 10.4 ms with shuffled IDs.
 - [x] Add reductions and smoothing, including boundary policies and reference checks.
   Following RXMesh: whole-attribute `ReduceQuery` (sum/min/max for f32, u32,
   i32) and `DotQuery`, like its `ReduceHandle`; `SmoothQuery` takes an
@@ -252,26 +268,34 @@ local cavities. The current Cargo version does not mean that release scope is co
    with regression tests; the deferred findings are listed under
    [static API review follow-ups](#static-api-review-follow-ups) and feed the
    benchmark baseline.
-2. **Benchmark baseline.** Add representative meshes and an unpartitioned WESL
-   baseline. Measure construction/upload separately from warm GPU execution;
-   report allocations, dispatches, query throughput, bytes/triangle, scratch and
-   ribbon overhead. Record adapter, limits, patch size and timing method.
-   Acceptance: reproducible runs and a baseline report, with no assumed speedup.
-   An [approximate comparison against Alum](docs/approximate_benchmark.md)
-   exists. Host construction was rewritten after it showed construction about
-   16x slower than Alum's; it is now about 2.4x slower. Construction on the
-   GPU is in progress ([strategy](docs/gpu_build_strategy.md)); it is already
-   1.3–1.4x faster than Alum's build at 522 K faces and above.
-3. **Workgroup-local traversal experiment.** Select a bottleneck from the
-   baseline; edge incidence is a candidate because it currently scans local
-   faces per owned edge. Compare staged and existing paths with identical
+2. **Benchmark baseline — done.** The [baseline report](docs/baseline_benchmark.md)
+   compares the patch arena with an unpartitioned WESL baseline (the same
+   connectivity in global arrays) on generated grids, spheres, tori and
+   irregular grids, each also with shuffled IDs, at 32 K–2.1 M faces and
+   patch sizes 32–512. It reports setup, bytes per face, ribbon overhead,
+   wall and per-pass GPU time, dispatches, buffers and bind groups. The arena
+   is slower on every query today: edge records 5.8x and batched adjacency
+   2.9x at 2.1 M faces in input order, 1.8x and 1.15x shuffled. It uses
+   3.6–4x the memory. Scratch bytes are not measured, because Metal does not
+   report buffer memory. The [approximate comparison against Alum](docs/approximate_benchmark.md)
+   remains for the GPU build and single-thread CPU numbers.
+3. **Workgroup-local traversal experiment.** The baseline picks edge
+   incidence. The arena's edge records scan every face of the owner patch for
+   each owned edge, cost grows linearly with patch size, and boundary flags
+   share the same scan. The order-sensitive global VV/FF kernels are the
+   second target. Following the Milestone 5 direction in
+   [the local dynamics plan](docs/local_dynamics_plan.md), build the staging
+   as WESL library functions that consumer kernels call. They must handle
+   per-patch capacity, tombstoned slots and active masks, so editing kernels
+   can use them too. Settle the accessor layer with the Milestone 5 work
+   before writing it. Compare staged and existing paths with identical
    outputs. Acceptance: Alum parity and measured tradeoffs across mesh/patch
    sizes; retain or revise the approach based on evidence.
-4. **Complete useful static functionality — implemented; costs unmeasured.**
-   Edge/face attributes, normals, areas, boundary flags, reductions and
-   smoothing landed with documented contracts, reference checks and the
-   `smoothing` example. Measured costs wait on the benchmark baseline
-   (milestone 2). Still open from Phase 3: the edge-length batch API decision.
+4. **Complete useful static functionality — done.** Edge/face attributes,
+   normals, areas, boundary flags, reductions and smoothing landed with
+   documented contracts, reference checks and the `smoothing` example. Their
+   costs are in the [baseline report](docs/baseline_benchmark.md#queries-without-a-twin).
+   Still open from Phase 3: the edge-length batch API decision.
 5. **Begin local dynamics.** Use the reviewed storage/synchronization contracts
    for Phase 4. Acceptance starts with a correct single interior flip before
    parallel claims or cross-patch editing.

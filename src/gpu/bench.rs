@@ -33,7 +33,8 @@ fn median(mut run: impl FnMut()) -> Duration {
     times[RUNS / 2]
 }
 
-fn wait(device: &wgpu::Device) {
+/// Blocks until the GPU finishes all submitted work.
+pub(super) fn wait(device: &wgpu::Device) {
     device
         .poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -42,7 +43,8 @@ fn wait(device: &wgpu::Device) {
         .unwrap();
 }
 
-fn ms(time: Duration) -> String {
+/// Formats `time` in milliseconds with two decimals.
+pub(super) fn ms(time: Duration) -> String {
     format!("{:.2} ms", time.as_secs_f64() * 1e3)
 }
 

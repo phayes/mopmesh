@@ -8,9 +8,9 @@ use crate::MeshId;
 /// unspecified order. A boundary edge's missing face is [`super::INVALID_ID`].
 /// The buffer supports `STORAGE | COPY_SRC`.
 pub struct EdgeConnectivity {
-    buffer: wgpu::Buffer,
-    edge_count: u32,
-    mesh: MeshId,
+    pub(super) buffer: wgpu::Buffer,
+    pub(super) edge_count: u32,
+    pub(super) mesh: MeshId,
 }
 impl EdgeConnectivity {
     pub fn buffer(&self) -> &wgpu::Buffer {

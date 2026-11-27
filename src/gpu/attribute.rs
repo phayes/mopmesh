@@ -1,5 +1,5 @@
 use super::pipeline::{self, check_binding, workgroups};
-use super::{FaceVertexQuery, GpuError, GpuMesh};
+use super::{FaceVertexQuery, FaceVertices, GpuError, GpuMesh};
 use crate::{Attribute, EdgeHandle, Element, ElementKind, FaceHandle, MeshId, VertexHandle};
 use std::marker::PhantomData;
 use wgpu::util::DeviceExt;
@@ -274,6 +274,35 @@ impl FaceCentroidQuery {
             "face centroids",
         )
     }
+
+    /// Like [`encode`](Self::encode), from face vertices already recorded
+    /// for the mesh `positions` belongs to.
+    #[cfg(test)]
+    pub(super) fn encode_from(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        faces: &FaceVertices,
+        positions: &GpuVertexAttribute<[f32; 4]>,
+    ) -> Result<GpuFaceAttribute<[f32; 4]>, GpuError> {
+        const RESOURCE: &str = "face centroids";
+        let groups = check_face_kernel::<[f32; 4]>(
+            device,
+            faces.mesh,
+            faces.face_count,
+            positions,
+            RESOURCE,
+        )?;
+        Ok(record_face_kernel(
+            device,
+            encoder,
+            faces,
+            positions,
+            &self.pipeline,
+            RESOURCE,
+            groups,
+        ))
+    }
 }
 
 /// Records a per-face kernel that reads face vertices and positions and
@@ -289,20 +318,51 @@ pub(super) fn face_kernel<T: GpuValue>(
 ) -> Result<GpuFaceAttribute<T>, GpuError> {
     // Validate the mesh ID and sizes, including the temporary face-vertex
     // result, before allocating buffers or recording commands.
-    if mesh.mesh != positions.mesh {
+    let groups = check_face_kernel::<T>(device, mesh.mesh, mesh.face_count, positions, resource)?;
+    if mesh.face_count == 0 {
+        return Ok(GpuFaceAttribute::<T>::output(
+            device, mesh.mesh, 0, resource,
+        ));
+    }
+    let faces = face_vertices.encode(device, encoder, mesh)?;
+    Ok(record_face_kernel(
+        device, encoder, &faces, positions, pipeline, resource, groups,
+    ))
+}
+
+/// Checks the mesh ID and the sizes a per-face kernel over `face_count`
+/// faces needs, and returns its workgroup count.
+pub(super) fn check_face_kernel<T: GpuValue>(
+    device: &wgpu::Device,
+    mesh: MeshId,
+    face_count: u32,
+    positions: &GpuVertexAttribute<[f32; 4]>,
+    resource: &'static str,
+) -> Result<u32, GpuError> {
+    if mesh != positions.mesh {
         return Err(GpuError::MeshMismatch);
     }
     let limits = device.limits();
-    GpuFaceAttribute::<T>::check_output(&limits, mesh.face_count, resource)?;
-    check_binding(&limits, (u64::from(mesh.face_count) * 12).max(4), resource)?;
-    let groups = workgroups(&limits, mesh.face_count, resource)?;
+    GpuFaceAttribute::<T>::check_output(&limits, face_count, resource)?;
+    check_binding(&limits, (u64::from(face_count) * 12).max(4), resource)?;
+    workgroups(&limits, face_count, resource)
+}
 
-    // Allocate the result, then run the face-vertex query and the kernel.
-    let result = GpuFaceAttribute::<T>::output(device, mesh.mesh, mesh.face_count, resource);
-    if mesh.face_count == 0 {
-        return Ok(result);
+/// Allocates the result and records a per-face kernel over `faces`, after
+/// [`check_face_kernel`] accepted the same mesh and sizes.
+pub(super) fn record_face_kernel<T: GpuValue>(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    faces: &FaceVertices,
+    positions: &GpuVertexAttribute<[f32; 4]>,
+    pipeline: &wgpu::ComputePipeline,
+    resource: &'static str,
+    groups: u32,
+) -> GpuFaceAttribute<T> {
+    let result = GpuFaceAttribute::<T>::output(device, faces.mesh, faces.face_count, resource);
+    if faces.face_count == 0 {
+        return result;
     }
-    let faces = face_vertices.encode(device, encoder, mesh)?;
     let bindings = pipeline::bind_buffers(
         device,
         resource,
@@ -310,5 +370,5 @@ pub(super) fn face_kernel<T: GpuValue>(
         &[faces.buffer(), positions.buffer(), result.buffer()],
     );
     pipeline::dispatch(encoder, resource, pipeline, &bindings, groups);
-    Ok(result)
+    result
 }

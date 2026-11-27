@@ -63,6 +63,63 @@ pub(super) fn workgroup_grid(
     Ok([width, rows])
 }
 
+/// Benchmark instrumentation for test builds: every compute pass recorded
+/// through this module is counted and, while a [`PassTimestamps`] is
+/// installed on the thread, timed.
+#[cfg(test)]
+pub(super) mod instrument {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        /// Compute dispatches recorded on this thread.
+        pub static DISPATCHES: Cell<u64> = const { Cell::new(0) };
+        /// The timestamp set that passes recorded on this thread write to.
+        pub static PASS_TIMESTAMPS: RefCell<Option<PassTimestamps>> = const { RefCell::new(None) };
+    }
+
+    /// A timestamp query set with room for `capacity` passes. Pass `i`
+    /// writes its start to query `2i` and its end to query `2i + 1`.
+    pub struct PassTimestamps {
+        pub set: wgpu::QuerySet,
+        pub capacity: u32,
+        /// Passes recorded so far, including any beyond `capacity`, which
+        /// are not timed.
+        pub passes: u32,
+    }
+
+    /// Counts a pass and returns the query set and pass index to time it
+    /// with, if a set is installed and has room.
+    pub(super) fn next_pass() -> Option<(wgpu::QuerySet, u32)> {
+        DISPATCHES.with(|count| count.set(count.get() + 1));
+        PASS_TIMESTAMPS.with_borrow_mut(|timestamps| {
+            let t = timestamps.as_mut()?;
+            let index = t.passes;
+            t.passes += 1;
+            (index < t.capacity).then(|| (t.set.clone(), index))
+        })
+    }
+}
+
+/// Begins a compute pass labeled `label`. Test builds also count it and,
+/// while benchmark timestamps are installed, time it.
+fn begin_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
+    #[cfg(test)]
+    if let Some((set, index)) = instrument::next_pass() {
+        return encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: &set,
+                beginning_of_pass_write_index: Some(2 * index),
+                end_of_pass_write_index: Some(2 * index + 1),
+            }),
+        });
+    }
+    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    })
+}
+
 /// Like [`dispatch`], over a grid from [`workgroup_grid`].
 pub(super) fn dispatch_grid(
     encoder: &mut wgpu::CommandEncoder,
@@ -71,10 +128,7 @@ pub(super) fn dispatch_grid(
     bindings: &wgpu::BindGroup,
     [x, y]: [u32; 2],
 ) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(encoder, label);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bindings, &[]);
     pass.dispatch_workgroups(x, y, 1);
@@ -176,10 +230,7 @@ pub(super) fn dispatch(
     bindings: &wgpu::BindGroup,
     workgroups: u32,
 ) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(encoder, label);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bindings, &[]);
     pass.dispatch_workgroups(workgroups, 1, 1);
