@@ -220,11 +220,18 @@ Deferred findings from the milestone 1 review, to settle with measurements:
   `examples/smoothing.rs` composes boundary flags, smoothing, vertex normals,
   areas and reductions with its own bending shader.
 
-### 4 — Local dynamics: not started
+### 4 — Local dynamics: in progress
 
-- [ ] Introduce editable storage, active masks, capacity metadata and full conflict footprints.
-- [ ] Implement cavity discovery/staging, a single interior edge flip, then parallel compatible flips.
-- [ ] Test failure/rollback behavior and topology/attribute preservation against Alum operations.
+- [x] Introduce editable storage, active masks, capacity metadata and full conflict footprints.
+  `GpuEditableMesh` holds spare slots, active/owned/interior masks and owner
+  tables; a flip's conflict footprint is its four corner vertices.
+- [x] Implement a single interior edge flip, then parallel compatible flips.
+  `EdgeFlipQuery` runs claim, reserve and commit dispatches; downstream WESL
+  can run the same stages with its own rule through `topology::flip_pass`
+  (`examples/delaunay_flips.rs`). Cavity discovery/staging is not started.
+- [x] Test failure/rollback behavior and topology preservation against Alum operations.
+  Attribute preservation waits until attributes can be edited.
+- [ ] Run queries on editable meshes and reject results from before an edit (`GpuError::Stale`).
 
 ### 5 — Boundary dynamics: not started
 

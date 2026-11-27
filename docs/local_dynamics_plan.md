@@ -1,15 +1,25 @@
 # Milestone 5 plan: local dynamics
 
-Status: approved 26 November 2026. Steps 1, 2 and 4 are implemented; step 3
-waits on static meshes moving to the patch-record layout.
+Status: approved 26 November 2026. Steps 1, 2 and 4 are implemented, and
+step 5 apart from running queries before and after the flips; step 3 waits
+on static meshes moving to the patch-record layout, and that part of step 5
+waits on step 3.
+
+Step 5 as built: `topology::flip_pass` binds the arena, masks, claims, slots
+and batch parameters at group 1 and exposes `flip_candidate`, `flip_claim`,
+`flip_reserve` and `flip_commit`, so a downstream kernel adds its rule
+between candidate and claim. `EdgeFlipQuery::begin_pass` allocates that
+group and counts an edit; `runtime_shaders/edge_flip.wesl` is now a thin
+wrapper over the module. `examples/delaunay_flips.rs` flips a skewed grid by
+the opposite-angle rule until it settles, and its test replays the reported
+flips on the host.
 
 Step 4 as built: `EdgeFlipQuery::encode` takes a list of edges and records
 three dispatches (claim, reserve, commit). The priority hashes the
 candidate's index in the list, not its edge ID, so a repeated edge can't win
 twice; the seed is the mesh version. Slots are reserved with an atomic
 try-set in their own dispatch, before any slot is freed. Single flips go
-through the same path. A parallel downstream WESL example is left for
-step 5.
+through the same path.
 
 ## Direction: in-kernel local queries
 

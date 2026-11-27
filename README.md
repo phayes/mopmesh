@@ -26,7 +26,7 @@ work, acceptance criteria and next steps, and the
 - Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
 - GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
 - GPU boundary flags, whole-attribute reductions (sum, min, max, dot) and uniform Laplacian smoothing with optional fixed vertices, plus a downstream smoothing example.
-- An editable GPU mesh with spare per-patch slots and masks, parallel edge flips inside a patch verified against Alum, and a value-based WESL flip API that downstream kernels can apply themselves.
+- An editable GPU mesh with spare per-patch slots and masks, parallel edge flips inside a patch verified against Alum, and WESL flip APIs that let downstream kernels flip edges by their own rule, one at a time or in parallel batches (see `examples/delaunay_flips.rs`).
 - GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
@@ -42,6 +42,7 @@ cargo clippy --all-targets -- -D warnings
 cargo run --example weighted_boundary
 cargo run --example neighborhood
 cargo run --example smoothing
+cargo run --example delaunay_flips
 # Rough timing against Alum; see docs/approximate_benchmark.md:
 cargo run --release --example bench_alum
 cargo test --test gpu_topology -- --ignored --nocapture
@@ -581,37 +582,79 @@ Rules for step 5:
   could share a corner or pick the same free slot. To flip many edges at
   once, use the three-dispatch protocol below.
 
-**Flipping many edges at once from WESL.** Give each candidate an index and
-keep, per candidate, a status word, its two face slots and three reserved
-slots, plus one atomic claim word per mesh vertex, zeroed beforehand. Then
-run three dispatches with no readback between them:
+**Flipping many edges at once from WESL.** Use `topology::flip_pass` to
+choose edges with your own shader rule while the library handles competing
+requests and mesh updates. Give each request a unique index, list each edge
+at most once, and run three entry points in order: claim, reserve, then commit.
+Each stage handles one request per invocation and skips indices at or beyond
+`flip_pass_count()`. No CPU readback is needed between stages.
 
-1. **Claim.** Do steps 1–3 above, and step 4's interior and `c`–`d` checks,
-   without writing to the mesh. Leave free slots to the next dispatch. If the
-   candidate can flip, store its face slots and `atomicMax` its
-   `flip_priority(index, seed)` into the claim words of its four corners'
-   global vertex IDs.
-2. **Reserve.** Reload the candidate's two face rows and call `flip_quad`
-   again. Keep the candidate only if all four claim words still hold its
-   priority (otherwise `FLIP_LOST_CLAIM`). Then reserve one edge slot and two
-   face slots by atomic try-set: pick a slot with `free_bit`, check it is
-   below capacity, `atomicOr` its active bit, and keep it only if the bit was
-   clear before. If any of the three fails, clear the bits you set and report
-   `FLIP_OUT_OF_CAPACITY`.
-3. **Commit.** Reload the face rows, call `flip_quad` and `flip_writes` with
-   the reserved slots, and apply the writes.
+The claim stage below uses two application-defined functions:
+`edge_for_request(i)` supplies a mesh-wide edge ID, and `my_rule` decides
+whether its four vertices need a flip.
 
-Use a different index for every candidate. In the reserve and commit
-dispatches, read only the candidate's own owner entry, face rows and their
-edges' rows: other winners are changing the rest of the patch. Pass a new
-`seed` for each retry round. The header of `topology::flip` has the full
-contract.
+```wgsl
+import mopmesh::topology::flip_pass::{
+    flip_pass_count, flip_candidate, flip_claim, flip_reserve, flip_commit,
+};
+import mopmesh::topology::flip::{FLIP_DONE, FLIP_NOT_REQUESTED};
+import mopmesh::parallel::grid::flat_index;
 
-[`runtime_shaders/edge_flip.wesl`](runtime_shaders/edge_flip.wesl) is the
-library's own kernel, written with the three dispatches. The downstream example
-[`tests/shaders/flip_consumer.wesl`](tests/shaders/flip_consumer.wesl) adds a
-shorter-diagonal rule, and its test checks that it edits the mesh word for word
-like `EdgeFlipQuery`.
+@group(0) @binding(0) var<storage, read_write> status: array<u32>;
+
+@compute @workgroup_size(64)
+fn claim(@builtin(global_invocation_id) id: vec3<u32>,
+         @builtin(num_workgroups) groups: vec3<u32>) {
+    let i = flat_index(id, groups);
+    if (i >= flip_pass_count()) { return; }
+    let candidate = flip_candidate(i, edge_for_request(i));
+    var outcome = candidate.status;
+    if (outcome == FLIP_DONE && my_rule(candidate.corners)) {
+        flip_claim(i, candidate);
+    } else if (outcome == FLIP_DONE) {
+        outcome = FLIP_NOT_REQUESTED;
+    }
+    status[i] = outcome;
+}
+// reserve: if status[i] == FLIP_DONE, set status[i] = flip_reserve(i).
+// commit: call flip_commit(i).
+```
+
+`candidate.corners` contains mesh-wide vertex IDs `[a, b, c, d]`: the
+current edge joins `a` to `b`, and the replacement would join `c` to `d`.
+Read these only when the candidate status is `FLIP_DONE`. At this stage,
+that status means the edge is eligible, not that it has already flipped.
+
+In the host pipeline layout, use your application bindings as group 0 and
+`EdgeFlipQuery::pass_layout()` as group 1. For each batch, call
+`EdgeFlipQuery::begin_pass(device, &mut mesh, count)` and bind the returned
+`FlipPass::bind_group()` at group 1 for all three dispatches. Use
+`FlipPass::grid()` for the x and y workgroup counts and 1 for z with the
+64-invocation workgroups shown above. Preparing a pass increases the mesh
+version even if no dispatch follows. Do not also import
+`topology::patch_arena`, which uses group 1 too.
+
+After all claims finish, call `flip_reserve(i)` for each eligible request
+and store its returned status. After all reservations finish, call
+`flip_commit(i)` once per request. Only successfully reserved requests
+change the mesh. Final statuses follow the same rules as
+`EdgeFlipQuery::encode`: requests that share a vertex may report
+`FLIP_LOST_CLAIM`, and requests without replacement storage report
+`FLIP_OUT_OF_CAPACITY`. Both can be retried in a fresh batch; retrying does
+not create additional storage.
+
+[`examples/delaunay_flips.rs`](examples/delaunay_flips.rs) and its
+[shader](examples/shaders/delaunay.wesl) demonstrate this approach on a flat,
+skewed grid. They request a flip when the angles opposite an edge sum to
+more than 180 degrees, allowing a small tolerance, and repeat batches until
+no flips or retries remain. This is the local angle test for a Delaunay
+triangulation. The library's [edge-flip kernel](runtime_shaders/edge_flip.wesl)
+uses the same stages without an application rule.
+
+If group 1 is already in use, the header of `topology::flip` explains how to
+manage the three stages with your own buffers and bindings.
+[`tests/shaders/flip_consumer.wesl`](tests/shaders/flip_consumer.wesl) provides
+a smaller example of a single flip with custom bindings.
 
 The editable arena is one `u32` buffer: a header, a 16-word record per patch,
 owner tables mapping each global ID to its owning patch and local slot, and

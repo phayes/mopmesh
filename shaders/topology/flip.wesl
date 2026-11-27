@@ -171,8 +171,9 @@ public fn flipped_faces(
 // A batch can flip several edges safely by choosing flips that share no
 // corner vertices and reserving separate storage for each. Run `claim`,
 // `reserve`, and `commit` as three ordered GPU dispatches; there is no need
-// to read results back to the CPU between them. See
-// runtime_shaders/edge_flip.wesl for a complete example.
+// to read results back to the CPU between them. Import `topology::flip_pass`
+// to use these stages with bind group 1, or follow the steps below if your
+// shader needs to manage its own bindings and buffers.
 //
 // Give every request a unique index. For each request, allocate a status
 // word and five slot indices: two for the original faces, followed by one

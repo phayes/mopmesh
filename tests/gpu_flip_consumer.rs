@@ -1,6 +1,9 @@
-//! Runs the downstream flip kernel in tests/shaders/flip_consumer.wesl, which
-//! flips an edge with the public WESL API only when that shortens it, and
-//! checks that it edits the mesh exactly as `EdgeFlipQuery` does.
+//! Checks application shaders that use the public WESL edge-flip API.
+//! The shortening rule in `tests/shaders/flip_consumer.wesl` is compared with
+//! `EdgeFlipQuery`. The Delaunay example is checked by replaying its reported
+//! flips on the CPU and testing the resulting triangles.
+#[path = "../examples/support/delaunay.rs"]
+mod delaunay;
 use mopmesh::{
     Mesh, MeshBuilder,
     gpu::{EdgeFlipQuery, EditCapacity, FlipStatus, GpuEditableMesh},
@@ -83,6 +86,117 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
             assert_eq!(read_words(&device, &queue, by_consumer.arena()), original);
         }
     }
+}
+
+/// Checks that the example reports flips with no shared vertices per batch,
+/// and that replaying those flips satisfies its angle rule within 64 batches.
+#[test]
+#[ignore = "requires a GPU adapter; run cargo test --test gpu_flip_consumer -- --ignored --nocapture"]
+fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
+    let (device, queue) = gpu_device();
+    let (mesh, positions, mut triangles) = delaunay::skewed_grid(11);
+    let mut gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("delaunay positions"),
+        contents: bytemuck::cast_slice(&positions),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let query = EdgeFlipQuery::new(&device);
+    let flips = delaunay::DelaunayFlips::new(&device, &query);
+
+    // Track edge endpoints on the CPU so reported GPU flips can be replayed
+    // and checked without using the GPU mesh storage as the reference.
+    let p = &mesh.patches()[0];
+    let mut endpoints = vec![[0u32; 2]; mesh.edge_count()];
+    for (&id, ev) in p.edge_ids().iter().zip(p.edge_vertices()) {
+        endpoints[id as usize] = ev.map(|v| p.vertex_ids()[v as usize]);
+    }
+    assert!(
+        violations(&triangles, &positions) > 0,
+        "the fixture should start with non-Delaunay edges"
+    );
+    let mut flipped_total = 0;
+    for _ in 0..64 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let status = flips
+            .encode(&device, &mut encoder, &query, &mut gpu, &buffer)
+            .unwrap();
+        queue.submit([encoder.finish()]);
+        let words = delaunay::read_words(&device, &queue, &status);
+        let round = delaunay::Round::from_statuses(&words);
+
+        // A vertex may belong to at most one successful flip in this batch.
+        let mut corners = std::collections::HashSet::new();
+        for (id, &word) in words.iter().enumerate() {
+            if FlipStatus::from_word(word) != Some(FlipStatus::Flipped) {
+                continue;
+            }
+            let quad = host_flip(&mut triangles, endpoints[id]);
+            for v in quad {
+                assert!(corners.insert(v), "two flips in one batch share vertex {v}");
+            }
+            endpoints[id] = [quad[2], quad[3]];
+        }
+        flipped_total += round.flipped;
+        if round == delaunay::Round::default() {
+            assert!(flipped_total > 0);
+            assert_eq!(violations(&triangles, &positions), 0);
+            return;
+        }
+    }
+    panic!("flipping did not settle within 64 rounds");
+}
+
+/// Applies one flip to the CPU triangles and returns `[a, b, c, d]`, with
+/// `[a, b]` the old edge and `[c, d]` the new edge. Requires one triangle in
+/// each direction along u-v; panics if either is missing.
+fn host_flip(triangles: &mut [[u32; 3]], [u, v]: [u32; 2]) -> [u32; 4] {
+    // Match both directed sides of the edge to preserve triangle orientation.
+    let runs = |t: &[u32; 3], a, b| (0..3).find(|&k| t[k] == a && t[(k + 1) % 3] == b);
+    let first = triangles.iter().position(|t| runs(t, u, v).is_some());
+    let second = triangles.iter().position(|t| runs(t, v, u).is_some());
+    let (first, second) = (first.unwrap(), second.unwrap());
+    let opposite = |t: &[u32; 3], a, b| *t.iter().find(|&&x| x != a && x != b).unwrap();
+    let (a, b) = (u, v);
+    let c = opposite(&triangles[first], a, b);
+    let d = opposite(&triangles[second], a, b);
+    triangles[first] = [a, d, c];
+    triangles[second] = [d, b, c];
+    [a, b, c, d]
+}
+
+/// Counts interior edges that fail the example's Delaunay angle test:
+/// the two opposite angles sum to more than 180 degrees plus 0.001 radians.
+/// Positions are indexed by mesh-wide vertex ID; triangles must have
+/// consistent orientation and nonzero edge lengths.
+fn violations(triangles: &[[u32; 3]], positions: &[[f32; 4]]) -> usize {
+    let angle = |at: u32, p: u32, q: u32| {
+        let o = positions[at as usize];
+        let (p, q) = (positions[p as usize], positions[q as usize]);
+        let u = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+        let w = [q[0] - o[0], q[1] - o[1], q[2] - o[2]];
+        let dot = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+        let len = |x: [f32; 3]| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+        (dot / (len(u) * len(w))).clamp(-1.0, 1.0).acos()
+    };
+    // Store each triangle's opposite angle under its directed edge. The
+    // reverse edge supplies the angle in the neighboring triangle.
+    let mut opposite = std::collections::HashMap::new();
+    for t in triangles {
+        for k in 0..3 {
+            let (a, b, c) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+            opposite.insert((a, b), angle(c, a, b));
+        }
+    }
+    opposite
+        .iter()
+        .filter(|&(&(a, b), &theta)| {
+            a < b
+                && opposite
+                    .get(&(b, a))
+                    .is_some_and(|&other| theta + other > std::f32::consts::PI + 1e-3)
+        })
+        .count()
 }
 
 /// A 9 x 9 grid in one patch with x shifted by `shear * y`, its positions as

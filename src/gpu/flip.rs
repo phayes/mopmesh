@@ -71,10 +71,40 @@ impl GpuFlipStatuses {
     }
 }
 
+/// Bindings and dispatch dimensions for one batch of application-defined
+/// edge flips using `topology::flip_pass`.
+///
+/// Create a pass with [`EdgeFlipQuery::begin_pass`]. Bind it at group 1 for
+/// three ordered dispatches: claim, reserve, then commit. Use a fresh pass
+/// for each batch; its request state must not be reused.
+pub struct FlipPass {
+    bind_group: wgpu::BindGroup,
+    count: u32,
+    grid: [u32; 2],
+}
+impl FlipPass {
+    /// The bindings to set at group 1 in all three dispatches for this batch.
+    pub fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.bind_group
+    }
+    /// Number of requests, also available in WESL as `flip_pass_count()`.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+    /// Workgroup counts `[x, y]` for shaders using `@workgroup_size(64)` and
+    /// `parallel::grid::flat_index`. Dispatch with a z count of 1, and skip
+    /// invocations whose index is at least [`count`](Self::count).
+    /// Returns `[0, 0]` for an empty batch.
+    pub fn grid(&self) -> [u32; 2] {
+        self.grid
+    }
+}
+
 /// Records batches of edge flips on a [`GpuEditableMesh`].
 /// Create one per device and reuse it for subsequent batches.
 pub struct EdgeFlipQuery {
-    layout: wgpu::BindGroupLayout,
+    requests: wgpu::BindGroupLayout,
+    pass: wgpu::BindGroupLayout,
     claim: wgpu::ComputePipeline,
     reserve: wgpu::ComputePipeline,
     commit: wgpu::ComputePipeline,
@@ -88,20 +118,25 @@ impl EdgeFlipQuery {
             "MOPMesh edge flip",
             include_str!(concat!(env!("OUT_DIR"), "/edge_flip.wgsl")),
         );
+
+        // Keep request IDs and results in group 0. Group 1 matches the
+        // `topology::flip_pass` bindings used by application shaders too.
         let write = Storage { read_only: false };
-        let (layout, pipeline_layout) = pipeline::buffer_layout(
+        let (requests, _) = pipeline::buffer_layout(
             device,
-            "MOPMesh edge flip",
-            &[
-                Uniform,
-                Storage { read_only: true },
-                write,
-                write,
-                write,
-                write,
-                write,
-            ],
+            "MOPMesh edge flip requests",
+            &[Storage { read_only: true }, write],
         );
+        let (pass, _) = pipeline::buffer_layout(
+            device,
+            "MOPMesh edge flip pass",
+            &[write, write, write, write, Uniform],
+        );
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("MOPMesh edge flip"),
+            bind_group_layouts: &[Some(&requests), Some(&pass)],
+            immediate_size: 0,
+        });
         let stage = |entry| {
             pipeline::compute_pipeline(
                 device,
@@ -115,8 +150,71 @@ impl EdgeFlipQuery {
             claim: stage("claim"),
             reserve: stage("reserve"),
             commit: stage("commit"),
-            layout,
+            requests,
+            pass,
         }
+    }
+
+    /// The bind group layout required by WESL shaders importing
+    /// `topology::flip_pass`. Place it at index 1 in the pipeline layout;
+    /// use index 0 for application bindings.
+    pub fn pass_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.pass
+    }
+
+    /// Prepares bindings for `count` requests on `mesh` using application
+    /// shaders that import `topology::flip_pass`. This does not record GPU work.
+    /// Record claim, reserve, and commit dispatches with the returned pass,
+    /// in that order, before starting another batch on the same mesh.
+    ///
+    /// Every successful call increases [`GpuEditableMesh::version`], including
+    /// an empty batch or a pass that is never dispatched. Later batches may
+    /// choose different winners among requests that share vertices.
+    ///
+    /// Returns [`GpuError::LimitsExceeded`] if the requests or mesh exceed
+    /// the device's buffer or dispatch limits; on error the version is unchanged.
+    pub fn begin_pass(
+        &self,
+        device: &wgpu::Device,
+        mesh: &mut GpuEditableMesh,
+        count: u32,
+    ) -> Result<FlipPass, GpuError> {
+        // Check buffer sizes and dispatch dimensions before allocating or counting an edit.
+        const RESOURCE: &str = "edge flips";
+        let limits = device.limits();
+        let slot_bytes = u64::from(count) * u64::from(SLOT_WORDS) * 4;
+        pipeline::check_binding(&limits, slot_bytes, RESOURCE)?;
+        pipeline::check_binding(&limits, u64::from(mesh.vertex_count()) * 4, RESOURCE)?;
+        let grid = pipeline::workgroup_grid(&limits, count, RESOURCE)?;
+
+        // Fresh buffers provide zeroed claims and request state. Use the current
+        // version as the priority seed, then count this batch as an edit.
+        // The two trailing parameter words pad the shader uniform layout.
+        let seed = mesh.version() as u32;
+        mesh.bump_version();
+        let words = |n: u64| (n * 4).max(4);
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOPMesh edge flip parameters"),
+            contents: bytemuck::cast_slice(&[count, seed, 0, 0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let claims = pipeline::output_buffer(
+            device,
+            "MOPMesh edge flip claims",
+            words(u64::from(mesh.vertex_count())),
+        );
+        let slots = pipeline::output_buffer(device, "MOPMesh edge flip slots", slot_bytes.max(4));
+        let bind_group = pipeline::bind_buffers(
+            device,
+            "MOPMesh edge flip pass",
+            &self.pass,
+            &[mesh.arena(), mesh.masks(), &claims, &slots, &params],
+        );
+        Ok(FlipPass {
+            bind_group,
+            count,
+            grid,
+        })
     }
 
     /// Records a batch of flips for the mesh-wide edge IDs in `edges`.
@@ -151,25 +249,16 @@ impl EdgeFlipQuery {
         mesh: &mut GpuEditableMesh,
         edges: &[u32],
     ) -> Result<GpuFlipStatuses, GpuError> {
-        // Reject requests that exceed device limits before allocating buffers.
-        const RESOURCE: &str = "edge flips";
-        let limits = device.limits();
-        let count = u32::try_from(edges.len())
-            .map_err(|_| GpuError::LimitsExceeded { resource: RESOURCE })?;
-        let slot_bytes = u64::from(count) * u64::from(SLOT_WORDS) * 4;
-        pipeline::check_binding(&limits, slot_bytes, RESOURCE)?;
-        pipeline::check_binding(&limits, u64::from(mesh.vertex_count()) * 4, RESOURCE)?;
-        let grid = pipeline::workgroup_grid(&limits, count, RESOURCE)?;
-
-        // Advance the version even for an empty batch, which gets a one-word
-        // status buffer but has no results to read.
-        let seed = mesh.version() as u32;
-        mesh.bump_version();
-        let words = |n: u64| (n * 4).max(4);
+        // Preparing the pass counts an edit even when there are no requests.
+        // An empty result still needs a nonzero buffer size, but has no readable statuses.
+        let count = u32::try_from(edges.len()).map_err(|_| GpuError::LimitsExceeded {
+            resource: "edge flips",
+        })?;
+        let pass = self.begin_pass(device, mesh, count)?;
         let status = pipeline::output_buffer(
             device,
             "MOPMesh edge flip statuses",
-            words(u64::from(count)),
+            (u64::from(count) * 4).max(4),
         );
         if count == 0 {
             return Ok(GpuFlipStatuses {
@@ -177,45 +266,32 @@ impl EdgeFlipQuery {
                 len: 0,
             });
         }
-        // Match the shader parameter layout, including its two padding words.
-        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh edge flip parameters"),
-            contents: bytemuck::cast_slice(&[count, seed, 0, 0]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
         let requests = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh edge flip requests"),
             contents: bytemuck::cast_slice(edges),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let claims = pipeline::output_buffer(
-            device,
-            "MOPMesh edge flip claims",
-            words(u64::from(mesh.vertex_count())),
-        );
-        let slots = pipeline::output_buffer(device, "MOPMesh edge flip slots", slot_bytes);
         let bindings = pipeline::bind_buffers(
             device,
-            "MOPMesh edge flip bindings",
-            &self.layout,
-            &[
-                &params,
-                &requests,
-                mesh.arena(),
-                mesh.masks(),
-                &claims,
-                &slots,
-                &status,
-            ],
+            "MOPMesh edge flip requests",
+            &self.requests,
+            &[&requests, &status],
         );
 
-        // Run the three stages in order so each sees the previous stage's results.
+        // Separate dispatches let each stage read the completed results
+        // of the previous stage.
         for (label, stage) in [
             ("MOPMesh edge flip claim", &self.claim),
             ("MOPMesh edge flip reserve", &self.reserve),
             ("MOPMesh edge flip commit", &self.commit),
         ] {
-            pipeline::dispatch_grid(encoder, label, stage, &bindings, grid);
+            pipeline::dispatch_grid_groups(
+                encoder,
+                label,
+                stage,
+                &[&bindings, pass.bind_group()],
+                pass.grid(),
+            );
         }
         Ok(GpuFlipStatuses {
             buffer: status,
@@ -224,9 +300,9 @@ impl EdgeFlipQuery {
     }
 }
 
-/// Five words per request: two original face slots, one reserved edge slot,
-/// and two reserved face slots. Must match `runtime_shaders/edge_flip.wesl`.
-const SLOT_WORDS: u32 = 5;
+/// Number of `u32` words allocated for each request's temporary state.
+/// Keep this equal to `SLOT_WORDS` in `shaders/topology/flip_pass.wesl`.
+const SLOT_WORDS: u32 = 7;
 
 #[cfg(test)]
 mod tests {
