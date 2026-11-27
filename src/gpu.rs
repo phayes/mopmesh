@@ -21,8 +21,10 @@ mod bench_meshes;
 #[cfg(test)]
 mod bench_migration;
 mod boundary;
-// Test-only until cross-patch flips use it.
 mod build;
+// Test-only until cross-patch flips use them.
+#[cfg(test)]
+mod cavity_migrate;
 #[cfg(test)]
 mod cavity_rounds;
 mod edge;

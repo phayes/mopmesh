@@ -261,6 +261,56 @@ pub(super) fn buffer_layout(
     (group, pipeline)
 }
 
+/// Creates a buffer bind-group layout with each entry at the binding number
+/// paired with it, visible to compute shaders.
+#[cfg(test)]
+pub(super) fn buffer_layout_at(
+    device: &wgpu::Device,
+    label: &str,
+    bindings: &[(u32, wgpu::BufferBindingType)],
+) -> wgpu::BindGroupLayout {
+    let entries: Vec<_> = bindings
+        .iter()
+        .map(|&(binding, ty)| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        })
+        .collect();
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &entries,
+    })
+}
+
+/// Creates a bind group with each entire buffer bound at the binding number
+/// paired with it. The bindings must match `layout`.
+#[cfg(test)]
+pub(super) fn bind_buffers_at(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &[(u32, &wgpu::Buffer)],
+) -> wgpu::BindGroup {
+    let entries: Vec<_> = buffers
+        .iter()
+        .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+            binding,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &entries,
+    })
+}
+
 /// Creates a bind group with each entire buffer bound at its slice index.
 /// The buffers must match the types and order required by `layout`.
 pub(super) fn bind_buffers(

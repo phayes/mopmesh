@@ -11,6 +11,11 @@
 // - A lookup that must see a set or erase made by another invocation in the
 //   same dispatch must follow it across a `storageBarrier` (same workgroup)
 //   or a dispatch boundary.
+//
+// To add IDs from many invocations at once without knowing whether another
+// invocation adds the same ID, use `map_claim`, then `map_take` and
+// `map_set` in a later dispatch; their own comments give their rules.
+// `map_clear` empties a map so a workgroup can rebuild it.
 
 @group(1) @binding(7) var<storage, read_write> maps: array<atomic<u32>>;
 
@@ -103,6 +108,75 @@ public fn map_set(p: u32, kind: u32, global: u32, slot: u32) -> bool {
         probes++;
     }
     return false;
+}
+
+// Results of `map_claim`.
+// The ID was added, with no slot yet; `map_take` hands it to one caller.
+public const MAP_CLAIM_NEW: u32 = 0u;
+// The ID was already present, with or without a slot.
+public const MAP_CLAIM_HELD: u32 = 1u;
+// The ID was not present and the map has no never-used entry left.
+public const MAP_CLAIM_FULL: u32 = 2u;
+
+// Slot value of an entry handed out by `map_take`, until `map_set` stores
+// the real slot.
+const MAP_RESERVED: u32 = 0xfffffffeu;
+
+// Adds mesh-wide ID `global` of `kind` to patch `p`'s map without a slot,
+// unless it is already present. Any number of invocations may claim the
+// same or different IDs at once, from any workgroups; each ID is added once.
+// Erased entries are not reused, so a map can fill up before it holds as
+// many IDs as it has entries. Don't call `map_set` or `map_erase` on this
+// map in the same dispatch. `map_find` returns MAP_MISSING for an ID added
+// here until `map_set` gives it a slot.
+public fn map_claim(p: u32, kind: u32, global: u32) -> u32 {
+    let t = map_table(p, kind);
+    var at = map_hash(global) & (t.entries - 1u);
+    var probes = 0u;
+    while (probes < t.entries) {
+        let e = t.offset + 2u * at;
+        let key = atomicLoad(&maps[e]);
+        if (key == global) { return MAP_CLAIM_HELD; }
+        if (key == MAP_EMPTY) {
+            let claim = atomicCompareExchangeWeak(&maps[e], MAP_EMPTY, global);
+            if (claim.exchanged) { return MAP_CLAIM_NEW; }
+            // Retry a spurious failure; otherwise another invocation took
+            // the entry, perhaps for this same ID.
+            if (claim.old_value == MAP_EMPTY) { continue; }
+            if (claim.old_value == global) { return MAP_CLAIM_HELD; }
+        }
+        at = (at + 1u) & (t.entries - 1u);
+        probes++;
+    }
+    return MAP_CLAIM_FULL;
+}
+
+// Returns true for exactly one caller per ID added by `map_claim` that has
+// no slot yet; that caller must then store its slot with `map_set`. Returns
+// false for every other caller, and for IDs that already have a slot or are
+// not present. Use it in a later dispatch than the claims.
+public fn map_take(p: u32, kind: u32, global: u32) -> bool {
+    let e = map_entry(map_table(p, kind), global);
+    if (e == MAP_MISSING) { return false; }
+    var take = atomicCompareExchangeWeak(&maps[e + 1u], MAP_MISSING, MAP_RESERVED);
+    // Retry spurious failures.
+    while (!take.exchanged && take.old_value == MAP_MISSING) {
+        take = atomicCompareExchangeWeak(&maps[e + 1u], MAP_MISSING, MAP_RESERVED);
+    }
+    return take.exchanged;
+}
+
+// Empties patch `p`'s map for `kind`, for rebuilding it with `map_set`.
+// Spread the work over a workgroup: each invocation passes its own `first`
+// (such as its local index) and the workgroup size as `step`. Nothing else
+// may use this map until every invocation has finished and passed a
+// `storageBarrier`.
+public fn map_clear(p: u32, kind: u32, first: u32, step: u32) {
+    let t = map_table(p, kind);
+    for (var at = first; at < t.entries; at += step) {
+        atomicStore(&maps[t.offset + 2u * at], MAP_EMPTY);
+        atomicStore(&maps[t.offset + 2u * at + 1u], MAP_MISSING);
+    }
 }
 
 // Removes `global` of `kind` from patch `p`'s map. Returns false if the

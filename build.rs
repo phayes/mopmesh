@@ -21,6 +21,7 @@ fn main() {
         "smooth",
         "edge_flip",
         "cavity_rounds",
+        "cavity_migrate",
         "scan",
         "edges",
         "vertex_neighbors",

@@ -161,6 +161,17 @@ pub(super) struct Quad {
 
 impl Sim {
     pub(super) fn new(positions: &[[f32; 3]], triangles: &[[u32; 3]], patch_size: u32) -> Self {
+        Self::with_capacity(positions, triangles, patch_size, CAPACITY)
+    }
+
+    /// Like `new`, with `capacity` times as many slots per patch as it
+    /// starts with, rounded up, as `EditCapacity` gives.
+    pub(super) fn with_capacity(
+        positions: &[[f32; 3]],
+        triangles: &[[u32; 3]],
+        patch_size: u32,
+        capacity_factor: f64,
+    ) -> Self {
         let mesh = MeshBuilder::new()
             .patch_size(patch_size as usize)
             .positions(positions)
@@ -203,7 +214,7 @@ impl Sim {
             }
             let ids = [p.vertex_ids(), p.edge_ids(), p.face_ids()];
             held.push(ids.map(|ids| ids.iter().copied().collect::<HashSet<u32>>()));
-            capacity.push(ids.map(|ids| (ids.len() as f64 * CAPACITY).ceil() as usize));
+            capacity.push(ids.map(|ids| (ids.len() as f64 * capacity_factor).ceil() as usize));
         }
         let edge_of = ends
             .iter()
@@ -263,7 +274,7 @@ impl Sim {
     }
 
     /// Returns the patch owning every face at `v`, if one patch does.
-    fn interior_to(&self, v: u32) -> Option<u32> {
+    pub(super) fn interior_to(&self, v: u32) -> Option<u32> {
         let faces = &self.star[v as usize];
         let p = self.owner[FACE][faces[0] as usize];
         faces
@@ -579,6 +590,74 @@ impl Sim {
         angle(c) + angle(d) > std::f64::consts::PI + 1e-6
     }
 
+    /// Makes patch `p` own `faces` and their vertices and edges, importing
+    /// the copies it then needs. Returns how many vertex, edge and face
+    /// copies it imported, or `None`, changing nothing, if they don't fit
+    /// in its capacity.
+    pub(super) fn migrate(&mut self, p: u32, faces: &BTreeSet<u32>) -> Option<[usize; 3]> {
+        let pu = p as usize;
+        let mut owned: HashSet<u32> = self.owned_faces[pu].clone();
+        owned.extend(faces.iter().copied());
+        let need = self.required(owned.iter());
+        let missing: [usize; 3] = [0, 1, 2].map(|k| need[k].difference(&self.held[pu][k]).count());
+        if (0..3).any(|k| self.held[pu][k].len() + missing[k] > self.capacity[pu][k]) {
+            return None;
+        }
+
+        // Take ownership of the faces and their vertices and edges.
+        for &f in faces {
+            let old = self.owner[FACE][f as usize];
+            if old != p {
+                self.owned_faces[old as usize].remove(&f);
+                self.moves[f as usize] += 1;
+                self.owner[FACE][f as usize] = p;
+            }
+            for v in self.triangles[f as usize] {
+                self.owner[VERTEX][v as usize] = p;
+            }
+            for e in self.face_edges(f) {
+                self.owner[EDGE][e as usize] = p;
+            }
+        }
+        self.owned_faces[pu] = owned;
+        for k in 0..3 {
+            self.held[pu][k].extend(need[k].iter().copied());
+        }
+        self.record_peak(pu);
+        Some(missing)
+    }
+
+    /// Makes patch `q` hold exactly the copies its owned faces need. Returns
+    /// how many needed copies it lacked, which must be 0.
+    pub(super) fn clean(&mut self, q: u32) -> usize {
+        let need = self.required(self.owned_faces[q as usize].iter());
+        let gaps = (0..3)
+            .map(|k| need[k].difference(&self.held[q as usize][k]).count())
+            .sum();
+        self.held[q as usize] = need;
+        gaps
+    }
+
+    /// The vertex, edge or face IDs patch `p` holds copies of.
+    pub(super) fn held(&self, p: u32, kind: usize) -> &HashSet<u32> {
+        &self.held[p as usize][kind]
+    }
+
+    /// The patch owning element `id` of `kind`.
+    pub(super) fn owner(&self, kind: usize, id: u32) -> u32 {
+        self.owner[kind][id as usize]
+    }
+
+    /// The endpoints of edge `e`.
+    pub(super) fn edge_ends(&self, e: u32) -> [u32; 2] {
+        self.ends[e as usize]
+    }
+
+    /// The vertices of face `f`.
+    pub(super) fn triangle(&self, f: u32) -> [u32; 3] {
+        self.triangles[f as usize]
+    }
+
     fn record_peak(&mut self, p: usize) {
         for k in 0..3 {
             let ratio = self.held[p][k].len() as f64 / self.capacity[p][k].max(1) as f64;
@@ -682,40 +761,13 @@ impl Sim {
             // Act, then clean up every footprint patch.
             let mut dirty = BTreeSet::new();
             for (p, faces, fp, flips) in winners {
-                let pu = p as usize;
-                let mut owned: HashSet<u32> = self.owned_faces[pu].clone();
-                owned.extend(faces.iter().copied());
-                let need = self.required(owned.iter());
-                let missing: [usize; 3] =
-                    [0, 1, 2].map(|k| need[k].difference(&self.held[pu][k]).count());
-                if (0..3).any(|k| self.held[pu][k].len() + missing[k] > self.capacity[pu][k]) {
+                let Some(missing) = self.migrate(p, &faces) else {
                     for (e, _) in flips {
                         status.insert(e, Status::OutOfCapacity);
                     }
                     continue;
-                }
+                };
                 stats.imported_faces.push(missing[FACE]);
-
-                // Take ownership of the faces and their vertices and edges.
-                for &f in &faces {
-                    let old = self.owner[FACE][f as usize];
-                    if old != p {
-                        self.owned_faces[old as usize].remove(&f);
-                        self.moves[f as usize] += 1;
-                        self.owner[FACE][f as usize] = p;
-                    }
-                    for v in self.triangles[f as usize] {
-                        self.owner[VERTEX][v as usize] = p;
-                    }
-                    for e in self.face_edges(f) {
-                        self.owner[EDGE][e as usize] = p;
-                    }
-                }
-                self.owned_faces[pu] = owned;
-                for k in 0..3 {
-                    self.held[pu][k].extend(need[k].iter().copied());
-                }
-                self.record_peak(pu);
 
                 // Flip the planned edges, in priority order.
                 for (e, q) in flips {
@@ -732,11 +784,7 @@ impl Sim {
                 dirty.extend(fp);
             }
             for q in dirty {
-                let need = self.required(self.owned_faces[q as usize].iter());
-                for k in 0..3 {
-                    stats.ribbon_gaps += need[k].difference(&self.held[q as usize][k]).count();
-                }
-                self.held[q as usize] = need;
+                stats.ribbon_gaps += self.clean(q);
             }
             round += 1;
         }

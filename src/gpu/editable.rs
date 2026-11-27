@@ -702,6 +702,43 @@ pub(super) mod inspect {
             }
         }
     }
+
+    /// Panics unless every patch holds only what it needs: its owned
+    /// elements, and every face at a vertex of a face it owns, with their
+    /// edges and vertices. `check_invariants` checks the converse.
+    pub fn check_exact_ribbons(arena: &[u32], masks: &[u32]) {
+        let views = patch_views(arena, masks);
+        let faces: Vec<[u32; 3]> = (0..arena[layout::FACE_COUNT])
+            .map(|f| face_vertices(arena, f))
+            .collect();
+        let mut star = vec![Vec::new(); arena[layout::VERTEX_COUNT] as usize];
+        for (f, t) in faces.iter().enumerate() {
+            for &v in t {
+                star[v as usize].push(f);
+            }
+        }
+        let sorted_edge = |a: u32, b: u32| [a.min(b), a.max(b)];
+
+        for (p, view) in views.iter().enumerate() {
+            // Faces at a vertex of an owned face, with their edges and vertices.
+            let mut vertices = view.owned_vertices.clone();
+            let mut edges = view.owned_edges.clone();
+            let mut needed_faces = view.owned_faces.clone();
+            for owned in &view.owned_faces {
+                for &v in owned {
+                    for &g in &star[v as usize] {
+                        let [a, b, c] = faces[g];
+                        needed_faces.insert(rotate(faces[g]));
+                        vertices.extend([a, b, c]);
+                        edges.extend([sorted_edge(a, b), sorted_edge(b, c), sorted_edge(c, a)]);
+                    }
+                }
+            }
+            assert_eq!(view.faces, needed_faces, "patch {p}: faces held");
+            assert_eq!(view.edges, edges, "patch {p}: edges held");
+            assert_eq!(view.vertices, vertices, "patch {p}: vertices held");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -27,11 +27,15 @@
 //      priority at all four corners become CAVITY_SELECTED and use up their
 //      corners; the others become pending again.
 //
+// To carry out the selected edits, run the stages of
+// `topology::cavity_migrate` next; `cavity_conclude` runs among them and
+// turns the requests of acting patches without room into CAVITY_FAILED.
+//
 // Selected requests of different acting patches have disjoint footprints,
 // so their patches can edit independently. Every round selects at least one
 // request, unless every pending one has lost to a used corner. Run the
 // stages as separate dispatches in this order; each reads what the previous
-// one wrote. Before each round, clear the vertex records and patch locks to
+// one wrote. Before each round, clear the vertex records and patch words to
 // zero.
 //
 // Importing this module binds the mesh read-only through
@@ -57,9 +61,26 @@ public const CAVITY_WON: u32 = 2u;
 public const CAVITY_SELECTED: u32 = 3u;
 // Shares a corner with a request selected in an earlier round.
 public const CAVITY_LOST: u32 = 4u;
+// Was selected, but its acting patch had no room for the copies it needed
+// (`topology::cavity_migrate`). Its corners are free again.
+public const CAVITY_FAILED: u32 = 5u;
 
 // Words per mesh vertex in the round's vertex records.
-public const CAVITY_VERTEX_WORDS: u32 = 12u;
+public const CAVITY_VERTEX_WORDS: u32 = 14u;
+// Offsets within a vertex record, written by `cavity_resolve` and
+// `topology::cavity_migrate`: one more than the acting patch of the
+// selected request using the vertex as a corner, and one more than the
+// acting patch whose cavity faces have the vertex as a corner. 0 when unset.
+public const CAVITY_CORNER: u32 = 12u;
+public const CAVITY_RING: u32 = 13u;
+// Words per patch in the round's patch words.
+public const CAVITY_PATCH_WORDS: u32 = 5u;
+// Offsets within a patch's words: the highest bid on the patch; nonzero if
+// the patch's edits this round failed for lack of room; then how many new
+// vertex, edge and face copies they need.
+public const CAVITY_LOCK_WORD: u32 = 0u;
+public const CAVITY_FAILED_WORD: u32 = 1u;
+public const CAVITY_NEW_WORDS: u32 = 2u;
 // Owners counted around one vertex; a vertex with more is left out of
 // choosing acting patches.
 const LEADER_SLOTS: u32 = 4u;
@@ -93,8 +114,8 @@ struct RoundParams {
 @group(2) @binding(0) var<storage, read_write> requests: array<u32>;
 // CAVITY_VERTEX_WORDS words per mesh vertex, cleared every round.
 @group(2) @binding(1) var<storage, read_write> vertex_records: array<atomic<u32>>;
-// One word per patch: the highest bid on it this round.
-@group(2) @binding(2) var<storage, read_write> patch_locks: array<atomic<u32>>;
+// CAVITY_PATCH_WORDS words per patch, cleared every round.
+@group(2) @binding(2) var<storage, read_write> patch_words: array<atomic<u32>>;
 // One word per mesh vertex: nonzero once a selected request used it. Keep
 // it for every round of a batch.
 @group(2) @binding(3) var<storage, read_write> taken: array<atomic<u32>>;
@@ -263,9 +284,10 @@ fn relay(lane: u32, r: PatchRecord, forward: bool) {
             if (bid == 0u) { continue; }
             let patches = face_footprint(r, f, vertices);
             for (var k = 0u; k < 7u; k++) {
+                let lock = CAVITY_PATCH_WORDS * patches[k] + CAVITY_LOCK_WORD;
                 if (forward) {
-                    atomicMax(&patch_locks[patches[k]], bid);
-                } else if (atomicLoad(&patch_locks[patches[k]]) != bid) {
+                    atomicMax(&patch_words[lock], bid);
+                } else if (atomicLoad(&patch_words[lock]) != bid) {
                     atomicStore(&vertex_records[record_word(v, LOST)], 1u);
                 }
             }
@@ -320,8 +342,30 @@ public fn cavity_resolve(request: u32) {
         }
     }
     requests[at] = CAVITY_SELECTED;
+    let tag = requests[at + 1u] + 1u;
     for (var i = 0u; i < 4u; i++) {
         atomicStore(&taken[c[i]], 1u);
+        atomicStore(&vertex_records[record_word(c[i], CAVITY_CORNER)], tag);
+    }
+}
+
+// After `cavity_preflight` from `topology::cavity_migrate`, for request
+// `request`: a selected request whose acting patch failed becomes
+// CAVITY_FAILED and frees its corners.
+public fn cavity_conclude(request: u32) {
+    let at = stage_word(request);
+    if (requests[at] != CAVITY_SELECTED) { return; }
+    let actor = requests[at + 1u];
+    let failed = CAVITY_PATCH_WORDS * actor + CAVITY_FAILED_WORD;
+    if (atomicLoad(&patch_words[failed]) == 0u) { return; }
+
+    // Only requests selected this round carry this round's corner marks.
+    let c = corners(request);
+    let mark = atomicLoad(&vertex_records[record_word(c.x, CAVITY_CORNER)]);
+    if (mark != actor + 1u) { return; }
+    requests[at] = CAVITY_FAILED;
+    for (var i = 0u; i < 4u; i++) {
+        atomicStore(&taken[c[i]], 0u);
     }
 }
 

@@ -4,7 +4,7 @@ import package::shaders::topology::patch::PATCH_LANES;
 import package::shaders::topology::patch_arena::{patch_count, patch_record};
 import package::shaders::topology::cavity_rounds::{
     cavity_lead, cavity_bid, cavity_relay_forward, cavity_relay_back, cavity_check,
-    cavity_claim, cavity_resolve, cavity_request_count,
+    cavity_claim, cavity_resolve, cavity_conclude, cavity_request_count,
 };
 import package::shaders::parallel::grid::{flat_index, flat_group};
 
@@ -60,4 +60,11 @@ fn claim(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) 
 fn resolve(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let i = flat_index(id, groups);
     if (i < cavity_request_count()) { cavity_resolve(i); }
+}
+
+// Runs between the migration stages; see `topology::cavity_migrate`.
+@compute @workgroup_size(64)
+fn conclude(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let i = flat_index(id, groups);
+    if (i < cavity_request_count()) { cavity_conclude(i); }
 }

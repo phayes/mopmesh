@@ -1,7 +1,10 @@
 //! Rounds that select edits which may proceed together across patch
 //! borders, using `topology::cavity_rounds`. Each round records seven
 //! dispatches: lead, bid, relay forward, relay back, check, claim and
-//! resolve.
+//! resolve. When asked to migrate, it also records the stages of
+//! `topology::cavity_migrate`, with the scheduler's conclude stage among
+//! them.
+use super::cavity_migrate::{AFTER_CONCLUDE, BEFORE_CONCLUDE, CavityMigrate};
 use super::pipeline;
 use super::{GpuEditableMesh, GpuError};
 use wgpu::util::DeviceExt;
@@ -12,8 +15,11 @@ pub(crate) const NONE: u32 = 0;
 pub(crate) const PENDING: u32 = 1;
 pub(crate) const SELECTED: u32 = 3;
 pub(crate) const LOST: u32 = 4;
+pub(crate) const FAILED: u32 = 5;
 /// Words per mesh vertex in a round's vertex records.
-const VERTEX_WORDS: u64 = 12;
+const VERTEX_WORDS: u64 = 14;
+/// Words per patch in a round's patch words; the first is the patch's lock.
+pub(crate) const PATCH_WORDS: usize = 5;
 
 /// Entry points in dispatch order, and whether each runs one workgroup per
 /// patch rather than one invocation per request.
@@ -36,6 +42,8 @@ pub(crate) struct CavityRounds {
     mesh: wgpu::BindGroupLayout,
     state: wgpu::BindGroupLayout,
     stages: Vec<wgpu::ComputePipeline>,
+    conclude: wgpu::ComputePipeline,
+    migrate: CavityMigrate,
 }
 
 /// One batch's requests and scratch words. Requests stay in `requests()`
@@ -43,9 +51,11 @@ pub(crate) struct CavityRounds {
 /// whole batch.
 pub(crate) struct CavityState {
     requests: wgpu::Buffer,
-    vertex_records: wgpu::Buffer,
-    patch_locks: wgpu::Buffer,
+    pub(super) vertex_records: wgpu::Buffer,
+    pub(super) patch_words: wgpu::Buffer,
     taken: wgpu::Buffer,
+    /// As long as the mesh's masks; used by `topology::cavity_migrate`.
+    pub(super) scratch: wgpu::Buffer,
     request_count: u32,
     seed: u32,
 }
@@ -75,42 +85,44 @@ impl CavityRounds {
             bind_group_layouts: &[Some(&empty), Some(&mesh), Some(&state)],
             immediate_size: 0,
         });
-        let stages = STAGES
-            .iter()
-            .map(|(entry, _)| {
-                pipeline::compute_pipeline(
-                    device,
-                    "MOPMesh cavity round",
-                    &module,
-                    entry,
-                    Some(&layout),
-                )
-            })
-            .collect();
+        let stage = |entry| {
+            pipeline::compute_pipeline(
+                device,
+                "MOPMesh cavity round",
+                &module,
+                entry,
+                Some(&layout),
+            )
+        };
         Self {
             empty,
             mesh,
             state,
-            stages,
+            stages: STAGES.iter().map(|(entry, _)| stage(entry)).collect(),
+            conclude: stage("conclude"),
+            migrate: CavityMigrate::new(device),
         }
     }
 
     /// Records round `round` of `state`'s batch on `mesh`. Rounds must be
-    /// recorded in order, starting at 0, with nothing that changes `mesh`
-    /// between a round's stages.
+    /// recorded in order, starting at 0, with nothing else that changes
+    /// `mesh` between a round's stages. With `migrate`, each selected
+    /// request's acting patch also takes over the faces around its corners,
+    /// or the request becomes FAILED; this counts as an edit of `mesh`.
     pub fn encode_round(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &GpuEditableMesh,
+        mesh: &mut GpuEditableMesh,
         state: &CavityState,
         round: u32,
+        migrate: bool,
     ) -> Result<(), GpuError> {
-        // Clear this round's vertex records and patch locks.
+        // Clear this round's vertex records, patch words and slot scratch.
         let limits = device.limits();
         let flat = pipeline::workgroup_grid(&limits, state.request_count, RESOURCE)?;
         let patches = pipeline::group_grid(&limits, mesh.patch_count(), RESOURCE)?;
-        for buffer in [&state.vertex_records, &state.patch_locks] {
+        for buffer in [&state.vertex_records, &state.patch_words, &state.scratch] {
             encoder.clear_buffer(buffer, 0, None);
         }
 
@@ -131,21 +143,26 @@ impl CavityRounds {
             &[
                 &state.requests,
                 &state.vertex_records,
-                &state.patch_locks,
+                &state.patch_words,
                 &state.taken,
                 &params,
             ],
         );
 
         // Run the stages in order.
+        let groups = [&empty, &mesh_group, &state_group];
         for (pipeline, &(entry, per_patch)) in self.stages.iter().zip(&STAGES) {
-            pipeline::dispatch_grid_groups(
-                encoder,
-                entry,
-                pipeline,
-                &[&empty, &mesh_group, &state_group],
-                if per_patch { patches } else { flat },
-            );
+            let grid = if per_patch { patches } else { flat };
+            pipeline::dispatch_grid_groups(encoder, entry, pipeline, &groups, grid);
+        }
+
+        // Migrate, with failed requests concluded before anything is copied.
+        if migrate {
+            let (m, before, after) = (&self.migrate, BEFORE_CONCLUDE, AFTER_CONCLUDE);
+            m.encode(device, encoder, mesh, state, before)?;
+            pipeline::dispatch_grid_groups(encoder, "conclude", &self.conclude, &groups, flat);
+            m.encode(device, encoder, mesh, state, after)?;
+            mesh.mark_edited();
         }
         Ok(())
     }
@@ -164,9 +181,10 @@ impl CavityState {
         let limits = device.limits();
         let vertex_bytes = (u64::from(mesh.vertex_count()) * 4).max(4);
         let record_bytes = vertex_bytes * VERTEX_WORDS;
-        let patch_bytes = (u64::from(mesh.patch_count()) * 4).max(4);
+        let patch_bytes = (u64::from(mesh.patch_count()) * 4 * PATCH_WORDS as u64).max(4);
         let request_bytes = (requests.len() as u64 * 4).max(4);
-        for bytes in [record_bytes, patch_bytes, request_bytes] {
+        let scratch_bytes = mesh.masks().size();
+        for bytes in [record_bytes, patch_bytes, request_bytes, scratch_bytes] {
             pipeline::check_binding(&limits, bytes, RESOURCE)?;
         }
 
@@ -191,8 +209,9 @@ impl CavityState {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             }),
             vertex_records: scratch("MOPMesh cavity vertex records", record_bytes),
-            patch_locks: scratch("MOPMesh cavity patch locks", patch_bytes),
+            patch_words: scratch("MOPMesh cavity patch words", patch_bytes),
             taken: scratch("MOPMesh cavity taken vertices", vertex_bytes),
+            scratch: scratch("MOPMesh cavity slot scratch", scratch_bytes),
             request_count: (requests.len() / REQUEST_WORDS) as u32,
             seed,
         })
@@ -204,7 +223,7 @@ impl CavityState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::MeshBuilder;
     use crate::gpu::EditCapacity;
@@ -215,7 +234,7 @@ mod tests {
 
     /// Predicts one round on the CPU: updates `words` (REQUEST_WORDS per
     /// request) and `taken` as the GPU should. Returns the selected requests.
-    fn predict_round(
+    pub(in crate::gpu) fn predict_round(
         sim: &Sim,
         words: &mut [u32],
         taken: &mut HashSet<u32>,
@@ -312,7 +331,8 @@ mod tests {
                     .triangles(&bench.triangles)
                     .build()
                     .unwrap();
-                let gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+                let mut gpu =
+                    GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
 
                 // Request every edge with two faces.
                 let mut words = Vec::with_capacity(REQUEST_WORDS * sim.edge_count());
@@ -362,7 +382,7 @@ mod tests {
 
                     let mut encoder = device.create_command_encoder(&Default::default());
                     rounds
-                        .encode_round(&device, &mut encoder, &gpu, &state, round)
+                        .encode_round(&device, &mut encoder, &mut gpu, &state, round, false)
                         .unwrap();
                     let read = test_support::read_words(&device, &queue, encoder, state.requests());
                     assert_eq!(read, words, "{context}: round {round}");
