@@ -1,6 +1,8 @@
 # MOPMesh
 
-MOPMesh is a WESL library for GPU triangle-mesh processing. Import topology,
+MOPMesh is a WESL library for GPU triangle-mesh processing. It is a wesl / rust port of the RXMesh.
+
+Import topology,
 geometry, and parallel helpers into your own compute shaders to traverse
 neighborhoods, calculate mesh properties, and flip edges. You choose the
 application buffers, entry points, and output.
