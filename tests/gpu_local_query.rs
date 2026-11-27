@@ -280,7 +280,6 @@ fn local_queries_follow_edits_with_reused_slots() {
     let fresh = fresh_flips::FreshFlips::new(&device).flip(
         &device,
         &queue,
-        &query,
         &mut gpu,
         &positions,
         &some_edges,

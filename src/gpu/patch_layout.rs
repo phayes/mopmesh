@@ -85,6 +85,71 @@ impl PatchRecord {
     }
 }
 
+/// Map-buffer words per patch at the start of the maps buffer: for vertices,
+/// edges and faces in turn, the table's word offset and its entry count.
+pub const MAP_HEADER_WORDS: usize = 6;
+/// Words per map entry: the global ID, then its local slot.
+pub const MAP_ENTRY_WORDS: u32 = 2;
+/// Key of a map entry that has never held an ID.
+pub const MAP_EMPTY: u32 = INVALID_ID;
+/// Key of a map entry whose ID was erased. Uploads never write it; only GPU
+/// edits erase entries.
+#[cfg(test)]
+pub const MAP_TOMBSTONE: u32 = INVALID_ID - 1;
+
+/// Returns the entry count of a map for `capacity` slots: a power of two at
+/// least twice the capacity.
+pub fn map_entries(capacity: u32) -> u32 {
+    (2 * capacity).max(2).next_power_of_two()
+}
+
+/// Returns a map's first probe position for `global`, before masking to the
+/// entry count. Matches `map_hash` in `shaders/topology/patch_map.wesl`.
+pub fn map_hash(global: u32) -> u32 {
+    let mut x = global;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
+
+/// Returns the maps-buffer size in words for the given per-patch capacities.
+pub fn maps_words(capacities: &[[u32; 3]]) -> u64 {
+    let tables: u64 = capacities
+        .iter()
+        .flatten()
+        .map(|&c| u64::from(MAP_ENTRY_WORDS) * u64::from(map_entries(c)))
+        .sum();
+    (MAP_HEADER_WORDS * capacities.len()) as u64 + tables
+}
+
+/// Builds the maps buffer: for each patch and element kind, an
+/// open-addressing table from global ID to local slot holding every element
+/// of `ids[p][kind]`, which fills slots from 0. Probing is linear.
+pub fn build_maps(capacities: &[[u32; 3]], ids: &[[&[u32]; 3]]) -> Vec<u32> {
+    let mut maps = vec![0; MAP_HEADER_WORDS * capacities.len()];
+    for (p, (caps, ids)) in capacities.iter().zip(ids).enumerate() {
+        for k in 0..3 {
+            let entries = map_entries(caps[k]);
+            let start = maps.len();
+            maps[MAP_HEADER_WORDS * p + 2 * k] = start as u32;
+            maps[MAP_HEADER_WORDS * p + 2 * k + 1] = entries;
+            maps.resize(start + (MAP_ENTRY_WORDS * entries) as usize, MAP_EMPTY);
+            for (slot, &global) in ids[k].iter().enumerate() {
+                let mut at = map_hash(global) & (entries - 1);
+                while maps[start + (MAP_ENTRY_WORDS * at) as usize] != MAP_EMPTY {
+                    at = (at + 1) & (entries - 1);
+                }
+                let e = start + (MAP_ENTRY_WORDS * at) as usize;
+                maps[e] = global;
+                maps[e + 1] = slot as u32;
+            }
+        }
+    }
+    maps
+}
+
 /// Words in a bitmask with one bit per slot.
 pub fn mask_words(slots: u32) -> u32 {
     slots.div_ceil(32)

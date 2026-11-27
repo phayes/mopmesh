@@ -42,18 +42,20 @@ pub(super) use super::patch_layout as layout;
 
 use layout::{append_patch, owner_patches};
 
-/// Arena and mask-buffer contents for an editable upload.
+/// Arena, mask-buffer and maps-buffer contents for an editable upload.
 pub(super) struct EditableWords {
     pub arena: Vec<u32>,
     pub masks: Vec<u32>,
+    pub maps: Vec<u32>,
 }
 
-/// Per-patch slot capacities and the total arena and mask sizes in words,
-/// computed before anything is allocated.
+/// Per-patch slot capacities and the total arena, mask and map sizes in
+/// words, computed before anything is allocated.
 struct Sizes {
     capacities: Vec<[u32; 3]>,
     arena: u64,
     masks: u64,
+    maps: u64,
 }
 
 fn sizes(mesh: &Mesh, capacity: EditCapacity) -> Option<Sizes> {
@@ -73,10 +75,12 @@ fn sizes(mesh: &Mesh, capacity: EditCapacity) -> Option<Sizes> {
         masks = masks.checked_add(layout::patch_mask_words([v, e, f], true))?;
         capacities.push([v, e, f]);
     }
+    let maps = layout::maps_words(&capacities);
     Some(Sizes {
         capacities,
         arena,
         masks,
+        maps,
     })
 }
 
@@ -98,6 +102,13 @@ pub(super) fn editable_contents(
         limits,
         sizes.masks.max(1).checked_mul(4).ok_or(too_large)?,
         MASKS,
+    )?;
+    const MAPS: &str = "editable connectivity maps";
+    let too_large = GpuError::LimitsExceeded { resource: MAPS };
+    check_binding(
+        limits,
+        sizes.maps.max(1).checked_mul(4).ok_or(too_large)?,
+        MAPS,
     )?;
 
     // Header, then placeholder records and owner tables filled in below.
@@ -146,7 +157,19 @@ pub(super) fn editable_contents(
     if masks.is_empty() {
         masks.push(0);
     }
-    Ok(EditableWords { arena, masks })
+
+    // Map every element a patch holds from its global ID to its slot.
+    let ids: Vec<[&[u32]; 3]> = mesh
+        .patches()
+        .iter()
+        .map(|p| [p.vertex_ids(), p.edge_ids(), p.face_ids()])
+        .collect();
+    let mut maps = layout::build_maps(&sizes.capacities, &ids);
+    debug_assert_eq!(maps.len() as u64, sizes.maps);
+    if maps.is_empty() {
+        maps.push(0);
+    }
+    Ok(EditableWords { arena, masks, maps })
 }
 
 /// Returns, for each global vertex, the patch owning all of its faces, or
@@ -174,11 +197,13 @@ fn interior_patches(mesh: &Mesh) -> Vec<u32> {
 
 /// Mesh connectivity uploaded with spare room for topology edits.
 ///
-/// Holds two storage buffers: the connectivity arena and its bitmasks. Both
-/// support `STORAGE | COPY_SRC`. The layouts are experimental and may change.
+/// Holds three storage buffers: the connectivity arena, its bitmasks, and
+/// maps from global IDs to local slots. All support `STORAGE | COPY_SRC`. The
+/// layouts are experimental and may change.
 pub struct GpuEditableMesh {
     arena: wgpu::Buffer,
     masks: wgpu::Buffer,
+    maps: wgpu::Buffer,
     vertex_count: u32,
     edge_count: u32,
     face_count: u32,
@@ -216,6 +241,7 @@ impl GpuEditableMesh {
         Ok(Self {
             arena: buffer("MOPMesh editable connectivity", &words.arena),
             masks: buffer("MOPMesh editable connectivity masks", &words.masks),
+            maps: buffer("MOPMesh editable connectivity maps", &words.maps),
             vertex_count: words.arena[layout::VERTEX_COUNT],
             edge_count: words.arena[layout::EDGE_COUNT],
             face_count: words.arena[layout::FACE_COUNT],
@@ -255,6 +281,23 @@ impl GpuEditableMesh {
     pub fn masks(&self) -> &wgpu::Buffer {
         &self.masks
     }
+    /// Per-patch maps from global vertex, edge and face IDs to the local slot
+    /// holding that element in the patch. Read and change them with the WESL
+    /// module `topology::patch_map`.
+    ///
+    /// Starts with six words per patch: for vertices, edges and faces in turn,
+    /// the word offset of that map and its entry count, a power of two. Each
+    /// entry is two words: a global ID, then its slot. A key of `0xffffffff`
+    /// marks an entry never used, and `0xfffffffe` one whose ID was erased.
+    /// Every active slot has exactly one entry. For a mesh with no patches,
+    /// the buffer is one zero word.
+    ///
+    /// Edits through this crate keep the maps current. A custom kernel that
+    /// moves an element to another slot must update its entry with
+    /// `map_set`.
+    pub fn maps(&self) -> &wgpu::Buffer {
+        &self.maps
+    }
     /// Returns the ID of the CPU mesh used for this upload.
     pub fn mesh_id(&self) -> MeshId {
         self.mesh
@@ -269,8 +312,15 @@ impl GpuEditableMesh {
     pub fn topology(&self) -> TopologyStamp {
         TopologyStamp::editable(self.mesh, self.upload, self.version)
     }
-    /// Counts one recorded edit.
-    pub(super) fn bump_version(&mut self) {
+    /// Counts one edit recorded by your own kernel, raising the
+    /// [`version`](Self::version) so that results computed before it are
+    /// rejected with [`GpuError::Stale`].
+    ///
+    /// Call it once for each batch of dispatches you record that may change
+    /// [`arena`](Self::arena) or [`masks`](Self::masks), before computing
+    /// results from the edited mesh. The library's own edits, such as
+    /// [`EdgeFlipQuery`](super::EdgeFlipQuery), count themselves.
+    pub fn mark_edited(&mut self) {
         self.version += 1;
     }
     /// Returns the number of face groups used to process this mesh on the GPU.
@@ -468,6 +518,190 @@ pub(super) mod inspect {
             assert_eq!(owned, counts[k], "kind {k}: one owned slot per global ID");
         }
     }
+
+    /// Returns the slot patch `p`'s map records for `global` of `kind`, if any.
+    pub fn map_find(maps: &[u32], p: usize, kind: usize, global: u32) -> Option<u32> {
+        let header = layout::MAP_HEADER_WORDS * p + 2 * kind;
+        let (offset, entries) = (maps[header], maps[header + 1]);
+        let mut at = layout::map_hash(global) & (entries - 1);
+        for _ in 0..entries {
+            let e = (offset + layout::MAP_ENTRY_WORDS * at) as usize;
+            if maps[e] == global {
+                return Some(maps[e + 1]);
+            }
+            if maps[e] == layout::MAP_EMPTY {
+                return None;
+            }
+            at = (at + 1) & (entries - 1);
+        }
+        None
+    }
+
+    /// Returns patch `p`'s live map entries of `kind`.
+    fn map_len(maps: &[u32], p: usize, kind: usize) -> usize {
+        let header = layout::MAP_HEADER_WORDS * p + 2 * kind;
+        let (offset, entries) = (maps[header] as usize, maps[header + 1] as usize);
+        (0..entries)
+            .filter(|i| maps[offset + 2 * i] < layout::MAP_TOMBSTONE)
+            .count()
+    }
+
+    /// Panics unless the arena, masks and maps keep every invariant that
+    /// edits must preserve:
+    /// - owner tables point at active owned slots, one per global ID;
+    /// - each patch holds at most one copy of an ID, and its maps record
+    ///   exactly its active slots;
+    /// - edge and face rows reference active slots, and every copy agrees
+    ///   with the owner's connectivity;
+    /// - each patch holds every face at a vertex of a face it owns, with
+    ///   their edges and vertices;
+    /// - every vertex or edge owner owns a face incident to it;
+    /// - interior bits are set exactly for vertices whose faces the patch
+    ///   owns.
+    pub fn check_invariants(arena: &[u32], masks: &[u32], maps: &[u32]) {
+        check_owner_tables(arena, masks);
+        let recs = records(arena);
+        let counts = [layout::VERTEX_COUNT, layout::EDGE_COUNT, layout::FACE_COUNT]
+            .map(|i| arena[i] as usize);
+        let owner_patch = |kind: usize, global: usize| {
+            arena[arena[layout::OWNERS[kind]] as usize + layout::OWNER_WORDS as usize * global]
+        };
+
+        // Mesh-wide connectivity from the owning copies.
+        let edges: Vec<[u32; 2]> = (0..counts[1] as u32)
+            .map(|e| edge_endpoints(arena, e))
+            .collect();
+        let faces: Vec<[u32; 3]> = (0..counts[2] as u32)
+            .map(|f| face_vertices(arena, f))
+            .collect();
+        let face_edge_ids = |r: &PatchRecord, slot: u32| {
+            [0, 1, 2].map(|i| {
+                let local = arena[(r.fe + layout::FE_WORDS * slot + 2 * i) as usize];
+                arena[(r.edge_ids + local) as usize]
+            })
+        };
+        let owner_face_edges: Vec<[u32; 3]> = (0..counts[2])
+            .map(|f| {
+                let at = arena[layout::OWNERS[2]] as usize + layout::OWNER_WORDS as usize * f;
+                face_edge_ids(&recs[arena[at] as usize], arena[at + 1])
+            })
+            .collect();
+        let mut star = vec![Vec::new(); counts[0]];
+        for (f, t) in faces.iter().enumerate() {
+            for &v in t {
+                star[v as usize].push(f);
+            }
+        }
+
+        for (p, r) in recs.iter().enumerate() {
+            let used = [0, 1, 2].map(|k| masks[r.used as usize + k]);
+            let active = |k: usize, slot: u32| bit(masks, r.active[k], slot);
+            let ids = [r.vertex_ids, r.edge_ids, r.face_ids];
+            let id = |k: usize, slot: u32| arena[(ids[k] + slot) as usize];
+
+            // One copy per ID, and maps that record exactly the active slots.
+            let mut held: [BTreeSet<u32>; 3] = Default::default();
+            for k in 0..3 {
+                for slot in (0..used[k]).filter(|&s| active(k, s)) {
+                    let global = id(k, slot);
+                    assert!(
+                        held[k].insert(global),
+                        "patch {p} kind {k}: two copies of {global}"
+                    );
+                    assert_eq!(
+                        map_find(maps, p, k, global),
+                        Some(slot),
+                        "patch {p} kind {k}: map entry for {global}"
+                    );
+                }
+                assert_eq!(
+                    map_len(maps, p, k),
+                    held[k].len(),
+                    "patch {p} kind {k}: map size"
+                );
+            }
+
+            // Rows reference active slots and agree with the owners' copies.
+            for slot in (0..used[1]).filter(|&s| active(1, s)) {
+                let at = (r.ev + layout::EV_WORDS * slot) as usize;
+                let ends = [arena[at], arena[at + 1]];
+                assert!(
+                    ends.iter().all(|&v| active(0, v)),
+                    "patch {p}: edge row to inactive vertex"
+                );
+                assert_eq!(
+                    ends.map(|v| id(0, v)),
+                    edges[id(1, slot) as usize],
+                    "patch {p}: stale copy of edge {}",
+                    id(1, slot)
+                );
+            }
+            for slot in (0..used[2]).filter(|&s| active(2, s)) {
+                let fe = (r.fe + layout::FE_WORDS * slot) as usize;
+                for i in 0..3 {
+                    assert!(
+                        active(1, arena[fe + 2 * i]),
+                        "patch {p}: face row to inactive edge"
+                    );
+                }
+                let global = id(2, slot) as usize;
+                assert_eq!(
+                    face_edge_ids(r, slot),
+                    owner_face_edges[global],
+                    "patch {p}: stale copy of face {global}"
+                );
+            }
+
+            // Ribbon completeness around owned faces.
+            let owned = |k: usize| {
+                (0..used[k])
+                    .filter(move |&s| active(k, s) && bit(masks, r.owned[k], s))
+                    .map(move |s| id(k, s) as usize)
+            };
+            let owned_faces: BTreeSet<usize> = owned(2).collect();
+            for &f in &owned_faces {
+                for &v in &faces[f] {
+                    for &g in &star[v as usize] {
+                        assert!(held[2].contains(&(g as u32)), "patch {p}: missing face {g}");
+                        for e in owner_face_edges[g] {
+                            assert!(held[1].contains(&e), "patch {p}: missing edge {e}");
+                        }
+                        for w in faces[g] {
+                            assert!(held[0].contains(&w), "patch {p}: missing vertex {w}");
+                        }
+                    }
+                }
+            }
+
+            // Vertex and edge owners own an incident face.
+            for v in owned(0) {
+                assert!(
+                    star[v].iter().any(|f| owned_faces.contains(f)),
+                    "patch {p}: owns vertex {v} but none of its faces"
+                );
+            }
+            for e in owned(1) {
+                let [a, b] = edges[e];
+                assert!(
+                    star[a as usize]
+                        .iter()
+                        .any(|f| faces[*f].contains(&b) && owned_faces.contains(f)),
+                    "patch {p}: owns edge {e} but neither of its faces"
+                );
+            }
+
+            // Interior bits mark exactly the vertices whose faces are all owned here.
+            for slot in (0..used[0]).filter(|&s| active(0, s)) {
+                let v = id(0, slot) as usize;
+                let interior = star[v].iter().all(|&f| owner_patch(2, f) == p as u32);
+                assert_eq!(
+                    bit(masks, r.interior, slot),
+                    interior,
+                    "patch {p}: interior bit of vertex {v}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +857,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_uploads_keep_every_invariant() {
+        let limits = wgpu::Limits::default();
+        for fixture in fixtures::valid() {
+            for patch_size in fixtures::PATCH_SIZES {
+                for capacity in capacities() {
+                    let (mesh, _) = test_support::reference(&fixture, patch_size, &limits).unwrap();
+                    let words = editable_contents(&mesh, capacity, &limits).unwrap();
+                    if mesh.patches().is_empty() {
+                        continue;
+                    }
+                    inspect::check_invariants(&words.arena, &words.masks, &words.maps);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn interior_bits_match_a_scan_of_each_star() {
         let limits = wgpu::Limits::default();
         let mut seen = [0usize; 2];
@@ -722,6 +973,7 @@ mod tests {
             };
             assert_eq!(read(gpu.arena()), words.arena, "{}", fixture.name);
             assert_eq!(read(gpu.masks()), words.masks, "{}", fixture.name);
+            assert_eq!(read(gpu.maps()), words.maps, "{}", fixture.name);
             assert_eq!(gpu.mesh_id(), mesh.id());
             assert_eq!(gpu.face_count() as usize, mesh.face_count());
         }

@@ -148,7 +148,8 @@ public fn flipped_faces(
 // arena and bit updates for the mask buffer. The library never touches your
 // buffers: your kernel applies the list to its own bindings. That lets one
 // kernel test its own condition, pick an edge and flip it in a single
-// dispatch. A complete kernel is runtime_shaders/edge_flip.wesl. The steps:
+// dispatch. A complete kernel is tests/shaders/flip_consumer.wesl in the
+// MOPMesh repository. The steps:
 //
 //   1. Find the edge's owning patch through the edge owner table, and decode
 //      that patch's record with `decode_record` (topology::patch).
@@ -173,6 +174,10 @@ public fn flipped_faces(
 //            else if (m.op == MASK_CLEAR) { atomicAnd(&masks[m.offset], ~m.bits); }
 //            else { atomicMax(&masks[m.offset], m.bits); }
 //        }
+//   6. The edge and both faces now live in the new slots. Point their
+//      entries in the mesh's maps there with `map_set` from
+//      topology::patch_map, passing the owning patch and the mesh-wide IDs
+//      from `FlipSlots`. Later edits rely on the maps to find copies.
 //
 // Apply the writes with these safeguards:
 // - Complete all checks and slot selection before writing anything. Apply
@@ -219,8 +224,9 @@ public fn flipped_faces(
 //    any reservation fails, release only this request's reservations and
 //    set FLIP_OUT_OF_CAPACITY. Do not clear any other bits in this stage.
 // 3. Commit: for each request still at FLIP_DONE, reload its saved faces,
-//    call `flip_quad` and `flip_writes` with its reserved slots, and apply
-//    every write. After this stage, FLIP_DONE means the edge was flipped.
+//    call `flip_quad` and `flip_writes` with its reserved slots, apply
+//    every write, and update the maps as in step 6 above. After this stage,
+//    FLIP_DONE means the edge was flipped.
 //
 // Keep these constraints when adapting the example:
 // - Unique request indices give unique priorities for a fixed seed, so

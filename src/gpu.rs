@@ -18,6 +18,8 @@ mod bench_baseline;
 mod bench_flips;
 #[cfg(test)]
 mod bench_meshes;
+#[cfg(test)]
+mod bench_migration;
 mod boundary;
 mod build;
 mod edge;
@@ -25,6 +27,8 @@ mod editable;
 mod flip;
 mod geometry;
 mod patch_layout;
+#[cfg(test)]
+mod patch_map_tests;
 mod pipeline;
 mod reduce;
 mod scan;

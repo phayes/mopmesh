@@ -126,7 +126,7 @@ The following kernel counts each vertex's neighbors using workgroup-local
 traversal:
 
 ```wesl
-import mopmesh::topology::patch::VERTEX;
+import mopmesh::topology::patch::{VERTEX, PATCH_LANES};
 import mopmesh::topology::patch_arena::{
     patch_count, patch_record, slot_active, slot_owned, global_vertex,
 };
@@ -137,7 +137,7 @@ import mopmesh::parallel::grid::flat_group;
 
 @group(0) @binding(0) var<storage, read_write> degree: array<u32>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(PATCH_LANES)
 fn vertex_degree(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
@@ -150,7 +150,7 @@ fn vertex_degree(
     var first = 0u;
     while (first < vertices) {
         let end = stage_vertex_neighbors(lane, r, first);
-        for (var v = first + lane; v < end; v += 64u) {
+        for (var v = first + lane; v < end; v += PATCH_LANES) {
             if (!slot_active(r, VERTEX, v) || !slot_owned(r, VERTEX, v)) { continue; }
             var count = 0u;
             for (var it = vv_begin(r, first, v); vv_valid(it); it = vv_next(r, it)) {
@@ -166,8 +166,11 @@ fn vertex_degree(
 Bind your output at group 0, binding 0, with one `u32` per mesh vertex.
 `patch_queries` imports `patch_arena`, which declares two read-only storage
 bindings: the mesh's `arena()` at group 1, binding 0, and `masks()` at group 1,
-binding 1. Dispatch one 64-lane workgroup per patch. These readers work with
-both static and editable meshes.
+binding 1. Dispatch one workgroup per patch, declared with
+`@workgroup_size(PATCH_LANES)` from `topology::patch`. These readers work with
+both static and editable meshes. The per-patch modules clear their own
+workgroup memory, so pipelines can set `zero_initialize_workgroup_memory:
+false` in `PipelineCompilationOptions` to skip wgpu's zero-fill.
 
 Call `patch_slot_end` and `stage_vertex_neighbors` from every invocation in the
 workgroup, in uniform control flow: they contain synchronization. The iterator
@@ -198,7 +201,7 @@ flip when the angles opposite an edge sum to more than 180 degrees:
 cargo run --example delaunay_flips
 ```
 
-A batch is one dispatch with one 64-lane workgroup per patch, as in RXMesh's
+A batch is one dispatch with one `PATCH_LANES` workgroup per patch, as in RXMesh's
 cavity manager. The workgroup stages the patch's edges, offers each candidate
 from `flip_candidate` to your rule, and passes your decision to
 `flip_request`. Then `flip_finish` selects a maximal set of non-conflicting
@@ -234,6 +237,13 @@ For lower-level control with your own bindings,
 helpers. The [single-flip consumer](tests/shaders/flip_consumer.wesl) demonstrates
 this path; its caller is responsible for validating and applying the complete
 edit exactly once.
+
+Each editable mesh also keeps per-patch maps from mesh-wide vertex, edge and
+face IDs to the local slots that hold them (`GpuEditableMesh::maps`).
+[`topology::patch_map`](shaders/topology/patch_map.wesl) binds them at group 1,
+binding 7, and provides `map_find`, `map_set` and `map_erase`. A kernel that
+moves an element to another slot must update its entry with `map_set`, as the
+single-flip consumer does.
 
 ## More shader building blocks
 
@@ -313,7 +323,8 @@ cargo doc --no-deps --open
 Keep inputs on the same device and mesh. Built-in operations check mesh identity
 for typed inputs; custom operators should compare `mesh_id()` themselves.
 Connectivity-derived results from editable meshes carry a topology version and
-must be refreshed after edits.
+must be refreshed after edits. If your own kernel edits an editable mesh, call
+`GpuEditableMesh::mark_edited` so that older results are rejected.
 
 ## Supported inputs and limits
 

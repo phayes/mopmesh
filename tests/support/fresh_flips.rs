@@ -4,7 +4,7 @@
 //! leave empty slots below a patch's used count, for tests that check that
 //! queries skip such holes.
 #![allow(dead_code)]
-use mopmesh::gpu::{EdgeFlipQuery, FlipStatus, GpuEditableMesh};
+use mopmesh::gpu::{FlipStatus, GpuEditableMesh};
 use wgpu::util::DeviceExt;
 
 pub struct FreshFlips {
@@ -39,19 +39,25 @@ impl FreshFlips {
 
     /// Tries to flip each edge of `edges` in turn, one dispatch each, and
     /// returns their statuses in order. `positions` holds one `vec4<f32>` per
-    /// mesh vertex. Counts one edit on `mesh` through `query`, so results
-    /// computed before are reported stale.
+    /// mesh vertex. Counts one edit on `mesh`, so results computed before are
+    /// reported stale.
     pub fn flip(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        query: &EdgeFlipQuery,
         mesh: &mut GpuEditableMesh,
         positions: &wgpu::Buffer,
         edges: &[u32],
     ) -> Vec<Option<FlipStatus>> {
-        // Preparing an unused pass is how a custom edit counts a version.
-        query.begin_pass(device, mesh).unwrap();
+        mesh.mark_edited();
+        let maps = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fresh-slot flip maps"),
+            layout: &self.pipeline.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 7,
+                resource: mesh.maps().as_entire_binding(),
+            }],
+        });
         let layout = self.pipeline.get_bind_group_layout(0);
         let mut requests = Vec::new();
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -77,6 +83,7 @@ impl FreshFlips {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bindings, &[]);
+            pass.set_bind_group(1, &maps, &[]);
             pass.dispatch_workgroups(1, 1, 1);
             drop(pass);
             requests.push(request);

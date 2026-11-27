@@ -53,11 +53,20 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
             })
             .collect::<Vec<_>>(),
         });
+        let maps = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("consumer maps"),
+            layout: &consumer.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 7,
+                resource: by_consumer.maps().as_entire_binding(),
+            }],
+        });
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&consumer);
             pass.set_bind_group(0, &bindings, &[]);
+            pass.set_bind_group(1, &maps, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         queue.submit([encoder.finish()]);

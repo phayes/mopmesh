@@ -106,8 +106,9 @@ impl FlipPass {
     pub fn statuses(&self) -> &GpuFlipStatuses {
         &self.statuses
     }
-    /// Workgroup counts `[x, y]` for the dispatch: one workgroup of 64
-    /// invocations per patch. Dispatch with a z count of 1. Spare workgroups,
+    /// Workgroup counts `[x, y]` for the dispatch: one workgroup per patch,
+    /// declared with `@workgroup_size(PATCH_LANES)` from `topology::patch`.
+    /// Dispatch with a z count of 1. Spare workgroups,
     /// whose `flat_group` index is not below `flip_patch_count`, must return
     /// at once.
     pub fn patch_grid(&self) -> [u32; 2] {
@@ -201,7 +202,7 @@ impl EdgeFlipQuery {
         // Use the current version as the priority seed, then count this batch
         // as an edit. The three trailing parameter words pad the uniform.
         let seed = mesh.version() as u32;
-        mesh.bump_version();
+        mesh.mark_edited();
         let words = |n: u64| (n * 4).max(4);
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh edge flip parameters"),
@@ -311,7 +312,7 @@ const STATE_WORDS: u32 = 7;
 mod tests {
     use super::*;
     use crate::gpu::editable::inspect::{
-        PatchView, check_owner_tables, edge_endpoints as edge_endpoints_after, face_vertices,
+        PatchView, check_invariants, edge_endpoints as edge_endpoints_after, face_vertices,
         patch_views,
     };
     use crate::gpu::editable::{EditCapacity, editable_contents};
@@ -604,7 +605,7 @@ mod tests {
                                 );
                             }
                             Some(triangles) => {
-                                check_owner_tables(&arena, &masks);
+                                check_invariants(&arena, &masks, &gpu.read(gpu_mesh.maps()));
                                 assert_slots_kept(&before.0, &before.1, &arena, &masks, &context);
                                 assert_eq!(
                                     patch_views(&arena, &masks),
@@ -709,7 +710,7 @@ mod tests {
         // Flipping back restores the mesh, but swaps the two faces' IDs.
         assert_eq!(gpu.flip(&mut editable, edge), FlipStatus::Flipped);
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-        check_owner_tables(&arena, &masks);
+        check_invariants(&arena, &masks, &gpu.read(editable.maps()));
         assert_eq!(patch_views(&arena, &masks), original);
         assert_faces_by_id(
             &arena,
@@ -758,7 +759,7 @@ mod tests {
         }
         flipped.pop();
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-        check_owner_tables(&arena, &masks);
+        check_invariants(&arena, &masks, &gpu.read(editable.maps()));
         assert_slots_kept(&before.0, &before.1, &arena, &masks, "after 20 flips");
         assert_faces_by_id(
             &arena,
@@ -922,7 +923,7 @@ mod tests {
             let mut editable = GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
             let before = (gpu.read(editable.arena()), gpu.read(editable.masks()));
             // Exercise priority selection with a mesh version greater than zero.
-            editable.bump_version();
+            editable.mark_edited();
             let seed = editable.version() as u32;
             let Prediction {
                 statuses: expected,
@@ -964,7 +965,7 @@ mod tests {
 
             // Compare the GPU result with the same flips performed by Alum.
             let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-            check_owner_tables(&arena, &masks);
+            check_invariants(&arena, &masks, &gpu.read(editable.maps()));
             assert_slots_kept(&before.0, &before.1, &arena, &masks, &context);
             let triangles = alum_flips(&fixture.positions, &fixture.triangles, &flipped);
             assert_eq!(
@@ -1012,7 +1013,7 @@ mod tests {
                         GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
                     let before = (gpu.read(editable.arena()), gpu.read(editable.masks()));
                     for _ in 0..seed {
-                        editable.bump_version();
+                        editable.mark_edited();
                     }
                     let context = format!("{context}, seed {seed}");
                     assert_eq!(
@@ -1021,7 +1022,7 @@ mod tests {
                         "{context}"
                     );
                     let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-                    check_owner_tables(&arena, &masks);
+                    check_invariants(&arena, &masks, &gpu.read(editable.maps()));
                     assert_slots_kept(&before.0, &before.1, &arena, &masks, &context);
                     let flipped = &prediction.flipped;
                     assert_eq!(
@@ -1065,9 +1066,9 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
     fn batches_in_patches_larger_than_one_staging_chunk_flip_as_predicted() {
-        // A 31 x 31 grid in one patch holds 2,610 edges: more than the 1,024
-        // edge slots the claim stage stages at a time.
-        const STAGED_EDGES: usize = 1024;
+        // A 31 x 31 grid in one patch holds 2,610 edges: several chunks of
+        // the edge slots the claim stage stages at a time.
+        use crate::gpu::test_support::STAGED_EDGES;
         let gpu = Gpu::new();
         let (positions, triangles) = fixtures::grid(31);
         let fixture = fixtures::Fixture {
@@ -1088,7 +1089,7 @@ mod tests {
         // Every edge is requested; the winners must be exactly the predicted ones.
         let mut editable =
             GpuEditableMesh::upload(&gpu.device, &mesh, EditCapacity::new(3.0).unwrap()).unwrap();
-        editable.bump_version();
+        editable.mark_edited();
         let seed = editable.version() as u32;
         let edges = batch_request(&mesh);
         let prediction = predict_batch(&mesh, &fixture.triangles, &edges, seed);
@@ -1108,7 +1109,7 @@ mod tests {
 
         // The mesh matches the same flips made by Alum.
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-        check_owner_tables(&arena, &masks);
+        check_invariants(&arena, &masks, &gpu.read(editable.maps()));
         assert_eq!(
             patch_views(&arena, &masks),
             rebuilt_views(
@@ -1183,7 +1184,7 @@ mod tests {
             }
 
             let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-            check_owner_tables(&arena, &masks);
+            check_invariants(&arena, &masks, &gpu.read(editable.maps()));
             let flipped_ends: Vec<_> = flipped.iter().map(|&e| ends[e as usize]).collect();
             let fixture = fixtures::Fixture {
                 name: "grid 9",
@@ -1217,7 +1218,7 @@ mod tests {
         assert_eq!(gpu.flip_all(&mut editable, &edges), prediction.statuses);
 
         let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
-        check_owner_tables(&arena, &masks);
+        check_invariants(&arena, &masks, &gpu.read(editable.maps()));
         assert_slots_kept(&before.0, &before.1, &arena, &masks, "capacity 1.0");
         assert_eq!(
             patch_views(&arena, &masks),

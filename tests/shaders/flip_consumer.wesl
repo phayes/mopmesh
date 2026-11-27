@@ -1,7 +1,8 @@
 // A downstream kernel that flips an edge only when the flip shortens it,
 // in one dispatch, using MOPMesh's public topology modules. It chooses its
 // own bindings: the editable arena and masks from `GpuEditableMesh`, plus
-// its own positions and request.
+// its own positions and request. The mesh's maps are bound at group 1,
+// binding 7, by `topology::patch_map`.
 import mopmesh::topology::patch::{
     PatchRecord, EDGE, FACE, VERTEX_COUNT_WORD, RECORDS_WORD, OWNERS_WORD,
     record_offset, decode_record, owner_offset, used_offset, mask_word, mask_test,
@@ -13,6 +14,7 @@ import mopmesh::topology::flip::{
     FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR,
     FLIP_CONNECTED, FLIP_OUT_OF_CAPACITY, FLIP_NOT_AN_EDGE,
 };
+import mopmesh::topology::patch_map::map_set;
 
 const INVALID: u32 = 0xffffffffu;
 
@@ -138,5 +140,12 @@ fn flip_if_shorter(global_edge: u32) -> u32 {
             atomicMax(&masks[m.offset], m.bits);
         }
     }
+
+    // The edge and both faces moved to new slots; point their map entries
+    // there. The maps have room: each ID already had an entry.
+    let p = arena[owner];
+    map_set(p, EDGE, slots.global_edge, new_edge);
+    map_set(p, FACE, slots.global_first, new_first);
+    map_set(p, FACE, slots.global_second, new_second);
     return FLIP_DONE;
 }

@@ -373,7 +373,6 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
     let fresh = fresh_flips::FreshFlips::new(&device).flip(
         &device,
         &queue,
-        &flip,
         &mut editable,
         &position_buffer,
         &some_edges,
@@ -512,6 +511,15 @@ fn results_from_before_an_edit_are_rejected_as_stale() {
     );
     assert!(dot.encode(&device, e, &new_areas, &new_areas).is_ok());
 
+    // An edit counted by the caller's own kernel makes results stale the same way.
+    editable.mark_edited();
+    assert_eq!(editable.version(), 2);
+    assert_eq!(
+        smooth_with(e, &editable, &fresh_adjacency, None),
+        Err(GpuError::Stale)
+    );
+    let fresh_adjacency = adjacency_query.encode(&device, e, &editable).unwrap();
+
     // Replacing computed values makes them the caller's, which edits don't affect.
     let flags = vec![0u32; positions.len()];
     boundary.vertices.write_values(&queue, &flags).unwrap();
@@ -525,6 +533,7 @@ fn results_from_before_an_edit_are_rejected_as_stale() {
     // doesn't accept this upload's results.
     let mut other = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
     flip.encode(&device, e, &mut other, &[]).unwrap();
+    other.mark_edited();
     assert_eq!(other.version(), editable.version());
     assert_eq!(
         smooth_with(e, &other, &fresh_adjacency, None),
