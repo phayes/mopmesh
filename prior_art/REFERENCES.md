@@ -14,7 +14,7 @@
 - Cargo development dependency: `alum` 0.7.1, with default features disabled.
 - Reproducibility: exact resolved version and checksum in `Cargo.lock`.
 - License: BSD-3-Clause; notice retained in `THIRD_PARTY_NOTICES`.
-- Role: primary CPU oracle for canonical connectivity (FV, EV/EF, VF, VE/VV, FF and edge diamonds), centroids, and downstream boundary/neighborhood geometry results. Match edges by endpoints rather than assuming identical edge numbering. Future edit tests should use Alum operations rather than a homegrown CPU reference implementation.
+- Role: primary CPU oracle for canonical connectivity (FV, EV/EF, VF, VE/VV, FF and edge diamonds), centroids, and downstream boundary/neighborhood geometry results. Match edges by endpoints rather than assuming identical edge numbering. Alum is a best-effort oracle: we accept differences from it. Edit tests use Alum where its operations match ours, and project CPU models plus invariant checks where they don't (for example splits that keep IDs and in-place collapses).
 
 The production Rust constructor builds MOPMesh storage and validates supported
 input topology; it is not used as the independent correctness oracle.

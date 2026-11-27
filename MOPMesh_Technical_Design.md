@@ -14,7 +14,7 @@ The static query families, vertex attributes, hierarchical scans and two downstr
 
 - Static partitioned mesh, EV/FE connectivity, ribbon ownership and typed attributes.
 
-- Portable workgroup primitives and Alum as the CPU reference oracle; do not build a separate CPU reference mesh implementation.
+- Portable workgroup primitives. Alum is a best-effort CPU reference: we accept differences from it, and project CPU models serve as oracles where Alum's operations don't match ours.
 
 - Reusable WESL library modules that downstream WESL projects can import and link independently of MOPMesh host execution.
 
@@ -68,7 +68,7 @@ Common operations belong in the public WESL library as they are implemented: con
 
 Downstream example applications are part of the core implementation plan and API acceptance criteria, not a stretch goal. Add a small runnable example alongside each major operator family. Each example should import the packaged library, own its bindings and entry points, and compose public operations with application-specific data or behavior. Generally useful operations discovered while building an example should become library functions rather than duplicated example code. Use concrete consumers to guide abstractions instead of designing speculative interfaces.
 
-Accept an operator family when its downstream example links using only the public package, runs with documented layouts and synchronization, and produces validated results. Use Alum as the independent mesh reference where applicable. If an example needs private runtime internals or duplicates a common operation, address the missing public API before considering the family complete. Keep downstream linking checks in the hardware-independent suite and execution checks in the explicit GPU suite.
+Accept an operator family when its downstream example links using only the public package, runs with documented layouts and synchronization, and produces validated results. Use Alum as a best-effort mesh reference where it fits. If an example needs private runtime internals or duplicates a common operation, address the missing public API before considering the family complete. Keep downstream linking checks in the hardware-independent suite and execution checks in the explicit GPU suite.
 
 | **Layer**     | **Responsibility**                                                      |
 |---------------|-------------------------------------------------------------------------|
@@ -214,7 +214,7 @@ Current runtime dependencies are `wgpu`, `wesl-core` and `bytemuck`; WESL compil
 
 ## Correctness
 
-Use Alum as the independent Rust CPU oracle and development dependency, rather than implementing a separate CPU reference mesh. Retain OpenMesh as additional prior art and an optional C++ reference. Compare canonical topology and attributes rather than relying on identical patch IDs or operation ordering. Define supported topology classes explicitly; start with oriented manifold triangle meshes and tested boundary cases.
+Use Alum as a best-effort Rust CPU oracle and development dependency. We accept differences from Alum, and never choose a slower or more complex design just to match it. Where an operation differs from Alum's, such as splits that keep IDs, in-place collapses or cross-patch scheduling, tests use project CPU models (for example the migration simulation's `Sim`) and invariant checks instead. Alum decides only between otherwise equal choices. Retain OpenMesh as additional prior art and an optional C++ reference. Compare canonical topology and attributes rather than relying on identical patch IDs or operation ordering. Define supported topology classes explicitly; start with oriented manifold triangle meshes and tested boundary cases.
 
 - Every active edge references valid vertices; every face forms a closed directed triangle.
 
@@ -255,7 +255,7 @@ Measure queries/s, successful edits/s, bytes/triangle, ribbon overhead, rejected
 | faimGraph \[15\]                     | CUDA autonomous allocation, recycling and dynamic connectivity.                          |
 | PRAgMaTIc \[16\]                     | CPU OpenMP/MPI mesh adaptation; parallel conflict avoidance and topology reference.      |
 
-Alum (https://github.com/ranjeethmahankali/alum), a Rust halfedge mesh library inspired by OpenMesh, is the selected CPU test reference and additional prior art. OpenMesh (https://www.graphics.rwth-aachen.de/software/openmesh/) is downloaded as a secondary reference. Neither is intended to replace MOPMesh's GPU patch/ribbon representation. Other potential references include tri-mesh, plexus and truck; meshopt is useful for simplification comparisons and parry for geometric queries. Their current APIs, licenses and suitability require separate review.
+Alum (https://github.com/ranjeethmahankali/alum), a Rust halfedge mesh library inspired by OpenMesh, is the selected best-effort CPU test reference and additional prior art. OpenMesh (https://www.graphics.rwth-aachen.de/software/openmesh/) is downloaded as a secondary reference. Neither is intended to replace MOPMesh's GPU patch/ribbon representation. Other potential references include tri-mesh, plexus and truck; meshopt is useful for simplification comparisons and parry for geometric queries. Their current APIs, licenses and suitability require separate review.
 
 ## Release scope
 

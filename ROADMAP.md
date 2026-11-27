@@ -81,7 +81,9 @@ Reconsider them only for a measured need through a separate design decision.
 ### 0 — References: mostly complete
 
 - [x] Record RXMesh and OpenMesh revisions and retain upstream license notices.
-- [x] Use Alum as the independent CPU oracle and development dependency.
+- [x] Use Alum as a best-effort CPU oracle and development dependency. We
+  accept differences from it; edits that don't match Alum's operations are
+  checked against project CPU models instead (decided 27 November 2026).
 - [x] Download OpenMesh and build OpenMeshCore as a secondary reference.
 - [x] Add synthetic correctness fixtures.
 - [ ] Curate reproducible benchmark meshes, sizes, provenance and licenses.

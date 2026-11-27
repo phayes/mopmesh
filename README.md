@@ -377,7 +377,8 @@ See the [roadmap](ROADMAP.md) for implementation plans, the
 [technical design](MOPMesh_Technical_Design.md) for architecture, and the
 [benchmark notes](docs/approximate_benchmark.md) for timing methodology.
 
-MOPMesh follows RXMesh's patch/ribbon architecture and uses Alum as a CPU
-reference in tests. [Reference setup](prior_art/REFERENCES.md) records upstream
+MOPMesh follows RXMesh's patch/ribbon architecture and uses Alum as a
+best-effort CPU reference in tests; results may differ from Alum's where our
+operations do. [Reference setup](prior_art/REFERENCES.md) records upstream
 sources and revisions. MOPMesh is licensed under [BSD-2-Clause](LICENSE);
 upstream notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
