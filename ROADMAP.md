@@ -369,16 +369,8 @@ RXMesh.
     original but did not beat it, so the repeated loads were cache hits.
     Bid's cost is elsewhere: it reads every request each round, and does
     scattered `taken` loads and `atomicMax` bids.
-  Candidates left:
-  - build rebuilt maps in workgroup memory, and erase a failed acting
-    patch's unfilled claims instead of rebuilding its maps;
-  - compact the pending requests and the flagged patches into lists, and
-    size the flat and per-patch stages by them;
-  - stop clearing 14 words per vertex every round (clear only touched
-    records, or tag them with the round);
-  - fuse small stages (bid with check, claim with resolve, the three
-    fills).
-  The roadmap's earlier flip timings (Phase 4, the Delaunay settle) predate
+  The candidates left are listed under "Further cross-patch round speedups"
+  at the end of this phase. The roadmap's earlier flip timings (Phase 4, the Delaunay settle) predate
   the cross-patch rounds and are stale until this rerun.
 - [ ] Step 6 (deferred 27 November 2026): review bid-then-act against
   RXMesh's try-lock host loop with Codex and the advisor, with the code and
@@ -399,6 +391,37 @@ RXMesh.
   - [ ] Small cleanups: `encode_round`'s `migrate` and the migration
     encoder's `planned` flags could become one enum; the `rotate` test
     helper exists in three copies.
+- Further cross-patch round speedups after step 5, not scheduled (524 K
+  faces, all-edges batch, unless noted):
+  - [ ] Build rebuilt maps in workgroup memory. When cleanup does rebuild a
+    map, it clears the table in storage and then inserts every active slot
+    with atomic probes into storage. Building the table in workgroup memory
+    and writing it out in one pass would make each rebuild cheaper.
+  - [ ] Erase a failed acting patch's unused claims instead of rebuilding
+    its maps. A failed actor's maps hold IDs it claimed but never filled,
+    and today cleanup rebuilds all three of its maps. Erasing only the
+    entries with no slot would leave the rest alone and count toward the
+    erase threshold like any other erasure. Failures are rare in an
+    all-edges batch, so measure how often this runs before doing it.
+  - [ ] Compact the pending requests into a list. Every round's flat stages
+    (bid, check, claim, resolve) read every request, though most stop
+    being pending after the first rounds. A compacted list of pending
+    requests, with the flat dispatches sized by it, would cut bid's
+    per-round cost (7–12 ms per batch), which comes from reading requests
+    rather than from `cavity_actor`. The flagged patches could get the same
+    treatment for the per-patch stages.
+  - [ ] Stop clearing the per-vertex records every round. Each round clears
+    14 words per mesh vertex before lead runs, however few vertices the
+    round touches. Clear only the records a round wrote, or tag each record
+    with its round and treat a stale tag as empty.
+  - [ ] Fuse small stages. A batch records 154 passes, and at 32 K faces
+    their fixed cost dominates (11–16 ms of cross-patch time), so fewer
+    passes is the lever for small meshes. Earlier notes suggested fusing
+    claim with resolve and the three fills. But each depends on the whole
+    previous dispatch: resolve reads every claim, and edge fills look up the
+    vertices that vertex fills copied. Fusing therefore needs a design
+    change, such as doing that work per patch within one workgroup, not
+    just merging passes.
 
 ### 6 — Growth: not started
 
