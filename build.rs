@@ -23,7 +23,6 @@ fn main() {
         "scan",
         "edges",
         "vertex_neighbors",
-        "face_neighbors",
         "build_elements",
         "build_connectivity",
         "build_patch_members",
@@ -34,6 +33,7 @@ fn main() {
         "radix_sort",
         "baseline_face_vertices",
         "baseline_edges",
+        "baseline_face_neighbors",
     ] {
         let resolver = wesl::resolver::StandardResolver::new(".");
         let compiled = wesl::Compiler::default()

@@ -1,6 +1,5 @@
-use super::pipeline::{self, workgroups};
-use super::{EdgeQuery, GpuEdgeAttribute, GpuError, GpuMesh, GpuVertexAttribute};
-use wgpu::util::DeviceExt;
+use super::pipeline::{self, group_grid};
+use super::{GpuEdgeAttribute, GpuError, GpuMesh, GpuVertexAttribute, PatchBuffers};
 
 /// Which edges and vertices lie on the mesh boundary, as `u32` flags: 1 on
 /// the boundary, 0 elsewhere. A boundary edge has only one adjoining face; a
@@ -13,7 +12,6 @@ pub struct MeshBoundary {
 
 /// Finds boundary edges and vertices. Cache one per device.
 pub struct BoundaryQuery {
-    edges: EdgeQuery,
     pipeline: wgpu::ComputePipeline,
 }
 impl BoundaryQuery {
@@ -24,7 +22,6 @@ impl BoundaryQuery {
             include_str!(concat!(env!("OUT_DIR"), "/boundary.wgsl")),
         );
         Self {
-            edges: EdgeQuery::new(device),
             pipeline: pipeline::compute_pipeline(device, "MOPMesh boundary", &module, "main", None),
         }
     }
@@ -39,12 +36,23 @@ impl BoundaryQuery {
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
     ) -> Result<MeshBoundary, GpuError> {
+        self.encode_patches(device, encoder, mesh.buffers())
+    }
+
+    /// Records the same query as [`encode`](Self::encode), using the shared
+    /// buffer layout of static and editable meshes.
+    pub(crate) fn encode_patches(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: PatchBuffers,
+    ) -> Result<MeshBoundary, GpuError> {
         // Check sizes, then allocate zeroed flags.
         const RESOURCE: &str = "boundary flags";
         let limits = device.limits();
         GpuEdgeAttribute::<u32>::check_output(&limits, mesh.edge_count, RESOURCE)?;
         GpuVertexAttribute::<u32>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
-        let groups = workgroups(&limits, mesh.edge_count, RESOURCE)?;
+        let grid = group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = MeshBoundary {
             edges: GpuEdgeAttribute::output(
                 device,
@@ -64,30 +72,14 @@ impl BoundaryQuery {
         }
 
         // Mark each boundary edge and its two endpoints.
-        let edges = self.edges.encode(device, encoder, mesh)?;
-        // Padded to 16 bytes, the minimum uniform struct size.
-        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh boundary sizes"),
-            contents: bytemuck::cast_slice(&[mesh.edge_count, 0, 0, 0]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bindings = pipeline::bind_buffers(
+        pipeline::dispatch_patches(
             device,
-            "MOPMesh boundary bindings",
-            &self.pipeline.get_bind_group_layout(0),
-            &[
-                &params,
-                edges.buffer(),
-                result.edges.buffer(),
-                result.vertices.buffer(),
-            ],
-        );
-        pipeline::dispatch(
             encoder,
             "MOPMesh boundary",
             &self.pipeline,
-            &bindings,
-            groups,
+            &[result.edges.buffer(), result.vertices.buffer()],
+            mesh,
+            grid,
         );
         Ok(result)
     }

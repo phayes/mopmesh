@@ -1,8 +1,9 @@
 # Milestone 3 plan: workgroup staging
 
 Status: draft. Decided 26 November 2026: the static arena adopts the editable
-header and patch records. Step 1 (the prototype) is done; see
-[Step 1 results](#step-1-results). The remaining decisions are listed at the
+header and patch records. Steps 1 to 3 are done; see
+[Step 1 results](#step-1-results), [Step 2 results](#step-2-results) and
+[Step 3 results](#step-3-results). The remaining decisions are listed at the
 end.
 
 The direction behind it: follow RXMesh, editing a mesh is a headline feature,
@@ -266,14 +267,62 @@ torus and irregular meshes, against today's face-task kernel:
 | VV + FF + diamonds + edges (grid) | input | 8.22 ms | 5.59 ms | 3.47 ms |
 | Face vertices, four meshes | input | – | 0.66–0.91 ms | 0.35–0.40 ms |
 
+## Step 3 results
+
+- **Kernels.** `runtime_shaders/edges.wesl` has a second entry point,
+  `adjacency`, which writes edge records, FF and diamonds in one staged pass.
+  The owning patch of an edge holds both its faces, so it writes both faces'
+  FF entries and both opposite vertices. `runtime_shaders/boundary.wesl` is
+  now staged too: it writes the flags directly, without edge records. Both
+  share `shaders/topology/patch_edge_staging.wesl`, a new opt-in public
+  module that runs the per-chunk staging loop over `topology::patch_arena`.
+- **Queries.** `AdjacencyQuery` no longer runs `EdgeQuery` or
+  `FaceVertexQuery`; VV still runs as a global transpose of the staged edge
+  records. `AdjacencyQuery` and `BoundaryQuery` gained `encode_patches`, and
+  `PatchBuffers` gained `vertex_count`. The global FF kernel moved to
+  `runtime_shaders/baseline_face_neighbors.wesl` for the flat benchmark path.
+- **Tests.** `src/gpu/staged.rs` checks, word for word, that the staged
+  edge records, FF and diamonds equal what the global FF kernel derives from
+  the same edge records and face vertices. It also checks that the boundary
+  flags equal a CPU derivation from the edge records, and that editable
+  uploads at capacity 1 and 1.5 give the same results, VV rows included.
+  That covers every fixture and patch size, plus generated meshes in both
+  orders, including the 131K-face sphere that needs chunking. Breaking the
+  opposite-vertex index or one vertex flag in a kernel makes it fail.
+- **Speed**, the baseline benchmark at 2.1 M faces and patch size 128,
+  median GPU time, before and after this step on the same machine. A build
+  overlapped part of the "before" run, around the shuffled sphere.
+
+| Query, 2.1 M faces | Order | Before | After | Flat |
+|---|---|---:|---:|---:|
+| VV + FF + diamonds + edges | input, four meshes | 4.70–5.48 ms | 4.47–5.28 ms | 2.82–2.93 ms |
+| VV + FF + diamonds + edges | shuffled, four meshes | 12.36–12.94 ms | 9.69–10.07 ms | 13.14–13.25 ms |
+| Boundary flags | input, four meshes | 2.84–5.66 ms | 3.17–3.82 ms | – |
+| Boundary flags | shuffled, four meshes | 4.10–5.10 ms | 3.58–5.69 ms | – |
+
+  Adjacency drops from 13 to 11 dispatches and now beats the flat layout by
+  about 25% on shuffled meshes. Boundary flags drop from 2 dispatches to 1
+  and its median wall time falls by 1.3–4.5 ms on every mesh, but its GPU
+  time is noisy and on two input-order meshes rose by 0.3–0.4 ms. On
+  input-order meshes it runs 0.5–0.6 ms above the staged edge-record pass
+  (3.17 against 2.68 ms on the grid), though it writes less; that is not
+  yet explained. The staged edge pass itself is still 2.5–3x the flat edge
+  pass on input-ordered meshes, and it is the remaining gap to flat there.
+  On shuffled meshes the global VV transpose is the largest cost, so step 4
+  is still worth doing.
+- **Staging FE as well (open question).** Not tried. The staged passes read
+  FE from the patch's own contiguous region, and the gap above is in the
+  staged pass as a whole, so FE staging is one candidate alongside the
+  patch size 32 follow-up. It needs profiling before it is worth its
+  workgroup memory.
+
 ## Steps
 
 1. **Prototype the staged edge kernel — done.** See above.
 2. **Move the static arena to the shared header and patch records — done.**
    See [Step 2 results](#step-2-results).
-3. **Stage the boundary and FF kernels** for both mesh types, then remove the
-   old FF kernel. Edge records moved to staging in step 2, because removing
-   the edge task list left the old kernel nothing to dispatch over.
+3. **Stage the boundary and FF kernels — done.** See
+   [Step 3 results](#step-3-results).
 4. **Stage VV,** if the benchmark still shows VV as the order-sensitive cost.
    It needs per-vertex row offsets, so it comes after FF.
 5. **Rerun the baseline** at all sizes and both orders, and update the report.
@@ -296,7 +345,14 @@ Defaults taken in step 1, not yet confirmed:
 - Chunked staging for oversized patches, rather than a `LimitsExceeded`
   error, which would reject the sphere at every patch size.
 
+Default taken in step 3, not yet confirmed:
+
+- A public opt-in module, `topology::patch_edge_staging`, for the staging
+  loop over `topology::patch_arena`, so the runtime kernels stay thin
+  wrappers over library functions.
+
 ## Open questions
 
 - Does staging FE as well as edge faces help the later kernels enough to be
-  worth its workgroup memory? Measure in step 3.
+  worth its workgroup memory? Not tried in step 3; see
+  [Step 3 results](#step-3-results). Profile the staged pass first.

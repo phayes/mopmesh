@@ -1,5 +1,5 @@
-use super::pipeline::{self, WORKGROUP_SIZE, check_binding, workgroups};
-use super::{EdgeConnectivity, EdgeQuery, FaceVertexQuery, FaceVertices, GpuError, GpuMesh, scan};
+use super::pipeline::{self, WORKGROUP_SIZE, check_binding, group_grid, workgroups};
+use super::{EdgeConnectivity, GpuError, GpuMesh, PatchBuffers, scan};
 use crate::MeshId;
 use wgpu::util::DeviceExt;
 
@@ -59,19 +59,29 @@ impl MeshAdjacency {
     }
 }
 
-/// Compute the remaining static adjacency families together, sharing EV/EF and
-/// FV intermediates. Cache once per device. VE/VV use a global GPU transpose;
-/// FF and diamonds compose EV/EF with FV. No CPU adjacency or readback is used.
+/// Computes vertex neighbors, face neighbors, edge diamonds and edge records
+/// together on the GPU; see [`MeshAdjacency`] for each result's layout.
+/// Create once per device and reuse it for that device's meshes.
 pub struct AdjacencyQuery {
-    edges: EdgeQuery,
-    faces: FaceVertexQuery,
+    edge_pipeline: wgpu::ComputePipeline,
     scan: scan::ScanPipeline,
     vertex_layout: wgpu::BindGroupLayout,
     vertex_pipelines: [wgpu::ComputePipeline; 3],
-    face_pipeline: wgpu::ComputePipeline,
 }
 impl AdjacencyQuery {
     pub fn new(device: &wgpu::Device) -> Self {
+        let module = pipeline::shader_module(
+            device,
+            "MOPMesh edge adjacency",
+            include_str!(concat!(env!("OUT_DIR"), "/edges.wgsl")),
+        );
+        let edge_pipeline = pipeline::compute_pipeline(
+            device,
+            "MOPMesh edge adjacency",
+            &module,
+            "adjacency",
+            None,
+        );
         let module = pipeline::shader_module(
             device,
             "MOPMesh vertex neighbors",
@@ -95,25 +105,11 @@ impl AdjacencyQuery {
         .map(|(label, entry)| {
             pipeline::compute_pipeline(device, label, &module, entry, Some(&layout))
         });
-        let module = pipeline::shader_module(
-            device,
-            "MOPMesh face neighbors and diamonds",
-            include_str!(concat!(env!("OUT_DIR"), "/face_neighbors.wgsl")),
-        );
-        let face_pipeline = pipeline::compute_pipeline(
-            device,
-            "MOPMesh face neighbors and diamonds",
-            &module,
-            "main",
-            None,
-        );
         Self {
-            edges: EdgeQuery::new(device),
-            faces: FaceVertexQuery::new(device),
+            edge_pipeline,
             scan: scan::ScanPipeline::new(device),
             vertex_layout,
             vertex_pipelines,
-            face_pipeline,
         }
     }
 
@@ -129,29 +125,54 @@ impl AdjacencyQuery {
         encoder: &mut wgpu::CommandEncoder,
         mesh: &GpuMesh,
     ) -> Result<MeshAdjacency, GpuError> {
-        // Validate every size first; the edge and face-vertex queries then
-        // check sizes already covered here, so they cannot fail after recording.
-        let plan = AdjacencyPlan::new(
-            &device.limits(),
-            mesh.vertex_count,
-            mesh.face_count,
-            mesh.edge_count,
-        )?;
-        let edges = self.edges.encode(device, encoder, mesh)?;
-        let fv = self.faces.encode(device, encoder, mesh)?;
-        Ok(self.record(device, encoder, &plan, edges, &fv))
+        self.encode_patches(device, encoder, mesh.buffers())
     }
 
-    /// Records the VE/VV, FF and diamond passes from already-recorded edge
-    /// records and face vertices, which must describe the mesh `plan` was
-    /// checked for. Records no GPU work for a mesh without edges.
-    pub(super) fn record(
+    /// Records the same queries as [`encode`](Self::encode), using the
+    /// shared buffer layout of static and editable meshes.
+    pub(crate) fn encode_patches(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        mesh: PatchBuffers,
+    ) -> Result<MeshAdjacency, GpuError> {
+        // Validate every size before allocating.
+        let limits = device.limits();
+        let plan =
+            AdjacencyPlan::new(&limits, mesh.vertex_count, mesh.face_count, mesh.edge_count)?;
+        let grid = group_grid(&limits, mesh.patch_count, AdjacencyPlan::RESOURCE)?;
+        let edges = EdgeConnectivity {
+            buffer: pipeline::output_buffer(device, "MOPMesh edge records", plan.edge_bytes),
+            edge_count: mesh.edge_count,
+            mesh: mesh.mesh,
+        };
+        let result = Self::outputs(device, &plan, edges);
+        if plan.edge_count == 0 {
+            return Ok(result);
+        }
+
+        // Write edge records, face neighbors and diamonds in one pass per
+        // patch, then build the vertex neighbor lists from the edge records.
+        pipeline::dispatch_patches(
+            device,
+            encoder,
+            "MOPMesh edge adjacency",
+            &self.edge_pipeline,
+            &[result.edges.buffer(), &result.faces, &result.diamonds],
+            mesh,
+            grid,
+        );
+        self.record_vertex_neighbors(device, encoder, &plan, &result);
+        Ok(result)
+    }
+
+    /// Allocates zeroed results for the mesh `plan` was checked for.
+    /// `edges` becomes the result's edge records; its contents may be
+    /// recorded before or after this call.
+    pub(super) fn outputs(
+        device: &wgpu::Device,
         plan: &AdjacencyPlan,
         edges: EdgeConnectivity,
-        fv: &FaceVertices,
     ) -> MeshAdjacency {
         let vertices = pipeline::output_buffer(
             device,
@@ -160,40 +181,31 @@ impl AdjacencyQuery {
         );
         let faces = pipeline::output_buffer(device, "MOPMesh face neighbors", plan.face_bytes);
         let diamonds = pipeline::output_buffer(device, "MOPMesh edge diamonds", plan.edge_bytes);
-        let result = MeshAdjacency {
+        MeshAdjacency {
             edges,
             vertices,
             faces,
             diamonds,
             vertex_count: plan.vertex_count,
             face_count: plan.face_count,
-        };
+        }
+    }
+
+    /// Records the vertex neighbor lists of `result` from its edge records,
+    /// which must be recorded first. Records no GPU work for a mesh without
+    /// edges.
+    pub(super) fn record_vertex_neighbors(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdjacencyPlan,
+        result: &MeshAdjacency,
+    ) {
         if plan.edge_count == 0 {
-            return result;
+            return;
         }
         let edge_groups = plan.edge_groups;
         let vertex_groups = plan.vertex_count.div_ceil(WORKGROUP_SIZE);
-
-        // For each edge, find the neighboring faces and their opposite vertices.
-        // Write the neighbor entry for each face that touches the edge.
-        let bindings = pipeline::bind_buffers(
-            device,
-            "MOPMesh face neighbors bindings",
-            &self.face_pipeline.get_bind_group_layout(0),
-            &[
-                result.edges.buffer(),
-                fv.buffer(),
-                &result.faces,
-                &result.diamonds,
-            ],
-        );
-        pipeline::dispatch(
-            encoder,
-            "MOPMesh face neighbors and diamonds",
-            &self.face_pipeline,
-            &bindings,
-            edge_groups,
-        );
 
         // Build a neighbor list for each vertex: count its edges, turn the counts
         // into row offsets, then fill the rows with edge and neighbor vertex IDs.
@@ -237,7 +249,6 @@ impl AdjacencyQuery {
             &bindings,
             edge_groups,
         );
-        result
     }
 }
 
@@ -254,6 +265,9 @@ pub(super) struct AdjacencyPlan {
     edge_count: u32,
 }
 impl AdjacencyPlan {
+    /// The resource named in this query's limit errors.
+    pub(super) const RESOURCE: &'static str = "mesh adjacency";
+
     /// Checks the results, temporary buffers and dispatches for a mesh with
     /// these counts. Returns [`GpuError::LimitsExceeded`] if any is too large.
     pub(super) fn new(
@@ -262,7 +276,7 @@ impl AdjacencyPlan {
         face_count: u32,
         edge_count: u32,
     ) -> Result<Self, GpuError> {
-        const RESOURCE: &str = "mesh adjacency";
+        const RESOURCE: &str = AdjacencyPlan::RESOURCE;
         let scan = scan::ScanPlan::new(vertex_count, limits)?;
         let vertex_bytes = 4 * (u64::from(vertex_count) + 1 + 4 * u64::from(edge_count));
         let face_bytes = (12 * u64::from(face_count)).max(4);
@@ -271,7 +285,6 @@ impl AdjacencyPlan {
             check_binding(limits, bytes, RESOURCE)?;
         }
         let edge_groups = workgroups(limits, edge_count, RESOURCE)?;
-        workgroups(limits, face_count, RESOURCE)?;
         Ok(Self {
             scan,
             vertex_bytes,

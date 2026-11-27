@@ -1,3 +1,6 @@
+// Unpartitioned twin of the `adjacency` entry point in edges.wesl, for
+// benchmarks: face neighbors and edge diamonds from global edge records and
+// face vertices. Run once per edge.
 import package::shaders::topology::edge::{EdgeRecord, INVALID_FACE, INVALID_VERTEX, other_edge_face};
 import package::shaders::topology::face::{face_edge_slot, opposite_vertex};
 

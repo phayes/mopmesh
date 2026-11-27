@@ -190,7 +190,7 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 - [ ] **Selective adjacency (P4).** `AdjacencyQuery` always computes VE/VV,
   FF and diamonds together. Measure selective execution.
 - [ ] **Explicit counts in two shaders (L3).** `face_centroids.wesl` and
-  `face_neighbors.wesl` bound loops with `arrayLength`, so they need
+  the benchmark's `baseline_face_neighbors.wesl` bound loops with `arrayLength`, so they need
   exact-size inputs. Switch to explicit counts when buffers are pooled or
   oversized.
 - [ ] **`missing_docs` (D-1).** Enable it for the public API in the release

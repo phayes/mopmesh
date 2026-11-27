@@ -1,8 +1,8 @@
 //! Unpartitioned twins of the queries that read the patch arena, for the
 //! benchmark baseline. A [`FlatMesh`] holds the same connectivity as the
 //! arena (edge endpoints and face edges) in global arrays, without patches
-//! or ribbons. Queries that only read global results (VV, FF, diamonds,
-//! centroids, smoothing) run the same kernels on either path.
+//! or ribbons. Queries that only read global results (VV, centroids,
+//! smoothing) run the same kernels on either path.
 use super::adjacency::AdjacencyPlan;
 use super::pipeline::{self, workgroups};
 use super::{
@@ -87,6 +87,7 @@ pub(super) struct FlatQueries {
     face_vertices: wgpu::ComputePipeline,
     edges: [wgpu::ComputePipeline; 3],
     edge_layout: wgpu::BindGroupLayout,
+    face_neighbors: wgpu::ComputePipeline,
     centroids: FaceCentroidQuery,
     adjacency: AdjacencyQuery,
 }
@@ -112,10 +113,18 @@ impl FlatQueries {
         let edges = ["initialize", "scatter", "compact"].map(|entry| {
             pipeline::compute_pipeline(device, "baseline edges", &module, entry, Some(&layout))
         });
+        let module = pipeline::shader_module(
+            device,
+            "baseline face neighbors",
+            include_str!(concat!(env!("OUT_DIR"), "/baseline_face_neighbors.wgsl")),
+        );
+        let face_neighbors =
+            pipeline::compute_pipeline(device, "baseline face neighbors", &module, "main", None);
         Self {
             face_vertices,
             edges,
             edge_layout,
+            face_neighbors,
             centroids: FaceCentroidQuery::new(device),
             adjacency: AdjacencyQuery::new(device),
         }
@@ -211,9 +220,50 @@ impl FlatQueries {
             mesh.face_count,
             mesh.edge_count,
         )?;
+        let groups = workgroups(&device.limits(), mesh.edge_count, AdjacencyPlan::RESOURCE)?;
         let edges = self.edges(device, encoder, mesh)?;
         let faces = self.face_vertices(device, encoder, mesh)?;
-        Ok(self.adjacency.record(device, encoder, &plan, edges, &faces))
+        let result = AdjacencyQuery::outputs(device, &plan, edges);
+        self.face_neighbors(device, encoder, &result, &faces, groups);
+        self.adjacency
+            .record_vertex_neighbors(device, encoder, &plan, &result);
+        Ok(result)
+    }
+
+    /// Records the face neighbors and edge diamonds of `adjacency` from its
+    /// edge records and from `faces`, which must be recorded first.
+    /// `groups` covers one invocation per edge. Records nothing for a mesh
+    /// without edges.
+    pub(super) fn face_neighbors(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        adjacency: &MeshAdjacency,
+        faces: &FaceVertices,
+        groups: u32,
+    ) {
+        if adjacency.edge_count() == 0 {
+            return;
+        }
+        // Each edge fills both faces' neighbor entries for that edge.
+        let bindings = pipeline::bind_buffers(
+            device,
+            "baseline face neighbors",
+            &self.face_neighbors.get_bind_group_layout(0),
+            &[
+                adjacency.edge_connectivity().buffer(),
+                faces.buffer(),
+                adjacency.face_neighbors(),
+                adjacency.edge_diamonds(),
+            ],
+        );
+        pipeline::dispatch(
+            encoder,
+            "baseline face neighbors",
+            &self.face_neighbors,
+            &bindings,
+            groups,
+        );
     }
 }
 

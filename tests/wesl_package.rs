@@ -5,6 +5,7 @@ fn downstream_shader_can_link_packaged_library() {
         "scan_consumer",
         "geometry_consumer",
         "patch_consumer",
+        "patch_arena_consumer",
         "flip_consumer",
     ] {
         validate(&compile_consumer(name));
@@ -58,7 +59,7 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
     )));
     validate(include_str!(concat!(
         env!("OUT_DIR"),
-        "/face_neighbors.wgsl"
+        "/baseline_face_neighbors.wgsl"
     )));
     validate(include_str!(concat!(env!("OUT_DIR"), "/edges.wgsl")));
     validate(include_str!(concat!(env!("OUT_DIR"), "/scan.wgsl")));

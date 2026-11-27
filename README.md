@@ -111,8 +111,8 @@ same value as the Rust constant `mopmesh::gpu::INVALID_ID`. Helpers that look up
 a missing face, endpoint or face slot return the matching constant.
 
 These public modules take values and declare no resource bindings or compute
-entry points, except the opt-in `topology::patch_arena` readers, which bind
-the arena and masks in group 1. Consumers choose the rest themselves. See
+entry points, except the opt-in `topology::patch_arena` readers and
+`topology::patch_edge_staging`, which bind the arena and masks in group 1. Consumers choose the rest themselves. See
 `tests/shaders/consumer.wesl` and `tests/wesl_package.rs` for a complete
 linking example. Public module paths and
 types are experimental. `face_vertices` accepts three EV records in face-edge
@@ -275,7 +275,11 @@ offsets of its global vertex IDs, EV endpoint pairs, FE triples of
 and of its used-slot counts and active and owned masks in the mask buffer. A
 static mesh has no spare slots: every slot is active, and it has no interior
 masks. Read the layout from WESL with `topology::patch` (value-based) or
-`topology::patch_arena` (read-only bindings in group 1).
+`topology::patch_arena` (read-only bindings in group 1). To find the faces
+around each edge of a patch in workgroup memory, use `topology::patch_staging`
+with your own bindings, or `topology::patch_edge_staging` on top of
+`topology::patch_arena`; `tests/shaders/patch_arena_consumer.wesl` shows the
+second.
 This static ABI is experimental. Upload checks the arena and masks against u32
 addressing and the device buffer and binding-size limits before allocation.
 Each query checks its own outputs and dispatches.
@@ -318,10 +322,10 @@ let ff = adjacency.face_neighbors();
 let diamonds = adjacency.edge_diamonds();
 ```
 
-`AdjacencyQuery` computes these four families together, sharing its edge and
-face connectivity intermediates. It also exposes `edge_connectivity()` for
-downstream composition. All result buffers have STORAGE and COPY_SRC usage.
-The batch requires four storage bindings, one uniform binding, and 64 lanes.
+`AdjacencyQuery` computes these four families together. It also exposes
+`edge_connectivity()` for downstream composition. All result buffers have
+STORAGE and COPY_SRC usage. The query needs up to five storage bindings per
+shader stage, one uniform binding, and 64 lanes.
 Buffer, scalar-index, scratch and dispatch limits are checked before commands
 are recorded.
 
@@ -344,10 +348,11 @@ are recorded.
 Empty meshes dispatch no work: VE/VV contains one zero offset, FF has a four-byte
 zero placeholder, and edge/diamond buffers each have a 16-byte zero placeholder.
 Their logical counts are zero; placeholders are not valid topology records.
-VE/VV uses a global count/scan/scatter transpose. FF and diamonds compose EV/EF
-with FV, with one writer per face-edge slot. No host adjacency or intermediate
-readback is used. Workgroup-local staging and selective single-family execution
-remain future optimizations.
+Edge records, FF and diamonds come from one pass with one workgroup per
+patch, which finds each edge's faces in workgroup memory. VE/VV uses a global
+count/scan/scatter transpose of the edge records. No host adjacency or
+intermediate readback is used. Selective single-family execution remains a
+future optimization.
 
 ### Vertex-to-face adjacency
 
