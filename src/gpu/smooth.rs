@@ -60,16 +60,17 @@ impl SmoothQuery {
     /// computed from `mesh` as it is now. `positions` holds `[x, y, z, w]` per
     /// vertex; `w` is copied unchanged. A vertex whose `fixed` flag is
     /// non-zero keeps its position; pass `None` to move every vertex. Vertices
-    /// with no neighbors never move. The result has no topology stamp, so it
-    /// stays usable after later edits.
+    /// with no neighbors never move, and unused vertex IDs keep their input
+    /// values. The result has no topology stamp, so it stays usable after
+    /// later edits.
     ///
     /// Returns [`GpuError::MeshMismatch`] unless all inputs belong to `mesh`,
     /// [`GpuError::Stale`] if `adjacency` or a computed `fixed` attribute
-    /// predates an edit of `mesh`, [`GpuError::InvalidBuffer`] if
-    /// `iterations` is zero and `positions` lacks `COPY_SRC` usage (the result
-    /// is then a copy), or [`GpuError::LimitsExceeded`] if a buffer or
-    /// dispatch is too large. Errors occur before allocating or recording
-    /// commands.
+    /// predates an edit of `mesh`, [`GpuError::InvalidBuffer`] if `positions`
+    /// or `fixed` doesn't have one value per vertex ID, or if `iterations` is
+    /// zero and `positions` lacks `COPY_SRC` usage (the result is then a
+    /// copy), or [`GpuError::LimitsExceeded`] if a buffer or dispatch is too
+    /// large. Errors occur before allocating or recording commands.
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
@@ -89,6 +90,12 @@ impl SmoothQuery {
         positions.check_for(current)?;
         if let Some(fixed) = fixed {
             fixed.check_for(current)?;
+        }
+        let vertices = mesh.vertex_capacity();
+        if positions.len() != vertices || fixed.is_some_and(|f| f.len() != vertices) {
+            return Err(GpuError::InvalidBuffer {
+                resource: "vertex attribute",
+            });
         }
         let mesh = current.mesh_id();
         if settings.iterations == 0

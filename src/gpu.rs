@@ -38,6 +38,8 @@ mod reduce;
 mod scan;
 mod smooth;
 #[cfg(test)]
+mod sparse_tests;
+#[cfg(test)]
 mod staged;
 #[cfg(test)]
 mod test_support;
@@ -133,9 +135,12 @@ pub(crate) struct PatchBuffers<'a> {
     pub arena: &'a wgpu::Buffer,
     pub masks: &'a wgpu::Buffer,
     pub patch_count: u32,
-    pub vertex_count: u32,
-    pub face_count: u32,
-    pub edge_count: u32,
+    pub vertex_capacity: u32,
+    pub face_capacity: u32,
+    pub edge_capacity: u32,
+    /// Whether some IDs below the capacities may be unused, so outputs must
+    /// mark them.
+    pub unused_ids: bool,
     pub topology: TopologyStamp,
 }
 
@@ -189,9 +194,10 @@ fn arena_contents(mesh: &Mesh, limits: &wgpu::Limits) -> Result<ArenaWords, GpuE
     // Write mesh counts and reserve space for patch records. Mark the
     // owner-table offsets as absent; static queries use ownership masks.
     let mut arena = vec![0u32; layout::HEADER_WORDS];
-    arena[layout::VERTEX_COUNT] = mesh.positions().len() as u32;
-    arena[layout::EDGE_COUNT] = mesh.edge_count() as u32;
-    arena[layout::FACE_COUNT] = mesh.face_count() as u32;
+    let [v, e, f] = layout::ID_CAPACITY;
+    arena[v] = mesh.positions().len() as u32;
+    arena[e] = mesh.edge_count() as u32;
+    arena[f] = mesh.face_count() as u32;
     arena[layout::PATCH_COUNT] = mesh.patches().len() as u32;
     arena[layout::RECORDS] = layout::HEADER_WORDS as u32;
     for owners in layout::OWNERS {
@@ -327,6 +333,7 @@ impl FaceVertices {
 /// Compile once per device and reuse across meshes uploaded to that device.
 pub struct FaceVertexQuery {
     pipeline: wgpu::ComputePipeline,
+    fill: pipeline::Fill,
 }
 
 impl FaceVertexQuery {
@@ -344,10 +351,12 @@ impl FaceVertexQuery {
                 "main",
                 None,
             ),
+            fill: pipeline::Fill::new(device),
         }
     }
 
     /// Records a query for the three vertex IDs of every face in `mesh`.
+    /// Rows of unused face IDs hold [`INVALID_ID`].
     /// Returns [`GpuError::LimitsExceeded`] before allocating or recording commands
     /// if the result or dispatch is too large. An empty mesh returns an empty
     /// [`FaceVertices`] result without recording GPU work.
@@ -370,15 +379,20 @@ impl FaceVertexQuery {
     ) -> Result<FaceVertices, GpuError> {
         const RESOURCE: &str = "face vertices";
         let limits = device.limits();
-        let bytes = (u64::from(mesh.face_count) * 12).max(4);
+        let bytes = (u64::from(mesh.face_capacity) * 12).max(4);
         check_binding(&limits, bytes, RESOURCE)?;
         let grid = pipeline::group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = FaceVertices {
             buffer: pipeline::output_buffer(device, "MOPMesh face vertices result", bytes),
-            face_count: mesh.face_count,
+            face_count: mesh.face_capacity,
             topology: mesh.topology,
         };
-        if mesh.face_count != 0 {
+        if mesh.face_capacity != 0 {
+            if mesh.unused_ids {
+                let words = 3 * mesh.face_capacity;
+                self.fill
+                    .encode(device, encoder, &result.buffer, words, INVALID_ID, RESOURCE)?;
+            }
             pipeline::dispatch_patches(
                 device,
                 encoder,
@@ -395,9 +409,12 @@ impl FaceVertexQuery {
 
 /// GPU CSR adjacency indexed by original input vertex ID.
 ///
-/// The buffer contains V + 1 u32 offsets followed by 3F u32 face IDs. Offsets
-/// are relative to the face-ID region. A vertex's incident faces occupy
+/// The buffer contains V + 1 u32 offsets followed by room for 3F u32 face
+/// IDs, where V and F are the vertex and face ID capacities. Offsets are
+/// relative to the face-ID region. A vertex's incident faces occupy
 /// `offsets[v]..offsets[v + 1]`; ordering within each row is unspecified.
+/// The last offset is the number of entries written, and unused vertex IDs
+/// have empty rows.
 /// The buffer has STORAGE and COPY_SRC usage and remains on the GPU.
 pub struct VertexFaceAdjacency {
     buffer: wgpu::Buffer,
@@ -495,27 +512,33 @@ impl VertexFaceQuery {
         // Validate result and temporary buffer sizes, plus dispatch limits, before GPU work.
         const RESOURCE: &str = "vertex-face CSR";
         let limits = device.limits();
-        let entries = u64::from(mesh.face_count) * 3;
-        let words = u64::from(mesh.vertex_count) + 1 + entries;
-        let scan_plan = scan::ScanPlan::new(mesh.vertex_count, &limits)?;
+        let entries = u64::from(mesh.face_capacity) * 3;
+        let words = u64::from(mesh.vertex_capacity) + 1 + entries;
+        // The scan covers one more entry than vertices, whose prefix is the
+        // total entry count.
+        let scan_plan = scan::ScanPlan::new(mesh.vertex_capacity + 1, &limits)?;
         check_binding(&limits, words * 4, RESOURCE)?;
-        check_binding(&limits, (u64::from(mesh.face_count) * 12).max(4), RESOURCE)?;
-        let face_groups = workgroups(&limits, mesh.face_count, RESOURCE)?;
-        let vertex_groups = mesh.vertex_count.div_ceil(WORKGROUP_SIZE);
+        check_binding(
+            &limits,
+            (u64::from(mesh.face_capacity) * 12).max(4),
+            RESOURCE,
+        )?;
+        let face_groups = workgroups(&limits, mesh.face_capacity, RESOURCE)?;
+        let vertex_groups = (mesh.vertex_capacity + 1).div_ceil(WORKGROUP_SIZE);
 
         let result = VertexFaceAdjacency {
             buffer: pipeline::output_buffer(device, "MOPMesh vertex faces CSR", words * 4),
-            vertex_count: mesh.vertex_count,
+            vertex_count: mesh.vertex_capacity,
             entry_count: entries as u32,
             topology: mesh.topology,
         };
-        if mesh.face_count == 0 {
+        if mesh.face_capacity == 0 {
             return Ok(result);
         }
         let faces = self.face_vertices.encode_patches(device, encoder, mesh)?;
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh vertex faces sizes"),
-            contents: bytemuck::cast_slice(&[mesh.vertex_count, mesh.face_count]),
+            contents: bytemuck::cast_slice(&[mesh.vertex_capacity, mesh.face_capacity]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         // The counting pass starts from zero, as guaranteed for new WebGPU buffers.

@@ -183,7 +183,7 @@ fn flip_batches(capacity: f32) -> Seen {
                 patch_size,
                 f64::from(capacity),
             );
-            let edges: Vec<u32> = (0..gpu.edge_count()).collect();
+            let edges: Vec<u32> = (0..mesh.edge_count() as u32).collect();
 
             for batch in 0..4 {
                 let context = format!("{} at patch size {patch_size}, batch {batch}", bench.name);

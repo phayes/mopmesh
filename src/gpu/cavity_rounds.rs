@@ -257,7 +257,7 @@ impl CavityState {
         request_count: u32,
     ) -> Result<[u64; 5], GpuError> {
         let limits = device.limits();
-        let vertex_bytes = (u64::from(mesh.vertex_count()) * 4).max(4);
+        let vertex_bytes = (u64::from(mesh.vertex_capacity()) * 4).max(4);
         let record_bytes = vertex_bytes * VERTEX_WORDS;
         let patch_bytes = (u64::from(mesh.patch_count()) * 4 * PATCH_WORDS as u64).max(4);
         let request_bytes = (u64::from(request_count) * REQUEST_WORDS as u64 * 4).max(4);

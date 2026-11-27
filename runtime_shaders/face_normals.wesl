@@ -9,6 +9,8 @@ import package::shaders::geometry::triangle::triangle_normal;
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= arrayLength(&faces) / 3u) { return; }
     let base = id.x * 3u;
+    // An unused face ID keeps its zero output.
+    if (faces[base] == 0xffffffffu) { return; }
     let a = positions[faces[base]].xyz;
     let b = positions[faces[base + 1u]].xyz;
     let c = positions[faces[base + 2u]].xyz;

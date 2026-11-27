@@ -369,6 +369,58 @@ pub(super) fn dispatch(
     pass.dispatch_workgroups(workgroups, 1, 1);
 }
 
+/// Fills buffers with one `u32` value on the GPU, such as `INVALID_ID` in the
+/// rows of unused IDs before a query writes the used ones.
+pub(super) struct Fill {
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl Fill {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
+        let module = shader_module(
+            device,
+            "MOPMesh fill",
+            include_str!(concat!(env!("OUT_DIR"), "/fill.wgsl")),
+        );
+        Self {
+            pipeline: compute_pipeline(device, "MOPMesh fill", &module, "main", None),
+        }
+    }
+
+    /// Records a fill of the first `words` words of `buffer` with `value`.
+    /// `buffer` needs `STORAGE` usage and at least `words` words. Returns
+    /// [`GpuError::LimitsExceeded`], labeled with `resource`, before
+    /// recording if the dispatch is too large.
+    pub(super) fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffer: &wgpu::Buffer,
+        words: u32,
+        value: u32,
+        resource: &'static str,
+    ) -> Result<(), GpuError> {
+        let grid = workgroup_grid(&device.limits(), words, resource)?;
+        if words == 0 {
+            return Ok(());
+        }
+        use wgpu::util::DeviceExt;
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOPMesh fill parameters"),
+            contents: bytemuck::cast_slice(&[value, words]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bindings = bind_buffers(
+            device,
+            "MOPMesh fill",
+            &self.pipeline.get_bind_group_layout(0),
+            &[&params, buffer],
+        );
+        dispatch_grid(encoder, "MOPMesh fill", &self.pipeline, &bindings, grid);
+        Ok(())
+    }
+}
+
 /// Creates a zero-initialized buffer of `bytes` bytes with `STORAGE | COPY_SRC`
 /// usage, suitable for shader results and copying to a readback buffer.
 pub(super) fn output_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {

@@ -6,15 +6,22 @@
 use super::INVALID_ID;
 use crate::Patch;
 
-/// Header words: vertex, edge, face and patch counts, then the offsets of
-/// the patch records and of the vertex, edge and face owner tables.
+/// Header words: vertex, edge and face ID capacities, the patch count, then
+/// the offsets of the patch records and of the vertex, edge and face owner
+/// tables. Every global ID is below its kind's ID capacity; a static mesh's
+/// capacities are its element counts.
 pub const HEADER_WORDS: usize = 8;
-pub const VERTEX_COUNT: usize = 0;
-pub const EDGE_COUNT: usize = 1;
-pub const FACE_COUNT: usize = 2;
+pub const ID_CAPACITY: [usize; 3] = [0, 1, 2];
 pub const PATCH_COUNT: usize = 3;
 pub const RECORDS: usize = 4;
 pub const OWNERS: [usize; 3] = [5, 6, 7];
+
+/// Words at the start of an editable mesh's mask buffer, before any patch's
+/// masks: the next unused vertex, edge and face IDs, then the live vertex,
+/// edge and face counts, then two reserved words.
+pub const ALLOCATOR_WORDS: usize = 8;
+pub const NEXT_ID: [usize; 3] = [0, 1, 2];
+pub const LIVE_COUNT: [usize; 3] = [3, 4, 5];
 
 /// Words in each patch record.
 pub const RECORD_WORDS: usize = 16;

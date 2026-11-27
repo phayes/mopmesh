@@ -148,16 +148,21 @@ impl VertexNormalQuery {
         const RESOURCE: &str = "vertex normals";
         let mesh = buffers(mesh);
         positions.check_for(mesh.topology)?;
+        if positions.len() != mesh.vertex_capacity {
+            return Err(GpuError::InvalidBuffer {
+                resource: "vertex attribute",
+            });
+        }
         let limits = device.limits();
-        GpuVertexAttribute::<[f32; 4]>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
-        let groups = workgroups(&limits, mesh.vertex_count, RESOURCE)?;
+        GpuVertexAttribute::<[f32; 4]>::check_output(&limits, mesh.vertex_capacity, RESOURCE)?;
+        let groups = workgroups(&limits, mesh.vertex_capacity, RESOURCE)?;
         let result = GpuVertexAttribute::derived(
             device,
             mesh.topology,
-            mesh.vertex_count,
+            mesh.vertex_capacity,
             "MOPMesh vertex normals",
         );
-        if mesh.vertex_count == 0 {
+        if mesh.vertex_capacity == 0 {
             return Ok(result);
         }
 
@@ -167,7 +172,7 @@ impl VertexNormalQuery {
         // Padded to 16 bytes, the minimum uniform struct size.
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh vertex normals sizes"),
-            contents: bytemuck::cast_slice(&[mesh.vertex_count, 0, 0, 0]),
+            contents: bytemuck::cast_slice(&[mesh.vertex_capacity, 0, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bindings = pipeline::bind_buffers(

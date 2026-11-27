@@ -1,6 +1,6 @@
 use super::pipeline::{self, WORKGROUP_SIZE, check_binding};
-use super::{GpuAttribute, GpuError, GpuValue};
-use crate::{Element, MeshId};
+use super::{GpuAttribute, GpuError, GpuTopology, GpuValue};
+use crate::{Element, ElementKind, MeshId};
 use std::marker::PhantomData;
 use wgpu::util::DeviceExt;
 
@@ -122,6 +122,7 @@ impl Kernels {
                 read,
                 read,
                 wgpu::BufferBindingType::Storage { read_only: false },
+                read,
             ],
         );
         let constants = [("VALUE_TYPE", value_type), ("OP", op)];
@@ -146,17 +147,26 @@ impl Kernels {
     }
 
     /// Records every level, then copies the final value into a new result.
+    /// The first level skips the values of `kind`'s IDs that `arena` marks
+    /// unused.
     #[allow(clippy::too_many_arguments)]
     fn encode<T: ReduceValue>(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: MeshId,
+        arena: &wgpu::Buffer,
+        kind: ElementKind,
         count: u32,
         input: &wgpu::Buffer,
         input_b: &wgpu::Buffer,
         resource: &'static str,
     ) -> Result<GpuReduction<T>, GpuError> {
+        let kind = match kind {
+            ElementKind::Vertex => 0u32,
+            ElementKind::Edge => 1,
+            ElementKind::Face => 2,
+        };
         // Plan the levels and check the scratch size before allocating.
         let limits = device.limits();
         let (levels, words) = plan(count, &limits, resource)?;
@@ -173,14 +183,19 @@ impl Kernels {
         for (i, level) in levels.iter().enumerate() {
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("MOPMesh reduce level"),
-                contents: bytemuck::cast_slice(&[level.count, level.source, level.destination, 0]),
+                contents: bytemuck::cast_slice(&[
+                    level.count,
+                    level.source,
+                    level.destination,
+                    kind,
+                ]),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
             let bindings = pipeline::bind_buffers(
                 device,
                 "MOPMesh reduce bindings",
                 &self.layout,
-                &[&params, input, input_b, &scratch],
+                &[&params, input, input_b, &scratch, arena],
             );
             let kernel = if i == 0 { &self.first } else { &self.next };
             pipeline::dispatch_grid(encoder, "MOPMesh reduce", kernel, &bindings, level.grid);
@@ -227,26 +242,48 @@ impl<T: ReduceValue> ReduceQuery<T> {
         }
     }
 
-    /// Records a reduction of every value of `attribute`. Returns
-    /// [`GpuError::LimitsExceeded`] before allocating or recording commands if
-    /// the scratch buffer or a dispatch is too large.
+    /// Records a reduction of the values of `attribute` at the element IDs
+    /// `mesh` uses; values at unused IDs are skipped. Returns
+    /// [`GpuError::MeshMismatch`] or [`GpuError::Stale`] if `attribute`
+    /// doesn't belong to `mesh` as it is now, [`GpuError::InvalidBuffer`] if
+    /// its length isn't the mesh's ID capacity, or
+    /// [`GpuError::LimitsExceeded`] if the scratch buffer or a dispatch is too
+    /// large. Errors occur before allocating or recording commands.
     pub fn encode<E: Element>(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        mesh: &impl GpuTopology,
         attribute: &GpuAttribute<E, T>,
     ) -> Result<GpuReduction<T>, GpuError> {
+        check_input(mesh, attribute, "reduction")?;
         let buffer = attribute.buffer();
         self.kernels.encode(
             device,
             encoder,
             attribute.mesh_id(),
+            mesh.arena(),
+            E::KIND,
             attribute.len(),
             buffer,
             buffer,
             "reduction",
         )
     }
+}
+
+/// Checks that `attribute` can be read with `mesh` as it is now, and has one
+/// value per ID.
+fn check_input<E: Element, T: GpuValue>(
+    mesh: &impl GpuTopology,
+    attribute: &GpuAttribute<E, T>,
+    resource: &'static str,
+) -> Result<(), GpuError> {
+    attribute.check_for(mesh.topology())?;
+    if attribute.len() != mesh.element_capacity(E::KIND) {
+        return Err(GpuError::InvalidBuffer { resource });
+    }
+    Ok(())
 }
 
 /// Computes the dot product of two `f32` attributes of the same mesh and
@@ -262,30 +299,29 @@ impl DotQuery {
         }
     }
 
-    /// Records the dot product of `a` and `b`. Returns
-    /// [`GpuError::MeshMismatch`] if they belong to different meshes,
-    /// [`GpuError::Stale`] if both were computed from connectivity but from
-    /// different uploads or versions, or
-    /// [`GpuError::LimitsExceeded`] if the scratch buffer or a dispatch is too
-    /// large. Errors occur before allocating or recording commands. Empty
-    /// attributes give zero.
+    /// Records the dot product of `a` and `b` over the element IDs `mesh`
+    /// uses; values at unused IDs are skipped. Returns
+    /// [`GpuError::MeshMismatch`] or [`GpuError::Stale`] if either doesn't
+    /// belong to `mesh` as it is now, [`GpuError::InvalidBuffer`] if either's
+    /// length isn't the mesh's ID capacity, or [`GpuError::LimitsExceeded`]
+    /// if the scratch buffer or a dispatch is too large. Errors occur before
+    /// allocating or recording commands. Empty attributes give zero.
     pub fn encode<E: Element>(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        mesh: &impl GpuTopology,
         a: &GpuAttribute<E, f32>,
         b: &GpuAttribute<E, f32>,
     ) -> Result<GpuReduction<f32>, GpuError> {
-        if a.mesh_id() != b.mesh_id() {
-            return Err(GpuError::MeshMismatch);
-        }
-        if let (Some(ta), Some(tb)) = (a.topology(), b.topology()) {
-            ta.check(tb)?;
-        }
+        check_input(mesh, a, "dot product")?;
+        check_input(mesh, b, "dot product")?;
         self.kernels.encode(
             device,
             encoder,
             a.mesh_id(),
+            mesh.arena(),
+            E::KIND,
             a.len(),
             a.buffer(),
             b.buffer(),

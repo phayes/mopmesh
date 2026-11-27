@@ -1,12 +1,13 @@
 use super::pipeline::{self, check_binding, group_grid};
-use super::{GpuError, GpuTopology, PatchBuffers, TopologyStamp, buffers};
+use super::{GpuError, GpuTopology, INVALID_ID, PatchBuffers, TopologyStamp, buffers};
 use crate::MeshId;
 
 /// Edge endpoints and the faces that touch each edge.
 /// The buffer contains one 16-byte WESL `EdgeRecord` per canonical edge ID:
 /// two input vertex IDs in ascending order, then two input face IDs in
-/// unspecified order. A boundary edge's missing face is [`super::INVALID_ID`].
-/// The buffer supports `STORAGE | COPY_SRC`.
+/// unspecified order. A boundary edge's missing face is [`super::INVALID_ID`],
+/// and every word of an unused edge ID's record is `INVALID_ID`. The buffer
+/// supports `STORAGE | COPY_SRC`.
 pub struct EdgeConnectivity {
     pub(super) buffer: wgpu::Buffer,
     pub(super) edge_count: u32,
@@ -32,6 +33,7 @@ impl EdgeConnectivity {
 /// across patch boundaries. Create once per device and reuse for its meshes.
 pub struct EdgeQuery {
     pipeline: wgpu::ComputePipeline,
+    fill: pipeline::Fill,
 }
 impl EdgeQuery {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -48,6 +50,7 @@ impl EdgeQuery {
                 "main",
                 None,
             ),
+            fill: pipeline::Fill::new(device),
         }
     }
 
@@ -74,15 +77,20 @@ impl EdgeQuery {
     ) -> Result<EdgeConnectivity, GpuError> {
         const RESOURCE: &str = "edge connectivity";
         let limits = device.limits();
-        let bytes = (u64::from(mesh.edge_count) * 16).max(16);
+        let bytes = (u64::from(mesh.edge_capacity) * 16).max(16);
         check_binding(&limits, bytes, RESOURCE)?;
         let grid = group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, "MOPMesh edge records", bytes),
-            edge_count: mesh.edge_count,
+            edge_count: mesh.edge_capacity,
             topology: mesh.topology,
         };
-        if mesh.edge_count != 0 {
+        if mesh.edge_capacity != 0 {
+            if mesh.unused_ids {
+                let words = 4 * mesh.edge_capacity;
+                self.fill
+                    .encode(device, encoder, &result.buffer, words, INVALID_ID, RESOURCE)?;
+            }
             pipeline::dispatch_patches(
                 device,
                 encoder,

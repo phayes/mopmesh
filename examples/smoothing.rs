@@ -95,8 +95,10 @@ async fn run() {
             .encode(&device, &mut encoder, &gpu, positions)
             .unwrap();
         (
-            sum.encode(&device, &mut encoder, &per_vertex).unwrap(),
-            sum.encode(&device, &mut encoder, &face_areas).unwrap(),
+            sum.encode(&device, &mut encoder, &gpu, &per_vertex)
+                .unwrap(),
+            sum.encode(&device, &mut encoder, &gpu, &face_areas)
+                .unwrap(),
         )
     };
     let (bending_before, area_before) = measure(&before);

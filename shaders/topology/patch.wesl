@@ -19,9 +19,12 @@ public const FACE: u32 = 2u;
 // @workgroup_size(PATCH_LANES), and step loops over slots by PATCH_LANES.
 public const PATCH_LANES: u32 = 128u;
 
-// Index of the arena word that stores the mesh's vertex count. The edge and
-// face counts follow at VERTEX_COUNT_WORD + EDGE and VERTEX_COUNT_WORD + FACE.
-public const VERTEX_COUNT_WORD: u32 = 0u;
+// Index of the arena word that stores the mesh's vertex ID capacity: every
+// vertex ID is below it. The edge and face capacities follow at
+// ID_CAPACITY_WORD + EDGE and ID_CAPACITY_WORD + FACE. A static arena's
+// capacities are its element counts; an editable arena may leave some IDs
+// below them unused.
+public const ID_CAPACITY_WORD: u32 = 0u;
 // Index of the arena word that stores the number of patches.
 public const PATCH_COUNT_WORD: u32 = 3u;
 // Index of the arena word that stores the first patch record's word offset.

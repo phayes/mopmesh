@@ -70,21 +70,21 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, queries: &Queries, mesh: &M
     let [sum, min, max] = &queries.f32;
     let expected: f64 = floats.iter().map(|&x| f64::from(x)).sum();
     let bound: f64 = floats.iter().map(|&x| f64::from(x).abs()).sum::<f64>() * 1e-6;
-    let actual = reduce(device, queue, sum, &attribute);
+    let actual = reduce(device, queue, &gpu, sum, &attribute);
     assert!(
         (f64::from(actual) - expected).abs() <= bound.max(1e-6),
         "f32 sum {actual} vs {expected}"
     );
     let lowest = floats.iter().copied().fold(f32::INFINITY, f32::min);
     let highest = floats.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    assert_eq!(reduce(device, queue, min, &attribute), lowest);
-    assert_eq!(reduce(device, queue, max, &attribute), highest);
+    assert_eq!(reduce(device, queue, &gpu, min, &attribute), lowest);
+    assert_eq!(reduce(device, queue, &gpu, max, &attribute), highest);
 
     // The dot product of the attribute with itself.
     let mut encoder = device.create_command_encoder(&Default::default());
     let dot = queries
         .dot
-        .encode(device, &mut encoder, &attribute, &attribute)
+        .encode(device, &mut encoder, &gpu, &attribute, &attribute)
         .unwrap();
     queue.submit([encoder.finish()]);
     let expected: f64 = floats.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
@@ -107,13 +107,13 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, queries: &Queries, mesh: &M
         .unwrap();
     let [sum, min, max] = &queries.u32;
     let wrapped = words.iter().fold(0u32, |a, &b| a.wrapping_add(b));
-    assert_eq!(reduce(device, queue, sum, &attribute), wrapped);
+    assert_eq!(reduce(device, queue, &gpu, sum, &attribute), wrapped);
     assert_eq!(
-        reduce(device, queue, min, &attribute),
+        reduce(device, queue, &gpu, min, &attribute),
         words.iter().copied().min().unwrap_or(u32::MAX)
     );
     assert_eq!(
-        reduce(device, queue, max, &attribute),
+        reduce(device, queue, &gpu, max, &attribute),
         words.iter().copied().max().unwrap_or(0)
     );
 
@@ -130,15 +130,15 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, queries: &Queries, mesh: &M
         .unwrap();
     let [sum, min, max] = &queries.i32;
     assert_eq!(
-        reduce(device, queue, sum, &attribute),
+        reduce(device, queue, &gpu, sum, &attribute),
         ints.iter().fold(0i32, |a, &b| a.wrapping_add(b))
     );
     assert_eq!(
-        reduce(device, queue, min, &attribute),
+        reduce(device, queue, &gpu, min, &attribute),
         ints.iter().copied().min().unwrap_or(i32::MAX)
     );
     assert_eq!(
-        reduce(device, queue, max, &attribute),
+        reduce(device, queue, &gpu, max, &attribute),
         ints.iter().copied().max().unwrap_or(i32::MIN)
     );
 
@@ -148,8 +148,11 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, queries: &Queries, mesh: &M
             .upload_attribute(device, &VertexAttribute::new(mesh, 1f32))
             .unwrap();
         let [_, min, max] = &queries.f32;
-        assert_eq!(reduce(device, queue, min, &attribute), f32::INFINITY);
-        assert_eq!(reduce(device, queue, max, &attribute), f32::NEG_INFINITY);
+        assert_eq!(reduce(device, queue, &gpu, min, &attribute), f32::INFINITY);
+        assert_eq!(
+            reduce(device, queue, &gpu, max, &attribute),
+            f32::NEG_INFINITY
+        );
     }
 }
 
@@ -160,14 +163,16 @@ fn dot_product_rejects_attributes_of_different_meshes() {
     let (a, b) = (grid(3), grid(3));
     let upload = |mesh: &Mesh| {
         let gpu = GpuMesh::upload(&device, mesh).unwrap();
-        gpu.upload_attribute(&device, &VertexAttribute::new(mesh, 1f32))
-            .unwrap()
+        let attribute = gpu
+            .upload_attribute(&device, &VertexAttribute::new(mesh, 1f32))
+            .unwrap();
+        (gpu, attribute)
     };
-    let (a, b) = (upload(&a), upload(&b));
+    let ((gpu, a), (_, b)) = (upload(&a), upload(&b));
     let mut encoder = device.create_command_encoder(&Default::default());
     assert_eq!(
         DotQuery::new(&device)
-            .encode(&device, &mut encoder, &a, &b)
+            .encode(&device, &mut encoder, &gpu, &a, &b)
             .err(),
         Some(GpuError::MeshMismatch)
     );
@@ -177,11 +182,12 @@ fn dot_product_rejects_attributes_of_different_meshes() {
 fn reduce<E: mopmesh::Element, T: ReduceValue>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    gpu: &GpuMesh,
     query: &ReduceQuery<T>,
     attribute: &mopmesh::gpu::GpuAttribute<E, T>,
 ) -> T {
     let mut encoder = device.create_command_encoder(&Default::default());
-    let result = query.encode(device, &mut encoder, attribute).unwrap();
+    let result = query.encode(device, &mut encoder, gpu, attribute).unwrap();
     assert_eq!(result.mesh_id(), attribute.mesh_id());
     queue.submit([encoder.finish()]);
     read(device, queue, &result)

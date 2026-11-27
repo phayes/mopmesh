@@ -27,8 +27,11 @@ async fn run() {
 
     // Create a 33 x 33 grid in several patches, with spare storage for the
     // copies that flips across patch borders need.
-    let (mesh, positions, _) = delaunay::skewed_grid(33, 512);
+    // Positions have one entry per vertex ID, so pad them to the mesh's
+    // vertex ID capacity.
+    let (mesh, mut positions, _) = delaunay::skewed_grid(33, 512);
     let mut gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+    positions.resize(gpu.vertex_capacity() as usize, [0.; 4]);
     let positions = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("positions"),
         contents: bytemuck::cast_slice(&positions),
@@ -47,7 +50,7 @@ async fn run() {
         let face_areas = areas
             .encode(&device, &mut encoder, gpu, &attribute)
             .unwrap();
-        let total = sum.encode(&device, &mut encoder, &face_areas).unwrap();
+        let total = sum.encode(&device, &mut encoder, gpu, &face_areas).unwrap();
         queue.submit([encoder.finish()]);
         f32::from_bits(delaunay::read_words(&device, &queue, total.buffer())[0])
     };

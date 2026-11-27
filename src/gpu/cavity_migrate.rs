@@ -242,7 +242,7 @@ pub(super) mod tests {
         let boundary = BoundaryQuery::new(device).encode(device, e, mesh).unwrap();
         queue.submit([encoder.finish()]);
 
-        let vertices = mesh.vertex_count() as usize;
+        let vertices = mesh.vertex_capacity() as usize;
         let words = |b: &wgpu::Buffer| read(device, queue, b);
         let mut edge_words = words(edges.buffer());
         sort_within(&mut edge_words, 4, 2..4);

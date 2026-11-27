@@ -10,6 +10,7 @@ fn main() {
         .build_artifact()
         .expect("emit MOPMesh shader package");
     for name in [
+        "fill",
         "face_vertices",
         "vertex_faces",
         "face_centroids",

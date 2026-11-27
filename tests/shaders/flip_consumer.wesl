@@ -4,7 +4,7 @@
 // its own positions and request. The mesh's maps are bound at group 1,
 // binding 7, by `topology::patch_map`.
 import mopmesh::topology::patch::{
-    PatchRecord, EDGE, FACE, VERTEX_COUNT_WORD, RECORDS_WORD, OWNERS_WORD,
+    PatchRecord, EDGE, FACE, ID_CAPACITY_WORD, RECORDS_WORD, OWNERS_WORD,
     record_offset, decode_record, owner_offset, used_offset, mask_word, mask_test,
     face_edge_offset, edge_vertices_offset, global_vertex_offset, global_face_offset,
 };
@@ -68,10 +68,12 @@ fn main() {
 }
 
 fn flip_if_shorter(global_edge: u32) -> u32 {
-    if (global_edge >= arena[VERTEX_COUNT_WORD + EDGE]) { return FLIP_NOT_AN_EDGE; }
+    if (global_edge >= arena[ID_CAPACITY_WORD + EDGE]) { return FLIP_NOT_AN_EDGE; }
     let edge_owners = arena[OWNERS_WORD + EDGE];
     let face_owners = arena[OWNERS_WORD + FACE];
     let owner = owner_offset(edge_owners, global_edge);
+    // An unused edge ID has no owner.
+    if (arena[owner] == INVALID) { return FLIP_NOT_AN_EDGE; }
     let r = record(arena[owner]);
     let edge = arena[owner + 1u];
 

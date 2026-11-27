@@ -1,5 +1,7 @@
 use super::pipeline::{self, WORKGROUP_SIZE, check_binding, group_grid, workgroups};
-use super::{EdgeConnectivity, GpuError, GpuTopology, PatchBuffers, TopologyStamp, buffers, scan};
+use super::{
+    EdgeConnectivity, GpuError, GpuTopology, INVALID_ID, PatchBuffers, TopologyStamp, buffers, scan,
+};
 use crate::MeshId;
 use wgpu::util::DeviceExt;
 
@@ -14,9 +16,12 @@ pub struct MeshAdjacency {
     face_count: u32,
 }
 impl MeshAdjacency {
-    /// V+1 u32 offsets followed by 2E pairs (edge ID, neighbor vertex ID).
-    /// Offsets count pairs, not words. Row order is unspecified, not cyclic.
-    /// Each edge contributes one pair to each endpoint's row.
+    /// V+1 u32 offsets followed by room for 2E pairs (edge ID, neighbor
+    /// vertex ID), where V and E are the vertex and edge ID capacities.
+    /// Offsets count pairs, not words; the last offset is the number of
+    /// pairs written, and unused vertex IDs have empty rows. Row order is
+    /// unspecified, not cyclic. Each edge contributes one pair to each
+    /// endpoint's row.
     pub fn vertex_neighbors(&self) -> &wgpu::Buffer {
         &self.vertices
     }
@@ -24,7 +29,8 @@ impl MeshAdjacency {
     /// For face vertices `[a, b, c]`, as reported by
     /// [`FaceVertexQuery`](super::FaceVertexQuery), the entries are the faces
     /// across edges `(a, b)`, `(b, c)`, and `(c, a)`. A boundary edge has no
-    /// neighbor and uses [`super::INVALID_ID`].
+    /// neighbor and uses [`super::INVALID_ID`], as do all three entries of an
+    /// unused face ID.
     pub fn face_neighbors(&self) -> &wgpu::Buffer {
         &self.faces
     }
@@ -33,7 +39,8 @@ impl MeshAdjacency {
     /// third vertex of an adjoining triangle, outside the shared edge.
     /// The opposite vertices follow the face order in [`Self::edge_connectivity`];
     /// a missing boundary face gives [`super::INVALID_ID`]. The four vertices
-    /// are not ordered around the edge.
+    /// are not ordered around the edge. All four are `INVALID_ID` for an
+    /// unused edge ID.
     pub fn edge_diamonds(&self) -> &wgpu::Buffer {
         &self.diamonds
     }
@@ -56,6 +63,9 @@ impl MeshAdjacency {
     pub fn edge_count(&self) -> u32 {
         self.edges.edge_count()
     }
+    /// Returns the room for pairs in [`vertex_neighbors`](Self::vertex_neighbors):
+    /// twice the edge ID capacity. The pairs written number the buffer's
+    /// last offset, which is smaller when some edge IDs are unused.
     pub fn vertex_entry_count(&self) -> u32 {
         2 * self.edge_count()
     }
@@ -72,6 +82,7 @@ pub struct AdjacencyQuery {
     scan: scan::ScanPipeline,
     vertex_layout: wgpu::BindGroupLayout,
     vertex_pipelines: [wgpu::ComputePipeline; 3],
+    fill: pipeline::Fill,
 }
 impl AdjacencyQuery {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -115,6 +126,7 @@ impl AdjacencyQuery {
             scan: scan::ScanPipeline::new(device),
             vertex_layout,
             vertex_pipelines,
+            fill: pipeline::Fill::new(device),
         }
     }
 
@@ -143,12 +155,16 @@ impl AdjacencyQuery {
     ) -> Result<MeshAdjacency, GpuError> {
         // Validate every size before allocating.
         let limits = device.limits();
-        let plan =
-            AdjacencyPlan::new(&limits, mesh.vertex_count, mesh.face_count, mesh.edge_count)?;
+        let plan = AdjacencyPlan::new(
+            &limits,
+            mesh.vertex_capacity,
+            mesh.face_capacity,
+            mesh.edge_capacity,
+        )?;
         let grid = group_grid(&limits, mesh.patch_count, AdjacencyPlan::RESOURCE)?;
         let edges = EdgeConnectivity {
             buffer: pipeline::output_buffer(device, "MOPMesh edge records", plan.edge_bytes),
-            edge_count: mesh.edge_count,
+            edge_count: mesh.edge_capacity,
             topology: mesh.topology,
         };
         let result = Self::outputs(device, &plan, edges);
@@ -156,8 +172,26 @@ impl AdjacencyQuery {
             return Ok(result);
         }
 
-        // Write edge records, face neighbors and diamonds in one pass per
-        // patch, then build the vertex neighbor lists from the edge records.
+        // Mark the rows of unused IDs, then write edge records, face neighbors
+        // and diamonds in one pass per patch, then build the vertex neighbor
+        // lists from the edge records.
+        if mesh.unused_ids {
+            let rows = [
+                (result.edges.buffer(), 4 * mesh.edge_capacity),
+                (&result.faces, 3 * mesh.face_capacity),
+                (&result.diamonds, 4 * mesh.edge_capacity),
+            ];
+            for (buffer, words) in rows {
+                self.fill.encode(
+                    device,
+                    encoder,
+                    buffer,
+                    words,
+                    INVALID_ID,
+                    AdjacencyPlan::RESOURCE,
+                )?;
+            }
+        }
         pipeline::dispatch_patches(
             device,
             encoder,
@@ -210,7 +244,7 @@ impl AdjacencyQuery {
             return;
         }
         let edge_groups = plan.edge_groups;
-        let vertex_groups = plan.vertex_count.div_ceil(WORKGROUP_SIZE);
+        let vertex_groups = (plan.vertex_count + 1).div_ceil(WORKGROUP_SIZE);
 
         // Build a neighbor list for each vertex: count its edges, turn the counts
         // into row offsets, then fill the rows with edge and neighbor vertex IDs.
@@ -282,7 +316,9 @@ impl AdjacencyPlan {
         edge_count: u32,
     ) -> Result<Self, GpuError> {
         const RESOURCE: &str = AdjacencyPlan::RESOURCE;
-        let scan = scan::ScanPlan::new(vertex_count, limits)?;
+        // The scan covers one more entry than vertices, whose prefix is the
+        // total pair count.
+        let scan = scan::ScanPlan::new(vertex_count + 1, limits)?;
         let vertex_bytes = 4 * (u64::from(vertex_count) + 1 + 4 * u64::from(edge_count));
         let face_bytes = (12 * u64::from(face_count)).max(4);
         let edge_bytes = (16 * u64::from(edge_count)).max(16);

@@ -7,11 +7,11 @@
 
 import package::shaders::topology::flip_pass::{
     flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request,
-    flip_finish,
+    flip_finish, flip_reject_unused,
 };
 import package::shaders::topology::patch_staging::STAGED_EDGES;
 import package::shaders::topology::patch::PATCH_LANES;
-import package::shaders::parallel::grid::flat_group;
+import package::shaders::parallel::grid::{flat_group, flat_index};
 
 // One bit per mesh-wide edge ID: bit e % 32 of word e / 32 is set when edge
 // e is requested.
@@ -39,4 +39,13 @@ fn flip(
         }
     }
     flip_finish(lane, r, edges);
+}
+
+// Reports FLIP_NOT_AN_EDGE for each requested ID no edge uses. Dispatch one
+// invocation per word of the request mask's IDs.
+@compute @workgroup_size(64)
+fn unused(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let e = flat_index(id, groups);
+    if (e >= 32u * arrayLength(&requested) || !is_requested(e)) { return; }
+    flip_reject_unused(e);
 }

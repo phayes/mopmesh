@@ -11,6 +11,7 @@ mod tests {
     use crate::gpu::adjacency::AdjacencyPlan;
     use crate::gpu::baseline::FlatQueries;
     use crate::gpu::bench_meshes;
+    use crate::gpu::editable::{editable_contents, inspect};
     use crate::gpu::pipeline::workgroups;
     use crate::gpu::test_support::{self, fixtures};
     use crate::gpu::{
@@ -117,7 +118,7 @@ mod tests {
             adjacency_edges,
             face_neighbors,
             diamonds,
-            vertex_neighbors: sorted_rows(vertex_neighbors, buffers.vertex_count),
+            vertex_neighbors: sorted_rows(vertex_neighbors, buffers.vertex_capacity),
             boundary_edges,
             boundary_vertices,
         }
@@ -135,12 +136,12 @@ mod tests {
         let buffers = buffers(gpu);
         let plan = AdjacencyPlan::new(
             &limits,
-            buffers.vertex_count,
-            buffers.face_count,
-            buffers.edge_count,
+            buffers.vertex_capacity,
+            buffers.face_capacity,
+            buffers.edge_capacity,
         )
         .unwrap();
-        let groups = workgroups(&limits, buffers.edge_count, "test").unwrap();
+        let groups = workgroups(&limits, buffers.edge_capacity, "test").unwrap();
         let mut encoder = device.create_command_encoder(&Default::default());
         let edges = q.edges.encode(device, &mut encoder, gpu).unwrap();
         let faces = q.face_vertices.encode(device, &mut encoder, gpu).unwrap();
@@ -202,12 +203,138 @@ mod tests {
             );
         }
 
-        // Editable uploads give the same words as the static upload.
-        for factor in [1.0, 1.5] {
-            let capacity = EditCapacity::new(factor).unwrap();
+        // Editable uploads give the same words as the static upload: exactly
+        // with no spare IDs, and for the used IDs with spare ones, whose
+        // other IDs read as unused.
+        // Normalize the static results the same way, which drops the
+        // placeholders of empty results.
+        let counts = [vertex_count, edge_count, gpu.face_count()];
+        let expected = dense(expected, counts, counts, |i| i);
+        for (slots, ids) in [(1.0, 1.0), (1.5, 2.0)] {
+            let capacity = EditCapacity::new(slots).unwrap().with_ids(ids).unwrap();
             let editable = GpuEditableMesh::upload(device, mesh, capacity).unwrap();
             let actual = run(device, queue, q, buffers(&editable));
-            assert_eq!(actual, expected, "{context}, capacity {factor}");
+            let capacities = [
+                editable.vertex_capacity(),
+                editable.edge_capacity(),
+                editable.face_capacity(),
+            ];
+            let actual = dense(actual, counts, capacities, |i| i);
+            assert_eq!(actual, expected, "{context}, slots {slots}, IDs {ids}");
+        }
+
+        // Used IDs spread out, with unused ones between them, give the same
+        // results once renumbered.
+        let limits = device.limits();
+        let mut words = editable_contents(mesh, EditCapacity::default(), &limits).unwrap();
+        inspect::spread_ids(&mut words);
+        if !mesh.patches().is_empty() {
+            inspect::check_invariants(&words.arena, &words.masks, &words.maps);
+        }
+        let editable = GpuEditableMesh::from_words(device, mesh.id(), &words);
+        let actual = run(device, queue, q, buffers(&editable));
+        let capacities = inspect::id_capacities(&words.arena);
+        let actual = dense(actual, counts, capacities, inspect::spread);
+        assert_eq!(actual, expected, "{context}, spread IDs");
+    }
+
+    /// Renumbers the results of an editable upload whose used IDs are
+    /// `id(i)` for each `i` below `counts` (vertex, edge and face) back to
+    /// `i`, after checking that every other ID below `capacities` reads as
+    /// unused: `INVALID_ID` rows, zero flags and empty neighbor rows.
+    fn dense(
+        r: Results,
+        counts: [u32; 3],
+        capacities: [u32; 3],
+        id: impl Fn(u32) -> u32,
+    ) -> Results {
+        const V: usize = 0;
+        const E: usize = 1;
+        const F: usize = 2;
+        let mut back = capacities.map(|c| vec![INVALID_ID; c as usize]);
+        for k in 0..3 {
+            for i in 0..counts[k] {
+                back[k][id(i) as usize] = i;
+            }
+        }
+        let used = |k: usize, new: usize| back[k][new] != INVALID_ID;
+        let old = |k: usize, w: u32| {
+            if w == INVALID_ID {
+                w
+            } else {
+                back[k][w as usize]
+            }
+        };
+
+        // Fixed-width rows, with each column's values renumbered by its kind.
+        let rows = |words: &[u32], row: usize, columns: &[usize], dead: u32, name: &str| {
+            let mut out = vec![0; counts[row] as usize * columns.len()];
+            for (new, chunk) in words.chunks(columns.len()).enumerate() {
+                if new >= capacities[row] as usize {
+                    break;
+                }
+                if !used(row, new) {
+                    assert!(chunk.iter().all(|&w| w == dead), "{name}: unused row {new}");
+                    continue;
+                }
+                let at = back[row][new] as usize * columns.len();
+                for (c, &w) in chunk.iter().enumerate() {
+                    out[at + c] = old(columns[c], w);
+                }
+            }
+            out
+        };
+        let flags = |words: &[u32], row: usize, name: &str| {
+            let mut out = vec![0; counts[row] as usize];
+            for (new, &w) in words.iter().enumerate().take(capacities[row] as usize) {
+                if used(row, new) {
+                    out[back[row][new] as usize] = w;
+                } else {
+                    assert_eq!(w, 0, "{name}: unused flag {new}");
+                }
+            }
+            out
+        };
+
+        // Vertex neighbor rows, rebuilt in dense order.
+        let v = capacities[V] as usize;
+        let (offsets, pairs) = r.vertex_neighbors.split_at(v + 1);
+        let mut neighbors = vec![0u32];
+        let mut entries: Vec<u32> = Vec::new();
+        for i in 0..counts[V] {
+            let new = id(i) as usize;
+            let row = 2 * offsets[new] as usize..2 * offsets[new + 1] as usize;
+            let mut row: Vec<[u32; 2]> = pairs[row]
+                .chunks(2)
+                .map(|p| [old(E, p[0]), old(V, p[1])])
+                .collect();
+            row.sort();
+            entries.extend(row.as_flattened());
+            neighbors.push((entries.len() / 2) as u32);
+        }
+        for new in (0..v).filter(|&n| !used(V, n)) {
+            assert_eq!(
+                offsets[new],
+                offsets[new + 1],
+                "unused vertex {new} has neighbors"
+            );
+        }
+        assert_eq!(
+            offsets[v] as usize,
+            entries.len() / 2,
+            "last offset counts the pairs"
+        );
+        neighbors.extend(entries);
+
+        Results {
+            edges: rows(&r.edges, E, &[V, V, F, F], INVALID_ID, "edges"),
+            face_vertices: rows(&r.face_vertices, F, &[V, V, V], INVALID_ID, "faces"),
+            adjacency_edges: rows(&r.adjacency_edges, E, &[V, V, F, F], INVALID_ID, "records"),
+            face_neighbors: rows(&r.face_neighbors, F, &[F, F, F], INVALID_ID, "FF"),
+            diamonds: rows(&r.diamonds, E, &[V, V, V, V], INVALID_ID, "diamonds"),
+            vertex_neighbors: neighbors,
+            boundary_edges: flags(&r.boundary_edges, E, "boundary edges"),
+            boundary_vertices: flags(&r.boundary_vertices, V, "boundary vertices"),
         }
     }
 

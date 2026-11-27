@@ -1,4 +1,5 @@
 import package::shaders::parallel::grid::{flat_group, flat_index};
+import package::shaders::topology::patch::{OWNERS_WORD, owner_offset};
 
 // Value type of the reduced attribute: 0 = f32, 1 = u32, 2 = i32.
 override VALUE_TYPE: u32 = 0u;
@@ -6,7 +7,8 @@ override VALUE_TYPE: u32 = 0u;
 // input_b (f32 only; summed like operation 0).
 override OP: u32 = 0u;
 
-struct Params { count: u32, source: u32, destination: u32, _pad: u32, }
+// `kind` is the attribute's element kind: 0 vertex, 1 edge, 2 face.
+struct Params { count: u32, source: u32, destination: u32, kind: u32, }
 @group(0) @binding(0) var<uniform> params: Params;
 // The attribute as raw 32-bit words.
 @group(0) @binding(1) var<storage, read> input: array<u32>;
@@ -15,6 +17,15 @@ struct Params { count: u32, source: u32, destination: u32, _pad: u32, }
 // Each level writes one partial result per workgroup at `destination`; later
 // levels read the previous level's partials from `source`.
 @group(0) @binding(3) var<storage, read_write> scratch: array<u32>;
+// The mesh's patch arena. Its owner tables, if it has them, mark unused IDs,
+// whose values the first level skips.
+@group(0) @binding(4) var<storage, read> arena: array<u32>;
+
+// Whether element `i` of the attribute's kind is in use.
+fn used(i: u32) -> bool {
+    let table = arena[OWNERS_WORD + params.kind];
+    return table == 0xffffffffu || arena[owner_offset(table, i)] != 0xffffffffu;
+}
 
 var<workgroup> partial: array<u32, 64>;
 
@@ -81,7 +92,7 @@ fn first(
 ) {
     let i = flat_index(id, groups);
     var value = identity();
-    if (i < params.count) {
+    if (i < params.count && used(i)) {
         value = input[i];
         if (OP == 3u) {
             value = bitcast<u32>(bitcast<f32>(value) * bitcast<f32>(input_b[i]));

@@ -87,28 +87,38 @@ pub trait GpuTopology: sealed::Sealed {
     fn masks(&self) -> &wgpu::Buffer;
     /// Returns the number of face groups used to process the mesh on the GPU.
     fn patch_count(&self) -> u32;
-    fn vertex_count(&self) -> u32;
-    fn edge_count(&self) -> u32;
-    fn face_count(&self) -> u32;
-    /// Returns the number of vertices, edges or faces.
-    fn element_count(&self, kind: ElementKind) -> u32 {
+    /// Returns the vertex ID capacity: every vertex ID is below it, and
+    /// per-vertex attributes and results have this many entries. For a
+    /// [`GpuMesh`] it is the vertex count.
+    fn vertex_capacity(&self) -> u32;
+    /// Returns the edge ID capacity; see [`vertex_capacity`](Self::vertex_capacity).
+    fn edge_capacity(&self) -> u32;
+    /// Returns the face ID capacity; see [`vertex_capacity`](Self::vertex_capacity).
+    fn face_capacity(&self) -> u32;
+    /// Returns whether some IDs below the capacities may be unused. Results
+    /// hold `INVALID_ID` or zero for unused IDs. Always `false` for a
+    /// [`GpuMesh`], whose IDs are all in use.
+    fn has_unused_ids(&self) -> bool;
+    /// Returns the vertex, edge or face ID capacity.
+    fn element_capacity(&self, kind: ElementKind) -> u32 {
         match kind {
-            ElementKind::Vertex => self.vertex_count(),
-            ElementKind::Edge => self.edge_count(),
-            ElementKind::Face => self.face_count(),
+            ElementKind::Vertex => self.vertex_capacity(),
+            ElementKind::Edge => self.edge_capacity(),
+            ElementKind::Face => self.face_capacity(),
         }
     }
 }
 
-/// Borrows `mesh`'s connectivity buffers, counts and current stamp for a query.
+/// Borrows `mesh`'s connectivity buffers, capacities and current stamp for a query.
 pub(crate) fn buffers(mesh: &impl GpuTopology) -> PatchBuffers<'_> {
     PatchBuffers {
         arena: mesh.arena(),
         masks: mesh.masks(),
         patch_count: mesh.patch_count(),
-        vertex_count: mesh.vertex_count(),
-        face_count: mesh.face_count(),
-        edge_count: mesh.edge_count(),
+        vertex_capacity: mesh.vertex_capacity(),
+        face_capacity: mesh.face_capacity(),
+        edge_capacity: mesh.edge_capacity(),
+        unused_ids: mesh.has_unused_ids(),
         topology: mesh.topology(),
     }
 }
@@ -129,14 +139,17 @@ impl GpuTopology for GpuMesh {
     fn patch_count(&self) -> u32 {
         GpuMesh::patch_count(self)
     }
-    fn vertex_count(&self) -> u32 {
+    fn vertex_capacity(&self) -> u32 {
         GpuMesh::vertex_count(self)
     }
-    fn edge_count(&self) -> u32 {
+    fn edge_capacity(&self) -> u32 {
         GpuMesh::edge_count(self)
     }
-    fn face_count(&self) -> u32 {
+    fn face_capacity(&self) -> u32 {
         GpuMesh::face_count(self)
+    }
+    fn has_unused_ids(&self) -> bool {
+        false
     }
 }
 
@@ -156,13 +169,16 @@ impl GpuTopology for GpuEditableMesh {
     fn patch_count(&self) -> u32 {
         GpuEditableMesh::patch_count(self)
     }
-    fn vertex_count(&self) -> u32 {
-        GpuEditableMesh::vertex_count(self)
+    fn vertex_capacity(&self) -> u32 {
+        GpuEditableMesh::vertex_capacity(self)
     }
-    fn edge_count(&self) -> u32 {
-        GpuEditableMesh::edge_count(self)
+    fn edge_capacity(&self) -> u32 {
+        GpuEditableMesh::edge_capacity(self)
     }
-    fn face_count(&self) -> u32 {
-        GpuEditableMesh::face_count(self)
+    fn face_capacity(&self) -> u32 {
+        GpuEditableMesh::face_capacity(self)
+    }
+    fn has_unused_ids(&self) -> bool {
+        true
     }
 }

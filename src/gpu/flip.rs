@@ -42,9 +42,10 @@ pub enum FlipStatus {
     /// kernels that place flips in free slots with `flip_writes` report it
     /// when a patch has no free slot for the new edge or faces.
     OutOfCapacity,
-    /// The requested edge ID is not less than the mesh's edge count. Reported
-    /// by your own WESL kernels that use the `FLIP_NOT_AN_EDGE` constant;
-    /// [`EdgeFlipQuery::encode`] returns an error for such IDs instead.
+    /// No edge uses the requested ID. [`EdgeFlipQuery::encode`] reports it
+    /// for an unused ID below the mesh's edge ID capacity, and returns an
+    /// error for IDs at or above it. Your own WESL kernels can report it with
+    /// `flip_reject_unused` or the `FLIP_NOT_AN_EDGE` constant.
     NotAnEdge,
     /// The flip crosses patch borders and was still waiting for its turn
     /// when the batch ended. It may be retried in a later batch.
@@ -145,6 +146,8 @@ pub struct EdgeFlipQuery {
     selected: wgpu::BindGroupLayout,
     pass: wgpu::BindGroupLayout,
     flip: wgpu::ComputePipeline,
+    /// Reports requested IDs that no edge uses.
+    unused: wgpu::ComputePipeline,
     /// Flips this round's selected cross-patch requests.
     flip_selected: wgpu::ComputePipeline,
     /// The gather, merge and finish stages, and their bindings.
@@ -163,10 +166,10 @@ const CROSS_PATCH_ROUNDS: u32 = 8;
 fn check_cross_patch(device: &wgpu::Device, mesh: &GpuEditableMesh) -> Result<(), GpuError> {
     pipeline::workgroup_grid(
         &device.limits(),
-        mesh.edge_count(),
+        mesh.edge_capacity(),
         "cross-patch edge flips",
     )?;
-    CavityState::check(device, mesh, mesh.edge_count())?;
+    CavityState::check(device, mesh, mesh.edge_capacity())?;
     Ok(())
 }
 
@@ -214,6 +217,13 @@ impl EdgeFlipQuery {
             "MOPMesh edge flip",
             &module,
             "flip",
+            Some(&pipeline_layout),
+        );
+        let unused = pipeline::compute_pipeline(
+            device,
+            "MOPMesh unused edge flip requests",
+            &module,
+            "unused",
             Some(&pipeline_layout),
         );
 
@@ -264,6 +274,7 @@ impl EdgeFlipQuery {
         };
         Self {
             flip,
+            unused,
             flip_selected,
             gather: stage("gather"),
             merge: stage("merge"),
@@ -304,9 +315,13 @@ impl EdgeFlipQuery {
         // Check buffer sizes and dispatch dimensions before allocating or counting an edit.
         const RESOURCE: &str = "edge flips";
         let limits = device.limits();
-        let edges = u64::from(mesh.edge_count());
+        let edges = u64::from(mesh.edge_capacity());
         let state_bytes = edges * u64::from(STATE_WORDS) * 4;
-        for bytes in [state_bytes, edges * 4, u64::from(mesh.vertex_count()) * 4] {
+        for bytes in [
+            state_bytes,
+            edges * 4,
+            u64::from(mesh.vertex_capacity()) * 4,
+        ] {
             pipeline::check_binding(&limits, bytes, RESOURCE)?;
         }
         let patch_grid = pipeline::group_grid(&limits, mesh.patch_count(), RESOURCE)?;
@@ -322,13 +337,13 @@ impl EdgeFlipQuery {
             contents: bytemuck::cast_slice(&[seed, 0, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let vertices = u64::from(mesh.vertex_count());
+        let vertices = u64::from(mesh.vertex_capacity());
         let claims = scratch_buffer(device, "MOPMesh edge flip claims", words(vertices));
         let partners = scratch_buffer(device, "MOPMesh edge flip partners", words(vertices));
         let state = scratch_buffer(device, "MOPMesh edge flip state", state_bytes.max(4));
         let statuses = GpuFlipStatuses {
             buffer: pipeline::output_buffer(device, "MOPMesh edge flip statuses", words(edges)),
-            len: mesh.edge_count(),
+            len: mesh.edge_capacity(),
         };
         let bind_group = pipeline::bind_buffers(
             device,
@@ -402,7 +417,7 @@ impl EdgeFlipQuery {
     ) -> GpuFlipStatuses {
         const RESOURCE: &str = "cross-patch edge flips";
         let checked = "checked by check_cross_patch";
-        let edges = mesh.edge_count();
+        let edges = mesh.edge_capacity();
         let flat = pipeline::workgroup_grid(&device.limits(), edges, RESOURCE).expect(checked);
         let state = CavityState::zeroed(device, mesh, edges, pass.seed).expect(checked);
 
@@ -520,7 +535,7 @@ impl EdgeFlipQuery {
         edges: &[u32],
     ) -> Result<GpuFlipStatuses, GpuError> {
         // Check the IDs and every limit before allocating or recording.
-        if edges.iter().any(|&e| e >= mesh.edge_count()) {
+        if edges.iter().any(|&e| e >= mesh.edge_capacity()) {
             return Err(GpuError::ElementOutOfRange {
                 resource: "edge flip requests",
             });
@@ -548,17 +563,18 @@ impl EdgeFlipQuery {
         // Check the IDs, then prepare the pass, which counts an edit even
         // when there are no requests.
         const RESOURCE: &str = "edge flip requests";
-        let edge_count = mesh.edge_count();
-        if edges.iter().any(|&e| e >= edge_count) {
+        let edge_capacity = mesh.edge_capacity();
+        if edges.iter().any(|&e| e >= edge_capacity) {
             return Err(GpuError::ElementOutOfRange { resource: RESOURCE });
         }
+        let unused_grid = pipeline::workgroup_grid(&device.limits(), edge_capacity, RESOURCE)?;
         let pass = self.begin_pass(device, mesh)?;
         if edges.is_empty() {
             return Ok(pass);
         }
 
         // Mark each requested edge in a bit mask.
-        let mut mask = vec![0u32; edge_count.div_ceil(32) as usize];
+        let mut mask = vec![0u32; edge_capacity.div_ceil(32) as usize];
         for &e in edges {
             mask[(e / 32) as usize] |= 1 << (e % 32);
         }
@@ -569,6 +585,15 @@ impl EdgeFlipQuery {
         });
         let bindings = pipeline::bind_buffers(device, RESOURCE, &self.requests, &[&requests]);
 
+        // Requests for unused IDs report NotAnEdge; the flip pass visits only
+        // edges in use.
+        pipeline::dispatch_grid_groups(
+            encoder,
+            "MOPMesh unused edge flip requests",
+            &self.unused,
+            &[&bindings, pass.bind_group()],
+            unused_grid,
+        );
         pipeline::dispatch_grid_groups(
             encoder,
             "MOPMesh edge flip",
@@ -829,7 +854,7 @@ mod tests {
                 .encode_interior(&self.device, &mut encoder, mesh, edges)
                 .unwrap()
                 .statuses;
-            assert_eq!(statuses.len(), mesh.edge_count());
+            assert_eq!(statuses.len(), mesh.edge_capacity());
             let words =
                 test_support::read_words(&self.device, &self.queue, encoder, statuses.buffer());
             for (e, &w) in words[..statuses.len() as usize].iter().enumerate() {
@@ -1629,8 +1654,8 @@ mod tests {
             .query
             .encode(&gpu.device, &mut encoder, &mut editable, &[])
             .unwrap();
-        // One status per edge, all reporting that nothing was requested.
-        assert_eq!(statuses.len(), mesh.edge_count() as u32);
+        // One status per edge ID, all reporting that nothing was requested.
+        assert_eq!(statuses.len(), editable.edge_capacity());
         let words = test_support::read_words(&gpu.device, &gpu.queue, encoder, statuses.buffer());
         assert!(words[..statuses.len() as usize].iter().all(|&w| w == 0));
         assert_eq!(editable.version(), 1);

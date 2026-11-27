@@ -531,11 +531,11 @@ impl Bench {
             ),
             (
                 "sum of face areas",
-                Box::new(|e| drop(self.sum.encode(d, e, &areas).unwrap())),
+                Box::new(|e| drop(self.sum.encode(d, e, gpu, &areas).unwrap())),
             ),
             (
                 "dot of face areas",
-                Box::new(|e| drop(self.dot.encode(d, e, &areas, &areas).unwrap())),
+                Box::new(|e| drop(self.dot.encode(d, e, gpu, &areas, &areas).unwrap())),
             ),
         ];
 

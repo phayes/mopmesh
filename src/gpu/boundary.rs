@@ -50,24 +50,24 @@ impl BoundaryQuery {
         // Check sizes, then allocate zeroed flags.
         const RESOURCE: &str = "boundary flags";
         let limits = device.limits();
-        GpuEdgeAttribute::<u32>::check_output(&limits, mesh.edge_count, RESOURCE)?;
-        GpuVertexAttribute::<u32>::check_output(&limits, mesh.vertex_count, RESOURCE)?;
+        GpuEdgeAttribute::<u32>::check_output(&limits, mesh.edge_capacity, RESOURCE)?;
+        GpuVertexAttribute::<u32>::check_output(&limits, mesh.vertex_capacity, RESOURCE)?;
         let grid = group_grid(&limits, mesh.patch_count, RESOURCE)?;
         let result = MeshBoundary {
             edges: GpuEdgeAttribute::derived(
                 device,
                 mesh.topology,
-                mesh.edge_count,
+                mesh.edge_capacity,
                 "MOPMesh boundary edges",
             ),
             vertices: GpuVertexAttribute::derived(
                 device,
                 mesh.topology,
-                mesh.vertex_count,
+                mesh.vertex_capacity,
                 "MOPMesh boundary vertices",
             ),
         };
-        if mesh.edge_count == 0 {
+        if mesh.edge_capacity == 0 {
             return Ok(result);
         }
 

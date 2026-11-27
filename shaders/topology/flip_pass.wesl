@@ -42,7 +42,7 @@
 // FLIP_LOST_CLAIM or FLIP_RETRY can be tried again in a later batch.
 
 import super::patch::{
-    PatchRecord, EDGE, FACE, PATCH_COUNT_WORD, RECORDS_WORD,
+    PatchRecord, EDGE, FACE, PATCH_COUNT_WORD, RECORDS_WORD, OWNERS_WORD, owner_offset,
     record_offset, decode_record, used_offset, mask_word, mask_test,
     face_edge_offset, edge_vertices_offset, global_vertex_offset, global_edge_offset,
     PATCH_LANES,
@@ -50,7 +50,7 @@ import super::patch::{
 import super::flip::{
     FaceEdges, FlipQuad, flip_quad, flip_in_place_writes, flip_priority, runs_stored_order,
     FLIP_IN_PLACE_WRITES, FLIP_NOT_REQUESTED, FLIP_DONE, FLIP_BOUNDARY, FLIP_NOT_INTERIOR,
-    FLIP_CONNECTED, FLIP_LOST_CLAIM,
+    FLIP_CONNECTED, FLIP_LOST_CLAIM, FLIP_NOT_AN_EDGE,
 };
 import super::patch_staging::{clear_staged_edges, stage_face_edge, staged_edge_faces};
 import super::edge::INVALID_FACE;
@@ -166,6 +166,17 @@ fn quad_of(r: PatchRecord, edge: u32, first: FaceEdges, second: FaceEdges) -> Fl
 // without calling the other flip functions.
 public fn flip_patch_count(lane: u32) -> u32 {
     return broadcast(lane, arena[PATCH_COUNT_WORD]);
+}
+
+// Reports FLIP_NOT_AN_EDGE for `edge` if no edge uses that mesh-wide ID,
+// and returns whether it did. Per-patch kernels only visit edges in use, so
+// call this from a separate dispatch for each requested ID, which must be
+// below the edge ID capacity.
+public fn flip_reject_unused(edge: u32) -> bool {
+    let at = owner_offset(arena[OWNERS_WORD + EDGE], edge);
+    if (arena[at] != 0xffffffffu) { return false; }
+    statuses[edge] = FLIP_NOT_AN_EDGE;
+    return true;
 }
 
 // Returns the record of patch `p`, which must be less than flip_patch_count.

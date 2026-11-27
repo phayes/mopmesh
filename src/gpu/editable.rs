@@ -4,39 +4,82 @@ use super::{GpuError, INVALID_ID, TopologyStamp};
 use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
 
-/// How much spare room each patch gets for edits.
+/// How much spare room an editable mesh gets for edits.
 ///
-/// Each patch gets `factor` times as many local vertex, edge and face slots as
-/// it has elements, rounded up. Edits that need more free slots in a patch than
-/// it has are rejected. An edge flip across patch borders makes one patch take
-/// over the faces around it, and that patch needs room for copies of their
-/// neighbors; flips inside one patch need none. Small patches fill up sooner:
-/// with the default factor, a Delaunay settle at patch size 64 or less can
-/// leave edges that report [`FlipStatus::OutOfCapacity`](super::FlipStatus::OutOfCapacity).
+/// **Slots.** Each patch gets `factor` times as many local vertex, edge and
+/// face slots as it has elements, rounded up. Edits that need more free slots
+/// in a patch than it has are rejected. An edge flip across patch borders
+/// makes one patch take over the faces around it, and that patch needs room
+/// for copies of their neighbors; flips inside one patch need none. Small
+/// patches fill up sooner: with the default factor, a Delaunay settle at
+/// patch size 64 or less can leave edges that report
+/// [`FlipStatus::OutOfCapacity`](super::FlipStatus::OutOfCapacity).
+///
+/// **IDs.** The mesh gets [`ids`](Self::ids) times as many vertex, edge and
+/// face IDs as it has elements, rounded up: its ID capacities. Edits that add
+/// elements give them unused IDs below the capacity, and IDs of removed
+/// elements become unused. Attributes and per-element query results have one
+/// entry per ID, so they grow with this factor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditCapacity {
     factor: f32,
+    ids: f32,
+}
+
+/// Returns `None` unless `factor` is finite and at least 1.
+fn checked_factor(factor: f32) -> Option<f32> {
+    (factor.is_finite() && factor >= 1.0).then_some(factor)
+}
+
+/// Returns `ceil(count * factor)`, or `None` if it exceeds `limit`.
+fn scaled(count: usize, factor: f32, limit: u32) -> Option<u32> {
+    let n = (count as f64 * f64::from(factor)).ceil();
+    (n <= f64::from(limit)).then_some(n as u32)
 }
 
 impl EditCapacity {
-    /// Returns `None` unless `factor` is finite and at least 1.
+    /// Returns a capacity with `factor` times as many slots per patch and the
+    /// default ID room, or `None` unless `factor` is finite and at least 1.
     pub fn new(factor: f32) -> Option<Self> {
-        (factor.is_finite() && factor >= 1.0).then_some(Self { factor })
+        Some(Self {
+            factor: checked_factor(factor)?,
+            ..Self::default()
+        })
     }
+    /// Returns this capacity with `ids` times as many IDs as elements, or
+    /// `None` unless `ids` is finite and at least 1.
+    pub fn with_ids(self, ids: f32) -> Option<Self> {
+        Some(Self {
+            ids: checked_factor(ids)?,
+            ..self
+        })
+    }
+    /// Returns the slot factor per patch.
     pub fn factor(self) -> f32 {
         self.factor
     }
+    /// Returns the ID factor.
+    pub fn ids(self) -> f32 {
+        self.ids
+    }
     /// Returns the slot count for `count` elements, or `None` if it exceeds `u32`.
     fn slots(self, count: usize) -> Option<u32> {
-        let slots = (count as f64 * f64::from(self.factor)).ceil();
-        (slots <= f64::from(u32::MAX)).then_some(slots as u32)
+        scaled(count, self.factor, u32::MAX)
+    }
+    /// Returns the ID capacity for `count` elements, or `None` if it would
+    /// reach the reserved IDs at the top of the `u32` range.
+    fn id_capacity(self, count: usize) -> Option<u32> {
+        scaled(count, self.ids, INVALID_ID - 1)
     }
 }
 
-/// A factor of 2.
+/// Factors of 2 for slots and IDs.
 impl Default for EditCapacity {
     fn default() -> Self {
-        Self { factor: 2.0 }
+        Self {
+            factor: 2.0,
+            ids: 2.0,
+        }
     }
 }
 
@@ -55,17 +98,24 @@ pub(super) struct EditableWords {
 /// words, computed before anything is allocated.
 struct Sizes {
     capacities: Vec<[u32; 3]>,
+    /// Vertex, edge and face ID capacities.
+    ids: [u32; 3],
     arena: u64,
     masks: u64,
     maps: u64,
 }
 
 fn sizes(mesh: &Mesh, capacity: EditCapacity) -> Option<Sizes> {
-    let owners = u64::from(layout::OWNER_WORDS)
-        * (mesh.positions().len() + mesh.edge_count() + mesh.face_count()) as u64;
+    let counts = [mesh.positions().len(), mesh.edge_count(), mesh.face_count()];
+    let ids = [
+        capacity.id_capacity(counts[0])?,
+        capacity.id_capacity(counts[1])?,
+        capacity.id_capacity(counts[2])?,
+    ];
+    let owners = u64::from(layout::OWNER_WORDS) * ids.iter().map(|&n| u64::from(n)).sum::<u64>();
     let mut arena =
         (layout::HEADER_WORDS + layout::RECORD_WORDS * mesh.patches().len()) as u64 + owners;
-    let mut masks = 0u64;
+    let mut masks = layout::ALLOCATOR_WORDS as u64;
     let mut capacities = Vec::with_capacity(mesh.patches().len());
     for p in mesh.patches() {
         let [v, e, f] = [
@@ -80,6 +130,7 @@ fn sizes(mesh: &Mesh, capacity: EditCapacity) -> Option<Sizes> {
     let maps = layout::maps_words(&capacities);
     Some(Sizes {
         capacities,
+        ids,
         arena,
         masks,
         maps,
@@ -114,11 +165,13 @@ pub(super) fn editable_contents(
     )?;
 
     // Header, then placeholder records and owner tables filled in below.
+    // IDs past the mesh's counts start unused: their owner entries are
+    // INVALID_ID.
     let counts = [mesh.positions().len(), mesh.edge_count(), mesh.face_count()];
     let mut arena = vec![0u32; layout::HEADER_WORDS];
-    arena[layout::VERTEX_COUNT] = counts[0] as u32;
-    arena[layout::EDGE_COUNT] = counts[1] as u32;
-    arena[layout::FACE_COUNT] = counts[2] as u32;
+    for kind in 0..3 {
+        arena[layout::ID_CAPACITY[kind]] = sizes.ids[kind];
+    }
     arena[layout::PATCH_COUNT] = mesh.patches().len() as u32;
     arena[layout::RECORDS] = arena.len() as u32;
     arena.resize(
@@ -126,11 +179,11 @@ pub(super) fn editable_contents(
         0,
     );
     let mut owner_offsets = [0u32; 3];
-    for (kind, &count) in counts.iter().enumerate() {
+    for (kind, &ids) in sizes.ids.iter().enumerate() {
         owner_offsets[kind] = arena.len() as u32;
         arena[layout::OWNERS[kind]] = arena.len() as u32;
         arena.resize(
-            arena.len() + layout::OWNER_WORDS as usize * count,
+            arena.len() + (layout::OWNER_WORDS * ids) as usize,
             INVALID_ID,
         );
     }
@@ -138,8 +191,14 @@ pub(super) fn editable_contents(
     // Mark each vertex whose faces all belong to one patch.
     let interior_patch = interior_patches(mesh);
 
-    // Store each patch's regions and masks, and its owned elements in the owner tables.
+    // The allocator words, then each patch's regions and masks, and its owned
+    // elements in the owner tables.
     let mut masks = Vec::with_capacity(sizes.masks as usize);
+    masks.resize(layout::ALLOCATOR_WORDS, 0);
+    for kind in 0..3 {
+        masks[layout::NEXT_ID[kind]] = counts[kind] as u32;
+        masks[layout::LIVE_COUNT[kind]] = counts[kind] as u32;
+    }
     for (p, &capacities) in mesh.patches().iter().zip(&sizes.capacities) {
         let record = append_patch(&mut arena, &mut masks, p, capacities, Some(&interior_patch));
         let start = layout::HEADER_WORDS + layout::RECORD_WORDS * p.id() as usize;
@@ -156,9 +215,6 @@ pub(super) fn editable_contents(
     }
     debug_assert_eq!(arena.len() as u64, sizes.arena);
     debug_assert_eq!(masks.len() as u64, sizes.masks);
-    if masks.is_empty() {
-        masks.push(0);
-    }
 
     // Map every element a patch holds from its global ID to its slot.
     let ids: Vec<[&[u32]; 3]> = mesh
@@ -206,9 +262,8 @@ pub struct GpuEditableMesh {
     arena: wgpu::Buffer,
     masks: wgpu::Buffer,
     maps: wgpu::Buffer,
-    vertex_count: u32,
-    edge_count: u32,
-    face_count: u32,
+    /// Vertex, edge and face ID capacities.
+    id_capacity: [u32; 3],
     patch_count: u32,
     mesh: MeshId,
     /// Unique to this upload, so results from another upload are rejected.
@@ -233,6 +288,11 @@ impl GpuEditableMesh {
         capacity: EditCapacity,
     ) -> Result<Self, GpuError> {
         let words = editable_contents(mesh, capacity, &device.limits())?;
+        Ok(Self::from_words(device, mesh.id(), &words))
+    }
+
+    /// Uploads arena, mask and map words built for the CPU mesh `mesh`.
+    pub(super) fn from_words(device: &wgpu::Device, mesh: MeshId, words: &EditableWords) -> Self {
         let buffer = |label, words: &[u32]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -240,22 +300,21 @@ impl GpuEditableMesh {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             })
         };
-        Ok(Self {
+        Self {
             arena: buffer("MOPMesh editable connectivity", &words.arena),
             masks: buffer("MOPMesh editable connectivity masks", &words.masks),
             maps: buffer("MOPMesh editable connectivity maps", &words.maps),
-            vertex_count: words.arena[layout::VERTEX_COUNT],
-            edge_count: words.arena[layout::EDGE_COUNT],
-            face_count: words.arena[layout::FACE_COUNT],
+            id_capacity: layout::ID_CAPACITY.map(|i| words.arena[i]),
             patch_count: words.arena[layout::PATCH_COUNT],
-            mesh: mesh.id(),
+            mesh,
             upload: next_upload(),
             version: 0,
-        })
+        }
     }
 
-    /// Header: vertex, edge, face and patch counts, then the word offsets of
-    /// the patch records and of the vertex, edge and face owner tables.
+    /// Header: vertex, edge and face ID capacities and the patch count, then
+    /// the word offsets of the patch records and of the vertex, edge and face
+    /// owner tables.
     ///
     /// Each 16-word patch record holds the vertex, edge and face slot
     /// capacities; the arena offsets of its global vertex IDs, edge vertices
@@ -264,22 +323,26 @@ impl GpuEditableMesh {
     /// then the mask-buffer offsets of its active vertex, edge and face masks,
     /// its owned vertex, edge and face masks, its interior-vertex mask, and its
     /// used-slot counts. Each owner-table entry is the patch and local slot
-    /// that owns that global ID.
+    /// that owns that global ID; both words are `INVALID_ID` for an unused ID.
     ///
     /// Unused slots hold [`INVALID_ID`](super::INVALID_ID). All offsets are in
     /// `u32` words.
     pub fn arena(&self) -> &wgpu::Buffer {
         &self.arena
     }
-    /// Per-patch slot state: bitmasks with one bit per local slot, packed into
-    /// `u32` words starting at the low bit, and used-slot counts.
-    /// [`arena`](Self::arena) gives each entry's word offset.
+    /// Slot state: eight mesh-wide words, then per-patch bitmasks with one bit
+    /// per local slot, packed into `u32` words starting at the low bit, and
+    /// used-slot counts. [`arena`](Self::arena) gives each patch entry's word
+    /// offset.
+    ///
+    /// The mesh-wide words are the lowest vertex, edge and face IDs no element
+    /// has used yet, then the numbers of vertices, edges and faces in the
+    /// mesh, then two reserved words.
     ///
     /// An active slot holds an element, an owned slot holds the element's
     /// owning copy, and an interior vertex has every face around it owned by
     /// that patch. The used-slot counts are three words, for vertices, edges
-    /// and faces: every active slot is below its count. For a mesh with no
-    /// patches, the buffer is one zero word.
+    /// and faces: every active slot is below its count.
     pub fn masks(&self) -> &wgpu::Buffer {
         &self.masks
     }
@@ -331,14 +394,19 @@ impl GpuEditableMesh {
     pub fn patch_count(&self) -> u32 {
         self.patch_count
     }
-    pub fn vertex_count(&self) -> u32 {
-        self.vertex_count
+    /// Returns the vertex ID capacity: every vertex ID is below it, and
+    /// vertex attributes and results have this many entries. Some IDs below
+    /// it may be unused.
+    pub fn vertex_capacity(&self) -> u32 {
+        self.id_capacity[0]
     }
-    pub fn edge_count(&self) -> u32 {
-        self.edge_count
+    /// Returns the edge ID capacity; see [`vertex_capacity`](Self::vertex_capacity).
+    pub fn edge_capacity(&self) -> u32 {
+        self.id_capacity[1]
     }
-    pub fn face_count(&self) -> u32 {
-        self.face_count
+    /// Returns the face ID capacity; see [`vertex_capacity`](Self::vertex_capacity).
+    pub fn face_capacity(&self) -> u32 {
+        self.id_capacity[2]
     }
 }
 
@@ -366,6 +434,68 @@ pub(super) mod inspect {
 
     fn bit(masks: &[u32], offset: u32, slot: u32) -> bool {
         masks[(offset + slot / 32) as usize] & (1 << (slot % 32)) != 0
+    }
+
+    /// The new ID of `id` after [`spread_ids`].
+    pub fn spread(id: u32) -> u32 {
+        2 * id + 1
+    }
+
+    /// Renumbers every global ID `i` of a fresh upload's words to
+    /// `spread(i)`, leaving ID 0 and every even ID unused, as edits that
+    /// remove elements would. Panics unless each kind's ID capacity is at
+    /// least twice its element count.
+    pub fn spread_ids(words: &mut super::EditableWords) {
+        let recs = records(&words.arena);
+        let live = layout::LIVE_COUNT.map(|i| words.masks[i]);
+        let capacities = id_capacities(&words.arena);
+        for k in 0..3 {
+            assert!(2 * live[k] <= capacities[k], "kind {k}: too few spare IDs");
+        }
+
+        // Renumber the IDs each patch holds; a fresh upload's slots below
+        // the used counts are all active.
+        let mut ids: Vec<[Vec<u32>; 3]> = Vec::new();
+        for r in &recs {
+            let starts = [r.vertex_ids, r.edge_ids, r.face_ids];
+            ids.push([0, 1, 2].map(|k| {
+                let used = words.masks[r.used as usize + k];
+                (0..used)
+                    .map(|slot| {
+                        let at = (starts[k] + slot) as usize;
+                        words.arena[at] = spread(words.arena[at]);
+                        words.arena[at]
+                    })
+                    .collect()
+            }));
+        }
+
+        // Move each owner entry, highest ID first so no entry is overwritten
+        // before it moves.
+        for k in 0..3 {
+            let table = words.arena[layout::OWNERS[k]] as usize;
+            let entry = |id: u32| table + (layout::OWNER_WORDS * id) as usize;
+            for id in (0..live[k]).rev() {
+                let (from, to) = (entry(id), entry(spread(id)));
+                let owner = [words.arena[from], words.arena[from + 1]];
+                words.arena[from..from + 2].copy_from_slice(&[INVALID_ID; 2]);
+                words.arena[to..to + 2].copy_from_slice(&owner);
+            }
+            words.masks[layout::NEXT_ID[k]] = 2 * live[k];
+        }
+
+        // Rebuild the maps for the new IDs.
+        if recs.is_empty() {
+            return;
+        }
+        let caps: Vec<[u32; 3]> = recs.iter().map(|r| r.capacity).collect();
+        let slices: Vec<[&[u32]; 3]> = ids
+            .iter()
+            .map(|[v, e, f]| [v.as_slice(), e.as_slice(), f.as_slice()])
+            .collect();
+        let maps = layout::build_maps(&caps, &slices);
+        assert_eq!(maps.len(), words.maps.len(), "rebuilt maps keep their size");
+        words.maps = maps;
     }
 
     pub fn records(arena: &[u32]) -> Vec<PatchRecord> {
@@ -497,15 +627,37 @@ pub(super) mod inspect {
         })
     }
 
-    /// Panics unless every owner-table entry points at an active, owned slot
-    /// holding that global ID, and every owned slot has an entry.
+    /// Returns whether ID `global` of `kind` is in use: its owner entry isn't
+    /// `INVALID_ID`. Panics if only one of the entry's two words is.
+    pub fn alive(arena: &[u32], kind: usize, global: u32) -> bool {
+        let at = (arena[layout::OWNERS[kind]] + layout::OWNER_WORDS * global) as usize;
+        let dead = [arena[at], arena[at + 1]].map(|w| w == INVALID_ID);
+        assert_eq!(dead[0], dead[1], "kind {kind} ID {global}: half-dead owner");
+        !dead[0]
+    }
+
+    /// Returns the vertex, edge and face ID capacities.
+    pub fn id_capacities(arena: &[u32]) -> [u32; 3] {
+        layout::ID_CAPACITY.map(|i| arena[i])
+    }
+
+    /// Panics unless every used ID's owner-table entry points at an active,
+    /// owned slot holding that global ID, every owned slot has an entry, and
+    /// the allocator words count the used IDs and bound them.
     pub fn check_owner_tables(arena: &[u32], masks: &[u32]) {
         let recs = records(arena);
-        let counts =
-            [layout::VERTEX_COUNT, layout::EDGE_COUNT, layout::FACE_COUNT].map(|i| arena[i]);
+        let capacities = id_capacities(arena);
         for k in 0..3 {
-            let mut owned = 0;
-            for global in 0..counts[k] {
+            let (mut owned, mut live) = (0, 0);
+            for global in 0..capacities[k] {
+                if !alive(arena, k, global) {
+                    continue;
+                }
+                live += 1;
+                assert!(
+                    global < masks[layout::NEXT_ID[k]],
+                    "kind {k} ID {global}: at or past the next unused ID"
+                );
                 let at = (arena[layout::OWNERS[k]] + layout::OWNER_WORDS * global) as usize;
                 let (p, slot) = (arena[at], arena[at + 1]);
                 let r = &recs[p as usize];
@@ -529,7 +681,12 @@ pub(super) mod inspect {
                     owned += u32::from(bit(masks, r.owned[k], slot));
                 }
             }
-            assert_eq!(owned, counts[k], "kind {k}: one owned slot per global ID");
+            assert_eq!(owned, live, "kind {k}: one owned slot per used ID");
+            assert_eq!(
+                masks[layout::LIVE_COUNT[k]],
+                live,
+                "kind {k}: live count word"
+            );
         }
     }
 
@@ -593,18 +750,30 @@ pub(super) mod inspect {
     pub fn check_invariants(arena: &[u32], masks: &[u32], maps: &[u32]) {
         check_owner_tables(arena, masks);
         let recs = records(arena);
-        let counts = [layout::VERTEX_COUNT, layout::EDGE_COUNT, layout::FACE_COUNT]
-            .map(|i| arena[i] as usize);
+        let counts = id_capacities(arena).map(|n| n as usize);
         let owner_patch = |kind: usize, global: usize| {
             arena[arena[layout::OWNERS[kind]] as usize + layout::OWNER_WORDS as usize * global]
         };
 
-        // Mesh-wide connectivity from the owning copies.
+        // Mesh-wide connectivity from the owning copies; unused IDs get
+        // INVALID_ID rows.
         let edges: Vec<[u32; 2]> = (0..counts[1] as u32)
-            .map(|e| edge_endpoints_in(arena, &recs, e))
+            .map(|e| {
+                if alive(arena, 1, e) {
+                    edge_endpoints_in(arena, &recs, e)
+                } else {
+                    [INVALID_ID; 2]
+                }
+            })
             .collect();
         let faces: Vec<[u32; 3]> = (0..counts[2] as u32)
-            .map(|f| face_vertices_in(arena, &recs, f))
+            .map(|f| {
+                if alive(arena, 2, f) {
+                    face_vertices_in(arena, &recs, f)
+                } else {
+                    [INVALID_ID; 3]
+                }
+            })
             .collect();
         let face_edge_ids = |r: &PatchRecord, slot: u32| {
             [0, 1, 2].map(|i| {
@@ -614,12 +783,18 @@ pub(super) mod inspect {
         };
         let owner_face_edges: Vec<[u32; 3]> = (0..counts[2])
             .map(|f| {
+                if !alive(arena, 2, f as u32) {
+                    return [INVALID_ID; 3];
+                }
                 let at = arena[layout::OWNERS[2]] as usize + layout::OWNER_WORDS as usize * f;
                 face_edge_ids(&recs[arena[at] as usize], arena[at + 1])
             })
             .collect();
         let mut star = vec![Vec::new(); counts[0]];
         for (f, t) in faces.iter().enumerate() {
+            if t[0] == INVALID_ID {
+                continue;
+            }
             for &v in t {
                 star[v as usize].push(f);
             }
@@ -636,6 +811,10 @@ pub(super) mod inspect {
             for k in 0..3 {
                 for slot in (0..used[k]).filter(|&s| active(k, s)) {
                     let global = id(k, slot);
+                    assert!(
+                        global < counts[k] as u32 && alive(arena, k, global),
+                        "patch {p} kind {k}: copy of unused ID {global}"
+                    );
                     assert!(
                         held[k].insert(global),
                         "patch {p} kind {k}: two copies of {global}"
@@ -754,11 +933,21 @@ pub(super) mod inspect {
     pub fn check_exact_ribbons(arena: &[u32], masks: &[u32]) {
         let views = patch_views(arena, masks);
         let recs = records(arena);
-        let faces: Vec<[u32; 3]> = (0..arena[layout::FACE_COUNT])
-            .map(|f| face_vertices_in(arena, &recs, f))
+        let [vertices, _, face_ids] = id_capacities(arena);
+        let faces: Vec<[u32; 3]> = (0..face_ids)
+            .map(|f| {
+                if alive(arena, 2, f) {
+                    face_vertices_in(arena, &recs, f)
+                } else {
+                    [INVALID_ID; 3]
+                }
+            })
             .collect();
-        let mut star = vec![Vec::new(); arena[layout::VERTEX_COUNT] as usize];
+        let mut star = vec![Vec::new(); vertices as usize];
         for (f, t) in faces.iter().enumerate() {
+            if t[0] == INVALID_ID {
+                continue;
+            }
             for &v in t {
                 star[v as usize].push(f);
             }
@@ -821,7 +1010,7 @@ mod tests {
     /// Rebuilds each global face's input vertex IDs from the owned face slots.
     fn decode_triangles(words: &EditableWords) -> Vec<[u32; 3]> {
         let a = &words.arena;
-        let mut triangles = vec![[INVALID_ID; 3]; a[layout::FACE_COUNT] as usize];
+        let mut triangles = vec![[INVALID_ID; 3]; a[layout::ID_CAPACITY[2]] as usize];
         for Decoded { record: r, .. } in patches(words) {
             for f in 0..r.capacity[2] {
                 if !bit(&words.masks, r.active[2], f) || !bit(&words.masks, r.owned[2], f) {
@@ -839,8 +1028,11 @@ mod tests {
         triangles
     }
 
+    /// Slot and ID factors: none spare, the default IDs, and a fractional
+    /// ID factor.
     fn capacities() -> [EditCapacity; 3] {
-        [1.0, 1.5, 2.25].map(|f| EditCapacity::new(f).unwrap())
+        [(1.0, 1.0), (1.5, 2.0), (2.25, 3.5)]
+            .map(|(slots, ids)| EditCapacity::new(slots).unwrap().with_ids(ids).unwrap())
     }
 
     #[test]
@@ -856,7 +1048,18 @@ mod tests {
                     );
                     let (mesh, _) = test_support::reference(&fixture, patch_size, &limits).unwrap();
                     let words = editable_contents(&mesh, capacity, &limits).unwrap();
-                    assert_eq!(decode_triangles(&words), fixture.triangles, "{context}");
+                    let decoded = decode_triangles(&words);
+                    let n = fixture.triangles.len();
+                    assert_eq!(
+                        decoded.len() as u32,
+                        capacity.id_capacity(n).unwrap(),
+                        "{context}"
+                    );
+                    assert_eq!(decoded[..n], fixture.triangles, "{context}");
+                    assert!(
+                        decoded[n..].iter().all(|t| *t == [INVALID_ID; 3]),
+                        "{context}: unused face IDs"
+                    );
                 }
             }
         }
@@ -916,9 +1119,19 @@ mod tests {
             }
         }
 
-        // Every global ID has exactly one owner entry, at an owned slot holding that ID.
+        // Every global ID has exactly one owner entry, at an owned slot holding
+        // that ID; the spare IDs have none, and the allocator words count the
+        // elements.
         let counts = [mesh.positions().len(), mesh.edge_count(), mesh.face_count()];
         for k in 0..3 {
+            let capacity = capacity.id_capacity(counts[k]).unwrap();
+            assert_eq!(a[layout::ID_CAPACITY[k]], capacity, "{context}");
+            assert_eq!(m[layout::NEXT_ID[k]] as usize, counts[k], "{context}");
+            assert_eq!(m[layout::LIVE_COUNT[k]] as usize, counts[k], "{context}");
+            for global in counts[k] as u32..capacity {
+                let at = (a[layout::OWNERS[k]] + layout::OWNER_WORDS * global) as usize;
+                assert_eq!(a[at..at + 2], [INVALID_ID; 2], "{context}: spare ID owner");
+            }
             let mut owned = vec![0u32; counts[k]];
             for (pid, d) in decoded.iter().enumerate() {
                 let r = &d.record;
@@ -1058,7 +1271,12 @@ mod tests {
             assert_eq!(read(gpu.masks()), words.masks, "{}", fixture.name);
             assert_eq!(read(gpu.maps()), words.maps, "{}", fixture.name);
             assert_eq!(gpu.mesh_id(), mesh.id());
-            assert_eq!(gpu.face_count() as usize, mesh.face_count());
+            assert_eq!(
+                gpu.face_capacity(),
+                EditCapacity::default()
+                    .id_capacity(mesh.face_count())
+                    .unwrap()
+            );
         }
     }
 }

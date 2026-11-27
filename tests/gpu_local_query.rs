@@ -11,7 +11,10 @@ mod fixtures;
 mod fresh_flips;
 use mopmesh::{
     Mesh, MeshBuilder,
-    gpu::{AdjacencyQuery, EdgeFlipQuery, EditCapacity, GpuEditableMesh, GpuMesh, GpuTopology},
+    gpu::{
+        AdjacencyQuery, EdgeFlipQuery, EditCapacity, GpuEditableMesh, GpuMesh, GpuTopology,
+        INVALID_ID,
+    },
 };
 use wgpu::util::DeviceExt;
 
@@ -108,7 +111,10 @@ impl LocalQueries {
         mesh: &impl GpuTopology,
         context: &str,
     ) -> Seen {
-        let (vertices, edges) = (mesh.vertex_count() as usize, mesh.edge_count() as usize);
+        let (vertices, edges) = (
+            mesh.vertex_capacity() as usize,
+            mesh.edge_capacity() as usize,
+        );
         let mut encoder = device.create_command_encoder(&Default::default());
         let global = self.adjacency.encode(device, &mut encoder, mesh).unwrap();
 
@@ -123,7 +129,13 @@ impl LocalQueries {
         };
         let neighbors = output("local neighbors", 2 * edges);
         let rows = output("local rows", 3 * vertices);
-        let diamonds = output("local diamonds", 4 * edges);
+        // Diamonds start as INVALID_ID, as the global query leaves the rows
+        // of unused edge IDs.
+        let diamonds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local diamonds"),
+            contents: bytemuck::cast_slice(&vec![INVALID_ID; (4 * edges).max(1)]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
         let bind = |layout, buffers: &[&wgpu::Buffer]| {
             let entries: Vec<_> = buffers
                 .iter()

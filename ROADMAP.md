@@ -423,26 +423,58 @@ RXMesh.
     change, such as doing that work per patch within one workgroup, not
     just merging passes.
 
-### 6 — Growth: not started
+### 6 — Growth: in progress
 
-- [ ] Implement splits/collapses, slot reservation/recycling and overflow handling.
-- [ ] Add compaction and patch slicing; test capacity pressure and attribute preservation.
+Planned 27 November 2026 with the user, after review by Codex and the
+advisor (Alum only breaks ties):
+- **Global IDs with spare room**, not RXMesh's (patch, slot) handles. An
+  ID factor in `EditCapacity` (default 2) sizes owner tables, attributes and
+  results; unused IDs have `INVALID_ID` owners. New IDs come from atomic
+  chunks per acting patch; freed IDs are reused only from the next batch.
+  Patch-local attribute storage is a measured follow-up.
+- **Order:** CPU simulation, ID room, splits, cross-patch splits, patch
+  slicing, collapses. Global renumbering (compaction with remaps) is
+  deferred; free-ID recycling and shrinking used counts stay in scope.
+- **Collapse keeps one endpoint and rewrites in place**, unlike RXMesh's
+  new-vertex fill-in: no new IDs or slots at commit.
+- **Atomic ID allocation**; tests compare up to renaming through the
+  results' parent → new ID maps.
 
-Decisions found during Phase 5, to settle when planning:
-- **Global ID room.** Owner tables and element counts are sized to the mesh
-  at upload, and global IDs index every attribute buffer. Splits create
-  vertices, edges and faces, so they need spare global IDs as well as spare
-  slots: an API decision.
-- **Patch splitting (RXMesh's `slice_patches`).** Small patches run out of
-  room in cross-patch flips: at patch size 16–64 a Delaunay settle leaves
-  edges that report `OutOfCapacity`. RXMesh reserves a pool of spare patches
-  up front (`patch_alloc_factor`, 2–5x) and splits a full patch into a new
-  one. Here that needs reserved patch records, arena, mask and map regions,
-  and host dispatch grids sized from the pool, not `patch_count()`; shaders
-  already read the patch count from the arena.
-- **Reuse.** A collapse's cavity is the faces around two vertices, which the
-  cavity rounds' four-corner requests already cover; a split also allocates
-  new elements.
+Steps:
+- [x] Step 0: CPU simulation of splits and collapses
+  (`src/gpu/bench_migration/growth.rs`, `7ccad51`). Findings:
+  - **Collapse footprint {b} ∪ link(b)** (the removed vertex and every
+    vertex sharing a face with it) is exact: zero stale copies, ribbon gaps
+    and inexact patches on five meshes at patch sizes 64–512, while a
+    quad-only control fails. It also collapses more per batch than
+    {a, b} ∪ both links (32 K → 9.6 K faces against 14.5 K in 12 batches).
+    Corners: 7/11/16 (median/p99/max), 183 at a sphere's poles.
+  - **Uniform patch capacity fails on high-valence meshes.** Sizing every
+    patch by the largest costs 3–3.6× today's patch bytes at 32 K faces,
+    but at 2.1 M faces the UV sphere's poles make it 8× (6.1 GiB) at patch
+    size 512 and 22× at 128. Sizing each patch by the larger of its own
+    count and the median count, with a 2× spare pool at the median size,
+    costs 2.3–3.0× on every mesh, including the sphere. **This reverses the
+    plan's uniform capacity; the patch capacity policy is decided at step
+    4 (slicing), which is the first step that needs it.** Maps are over
+    half of the patch bytes and are the cheapest lever.
+  - Splitting edges to half the mean length grows faces 2.3–4× and runs
+    patches out of room at capacity 2 without slicing, as expected.
+- [x] Step 1: ID room and liveness, with no new edits. `EditCapacity::with_ids`;
+  header words 0–2 are ID capacities; an allocator block (next unused ID,
+  live counts) starts the editable mask buffer; `GpuTopology` reports
+  capacities and `has_unused_ids`; every query marks unused IDs
+  (`INVALID_ID` connectivity rows, zero geometry and flags, empty CSR rows
+  with the true total as the last offset); reductions and dot products take
+  the mesh and skip unused IDs; flips of unused edge IDs report
+  `NotAnEdge` (new WESL `flip_reject_unused`, `element_alive`). Tests: a
+  spread-ID fixture (ID `i` becomes `2i + 1`) compared with static uploads
+  for every query, plus flips on it.
+- [ ] Step 2: ID allocator and single-patch splits (`EdgeSplitQuery`).
+- [ ] Step 3: cross-patch splits.
+- [ ] Step 4: patch slicing, with the patch capacity decision above.
+- [ ] Step 5: collapses (footprint lists, link condition, free lists).
+- [ ] Step 6: measure and document.
 
 ### 7 — Mesh algorithms: not started
 

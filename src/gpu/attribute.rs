@@ -75,13 +75,21 @@ fn upload_attribute<E: Element, T: GpuValue>(
     if mesh.mesh_id() != attribute.mesh {
         return Err(GpuError::MeshMismatch);
     }
-    GpuAttribute::new(device, mesh, &attribute.values)
+
+    // Pad with zeros for the IDs no CPU element has.
+    let capacity = mesh.element_capacity(E::KIND) as usize;
+    if attribute.values.len() == capacity {
+        return GpuAttribute::new(device, mesh, &attribute.values);
+    }
+    let mut values = attribute.values.clone();
+    values.resize(capacity, T::zeroed());
+    GpuAttribute::new(device, mesh, &values)
 }
 
 impl GpuMesh {
     /// Returns the number of vertices, edges or faces.
     pub fn element_count(&self, kind: ElementKind) -> u32 {
-        GpuTopology::element_count(self, kind)
+        GpuTopology::element_capacity(self, kind)
     }
 
     /// Copies a CPU attribute to a new GPU buffer. Later CPU changes do not
@@ -99,15 +107,16 @@ impl GpuMesh {
 }
 
 impl GpuEditableMesh {
-    /// Returns the number of vertices, edges or faces. Edge flips don't
-    /// change these counts.
-    pub fn element_count(&self, kind: ElementKind) -> u32 {
-        GpuTopology::element_count(self, kind)
+    /// Returns the vertex, edge or face ID capacity: the number of entries in
+    /// an attribute of that kind.
+    pub fn element_capacity(&self, kind: ElementKind) -> u32 {
+        GpuTopology::element_capacity(self, kind)
     }
 
     /// Copies a CPU attribute to a new GPU buffer, as
-    /// [`GpuMesh::upload_attribute`] does. The attribute stays valid after
-    /// edits: flips keep every element ID.
+    /// [`GpuMesh::upload_attribute`] does, with zeros for the IDs past the
+    /// CPU mesh's elements. The attribute stays valid after edits: flips keep
+    /// every element ID.
     pub fn upload_attribute<E: Element, T: GpuValue>(
         &self,
         device: &wgpu::Device,
@@ -118,11 +127,11 @@ impl GpuEditableMesh {
 }
 
 impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
-    /// Copies one value per element of `mesh`, in canonical order, to a new
-    /// GPU buffer with `STORAGE | COPY_SRC | COPY_DST` usage. Use this for
-    /// meshes built with [`GpuMeshBuilder`](super::GpuMeshBuilder), which have
-    /// no CPU attributes. Returns [`GpuError::InvalidBuffer`] unless `values`
-    /// has exactly [`GpuTopology::element_count`] entries, or
+    /// Copies one value per element ID of `mesh`, in ID order, to a new GPU
+    /// buffer with `STORAGE | COPY_SRC | COPY_DST` usage. Use this for meshes
+    /// built with [`GpuMeshBuilder`](super::GpuMeshBuilder), which have no CPU
+    /// attributes. Returns [`GpuError::InvalidBuffer`] unless `values` has
+    /// exactly [`GpuTopology::element_capacity`] entries, or
     /// [`GpuError::LimitsExceeded`] if the buffer would be too large. Errors
     /// occur before GPU allocation.
     pub fn new(
@@ -131,7 +140,7 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
         values: &[T],
     ) -> Result<Self, GpuError> {
         let resource = resource(E::KIND);
-        let len = mesh.element_count(E::KIND);
+        let len = mesh.element_capacity(E::KIND);
         if values.len() != len as usize {
             return Err(GpuError::InvalidBuffer { resource });
         }
@@ -155,11 +164,12 @@ impl<E: Element, T: GpuValue> GpuAttribute<E, T> {
     /// GPU writes to `buffer` are seen by queries that read the attribute. For
     /// example, pass the positions buffer given to
     /// [`GpuMeshBuilder::build`](super::GpuMeshBuilder::build) to compute face
-    /// centroids. The buffer must hold one `T` per element in canonical order,
-    /// starting at byte 0, and at least one `T` for an empty attribute. Returns
-    /// [`GpuError::InvalidBuffer`] if it is smaller or lacks `STORAGE` usage.
+    /// centroids. The buffer must hold one `T` per element ID below the ID
+    /// capacity, in ID order, starting at byte 0, and at least one `T` for an
+    /// empty attribute. Returns [`GpuError::InvalidBuffer`] if it is smaller
+    /// or lacks `STORAGE` usage.
     pub fn from_buffer(mesh: &impl GpuTopology, buffer: &wgpu::Buffer) -> Result<Self, GpuError> {
-        let len = mesh.element_count(E::KIND);
+        let len = mesh.element_capacity(E::KIND);
         let needed = std::mem::size_of::<T>() as u64 * u64::from(len.max(1));
         if buffer.size() < needed || !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
             return Err(GpuError::InvalidBuffer {
@@ -392,9 +402,19 @@ pub(super) fn face_kernel<T: GpuValue>(
 ) -> Result<GpuFaceAttribute<T>, GpuError> {
     // Validate the inputs and sizes, including the temporary face-vertex
     // result, before allocating buffers or recording commands.
-    let groups =
-        check_face_kernel::<T>(device, mesh.topology, mesh.face_count, positions, resource)?;
-    if mesh.face_count == 0 {
+    let groups = check_face_kernel::<T>(
+        device,
+        mesh.topology,
+        mesh.face_capacity,
+        positions,
+        resource,
+    )?;
+    if positions.len() != mesh.vertex_capacity {
+        return Err(GpuError::InvalidBuffer {
+            resource: "vertex attribute",
+        });
+    }
+    if mesh.face_capacity == 0 {
         return Ok(GpuFaceAttribute::<T>::derived(
             device,
             mesh.topology,

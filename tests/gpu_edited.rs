@@ -12,8 +12,8 @@ use mopmesh::{
     gpu::{
         AdjacencyQuery, BoundaryQuery, DotQuery, EdgeFlipQuery, EdgeQuery, EditCapacity,
         FaceAreaQuery, FaceCentroidQuery, FaceNormalQuery, FaceVertexQuery, FlipStatus,
-        GpuEditableMesh, GpuError, GpuMesh, GpuTopology, GpuVertexAttribute, ReduceOp, ReduceQuery,
-        SmoothQuery, Smoothing, VertexFaceQuery, VertexNormalQuery,
+        GpuEditableMesh, GpuError, GpuMesh, GpuTopology, GpuVertexAttribute, INVALID_ID, ReduceOp,
+        ReduceQuery, SmoothQuery, Smoothing, VertexFaceQuery, VertexNormalQuery,
     },
 };
 use std::collections::HashMap;
@@ -76,17 +76,23 @@ const SMOOTHING: Smoothing = Smoothing {
     iterations: 3,
 };
 
-/// Records every query on `mesh` with `positions`, checks that each result
-/// computed from connectivity carries the mesh's current stamp, and reads
-/// the results back.
+/// Records every query on `mesh` with `positions`, padded with zeros to the
+/// mesh's vertex ID capacity, checks that each result computed from
+/// connectivity carries the mesh's current stamp, and reads the results
+/// back. Every ID at or past `counts` (vertices, edges, faces) must be
+/// unused; the results are trimmed to the used IDs after checking that the
+/// unused ones read as unused.
 fn run(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     q: &Queries,
     mesh: &impl GpuTopology,
     positions: &[[f32; 4]],
+    counts: [usize; 3],
 ) -> Results {
-    let positions = GpuVertexAttribute::new(device, mesh, positions).unwrap();
+    let mut padded = positions.to_vec();
+    padded.resize(mesh.vertex_capacity() as usize, [0.; 4]);
+    let positions = GpuVertexAttribute::new(device, mesh, &padded).unwrap();
     let mut encoder = device.create_command_encoder(&Default::default());
     let e = &mut encoder;
     let edges = q.edges.encode(device, e, mesh).unwrap();
@@ -113,8 +119,8 @@ fn run(
             SMOOTHING,
         )
         .unwrap();
-    let area_sum = q.sum_f32.encode(device, e, &face_areas).unwrap();
-    let boundary_edge_count = q.sum_u32.encode(device, e, &boundary.edges).unwrap();
+    let area_sum = q.sum_f32.encode(device, e, mesh, &face_areas).unwrap();
+    let boundary_edge_count = q.sum_u32.encode(device, e, mesh, &boundary.edges).unwrap();
     queue.submit([encoder.finish()]);
 
     // Results computed from connectivity record the stamp they were computed from.
@@ -145,7 +151,13 @@ fn run(
 
     let words = |b: &wgpu::Buffer| delaunay::read_words(device, queue, b);
     let floats = |b: &wgpu::Buffer| bytemuck::cast_slice(&words(b)).to_vec();
-    Results {
+    let capacities = [
+        mesh.vertex_capacity(),
+        mesh.edge_capacity(),
+        mesh.face_capacity(),
+    ]
+    .map(|c| c as usize);
+    let results = Results {
         edges: words(edges.buffer()),
         faces: words(faces.buffer()),
         vertex_faces: words(vertex_faces.buffer()),
@@ -161,6 +173,50 @@ fn run(
         smoothed: floats(smoothed.buffer()),
         area_sum: f32::from_bits(words(area_sum.buffer())[0]),
         boundary_edge_count: words(boundary_edge_count.buffer())[0],
+    };
+    trim(results, counts, capacities)
+}
+
+/// Cuts each per-ID result of a mesh with ID `capacities` down to the first
+/// `counts` IDs, after asserting that the rest read as unused: `INVALID_ID`
+/// rows of connectivity, zero geometry and flags, and empty CSR rows.
+fn trim(r: Results, counts: [usize; 3], capacities: [usize; 3]) -> Results {
+    let [v, e, f] = counts;
+    let rows = |words: Vec<u32>, count: usize, capacity: usize, width: usize, dead: u32| {
+        let tail = &words[width * count..width * capacity];
+        assert!(tail.iter().all(|&w| w == dead), "unused rows");
+        words[..width * count].to_vec()
+    };
+    let floats = |values: Vec<f32>, count: usize, capacity: usize, width: usize| {
+        let tail = &values[width * count..width * capacity];
+        assert!(tail.iter().all(|&x| x == 0.), "unused values");
+        values[..width * count].to_vec()
+    };
+    let csr = |words: Vec<u32>, width: usize| {
+        let offsets = &words[..=capacities[0]];
+        assert!(
+            offsets[v..].iter().all(|&o| o == offsets[v]),
+            "unused rows are empty"
+        );
+        let entries = &words[capacities[0] + 1..][..width * offsets[v] as usize];
+        [&offsets[..=v], entries].concat()
+    };
+    Results {
+        edges: rows(r.edges, e, capacities[1], 4, INVALID_ID),
+        faces: rows(r.faces, f, capacities[2], 3, INVALID_ID),
+        vertex_faces: csr(r.vertex_faces, 1),
+        vertex_neighbors: csr(r.vertex_neighbors, 2),
+        face_neighbors: rows(r.face_neighbors, f, capacities[2], 3, INVALID_ID),
+        diamonds: rows(r.diamonds, e, capacities[1], 4, INVALID_ID),
+        boundary_edges: rows(r.boundary_edges, e, capacities[1], 1, 0),
+        boundary_vertices: rows(r.boundary_vertices, v, capacities[0], 1, 0),
+        face_normals: floats(r.face_normals, f, capacities[2], 4),
+        face_areas: floats(r.face_areas, f, capacities[2], 1),
+        centroids: floats(r.centroids, f, capacities[2], 4),
+        vertex_normals: floats(r.vertex_normals, v, capacities[0], 4),
+        smoothed: floats(r.smoothed, v, capacities[0], 4),
+        area_sum: r.area_sum,
+        boundary_edge_count: r.boundary_edge_count,
     }
 }
 
@@ -471,8 +527,9 @@ fn edited_queries_match_a_fresh_upload(capacity: EditCapacity) {
         .build()
         .unwrap();
     let fresh = GpuMesh::upload(&device, &fresh_mesh).unwrap();
-    let edited_results = run(&device, &queue, &q, &editable, &positions);
-    let fresh_results = run(&device, &queue, &q, &fresh, &positions);
+    let counts = [mesh.positions().len(), mesh.edge_count(), mesh.face_count()];
+    let edited_results = run(&device, &queue, &q, &editable, &positions, counts);
+    let fresh_results = run(&device, &queue, &q, &fresh, &positions, counts);
     compare(
         &edited_results,
         &fresh_results,
@@ -494,7 +551,9 @@ fn results_from_before_an_edit_are_rejected_as_stale() {
     let smooth = SmoothQuery::new(&device);
     let dot = DotQuery::new(&device);
     let mut editable = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
-    let gpu_positions = GpuVertexAttribute::new(&device, &editable, &positions).unwrap();
+    let mut padded = positions.clone();
+    padded.resize(editable.vertex_capacity() as usize, [0.; 4]);
+    let gpu_positions = GpuVertexAttribute::new(&device, &editable, &padded).unwrap();
     let mut encoder = device.create_command_encoder(&Default::default());
     let e = &mut encoder;
 
@@ -543,10 +602,14 @@ fn results_from_before_an_edit_are_rejected_as_stale() {
     assert_eq!(smooth_with(e, &editable, &fresh_adjacency, None), Ok(()));
     let new_areas = areas.encode(&device, e, &editable, &gpu_positions).unwrap();
     assert_eq!(
-        dot.encode(&device, e, &old_areas, &new_areas).err(),
+        dot.encode(&device, e, &editable, &old_areas, &new_areas)
+            .err(),
         Some(GpuError::Stale)
     );
-    assert!(dot.encode(&device, e, &new_areas, &new_areas).is_ok());
+    assert!(
+        dot.encode(&device, e, &editable, &new_areas, &new_areas)
+            .is_ok()
+    );
 
     // An edit counted by the caller's own kernel makes results stale the same way.
     editable.mark_edited();
@@ -558,7 +621,7 @@ fn results_from_before_an_edit_are_rejected_as_stale() {
     let fresh_adjacency = adjacency_query.encode(&device, e, &editable).unwrap();
 
     // Replacing computed values makes them the caller's, which edits don't affect.
-    let flags = vec![0u32; positions.len()];
+    let flags = vec![0u32; editable.vertex_capacity() as usize];
     boundary.vertices.write_values(&queue, &flags).unwrap();
     assert_eq!(boundary.vertices.topology(), None);
     assert_eq!(
