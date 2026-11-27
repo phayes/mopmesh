@@ -87,6 +87,36 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Ve
     test_support::read_words(device, queue, encoder, buffer)
 }
 
+/// Codes for the `sequential` entry point of `patch_map_consumer`: each
+/// operation is `[code, patch, kind, global, slot]`.
+pub(super) const OP_FIND: u32 = 0;
+pub(super) const OP_SET: u32 = 1;
+pub(super) const OP_ERASE: u32 = 2;
+
+/// Runs `ops` in order from one invocation on `maps` and returns one result
+/// per operation: the slot found, or 1 or 0 for a set or erase that
+/// succeeded or failed.
+pub(super) fn run_map_ops(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    maps: &wgpu::Buffer,
+    ops: &[[u32; 5]],
+) -> Vec<u32> {
+    let pipeline = consumer(device, "patch_map_consumer", "sequential");
+    let ops_buffer = storage(device, ops.as_flattened());
+    let results = storage(device, &vec![0xdead_beef; ops.len()]);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group0(device, &pipeline, &[&ops_buffer, &results]), &[]);
+        pass.set_bind_group(1, &maps_group(device, &pipeline, maps), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    queue.submit([encoder.finish()]);
+    read(device, queue, &results)
+}
+
 /// The same probing as `topology::patch_map`, on a host copy of the maps.
 struct Mirror(Vec<u32>);
 impl Mirror {
@@ -137,6 +167,8 @@ impl Mirror {
         };
         self.0[e] = layout::MAP_TOMBSTONE;
         self.0[e + 1] = INVALID_ID;
+        self.0[layout::MAP_HEADER_WORDS * p as usize + layout::MAP_ERASED_WORD + kind as usize] +=
+            1;
         true
     }
     /// The live keys of one map.
@@ -181,12 +213,11 @@ fn colliding(mirror: &Mirror, p: u32, kind: u32, target: u32, start: u32, n: usi
 #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
 fn patch_map_operations_match_a_host_mirror() {
     let (device, queue) = test_support::device(wgpu::Limits::default());
-    let pipeline = consumer(&device, "patch_map_consumer", "sequential");
     let (mesh, gpu) = grid_upload(&device, 9, 16);
     let mut mirror = Mirror(read(&device, &queue, gpu.maps()));
 
     // Every held ID of every map is found where the mirror says.
-    let (find, set, erase) = (0u32, 1u32, 2u32);
+    let (find, set, erase) = (OP_FIND, OP_SET, OP_ERASE);
     let mut ops: Vec<[u32; 5]> = Vec::new();
     for p in 0..gpu.patch_count() {
         for kind in 0..3 {
@@ -250,22 +281,7 @@ fn patch_map_operations_match_a_host_mirror() {
     assert_eq!(*expected.last().unwrap(), INVALID_ID);
 
     // Run the same operations on the GPU.
-    let ops_buffer = storage(&device, ops.as_flattened());
-    let results = storage(&device, &vec![0xdead_beef; ops.len()]);
-    let mut encoder = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(
-            0,
-            &group0(&device, &pipeline, &[&ops_buffer, &results]),
-            &[],
-        );
-        pass.set_bind_group(1, &maps_group(&device, &pipeline, gpu.maps()), &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    queue.submit([encoder.finish()]);
-    assert_eq!(read(&device, &queue, &results), expected);
+    assert_eq!(run_map_ops(&device, &queue, gpu.maps(), &ops), expected);
     assert_eq!(read(&device, &queue, gpu.maps()), mirror.0);
 }
 

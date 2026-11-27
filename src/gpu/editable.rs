@@ -287,8 +287,10 @@ impl GpuEditableMesh {
     /// holding that element in the patch. Read and change them with the WESL
     /// module `topology::patch_map`.
     ///
-    /// Starts with six words per patch: for vertices, edges and faces in turn,
-    /// the word offset of that map and its entry count, a power of two. Each
+    /// Starts with nine words per patch: for vertices, edges and faces in
+    /// turn, the word offset of that map and its entry count, a power of
+    /// two; then, for each kind in turn, how many IDs have been erased from
+    /// that map since it was uploaded or last rebuilt. Each
     /// entry is two words: a global ID, then its slot. A key of `0xffffffff`
     /// marks an entry never used, and `0xfffffffe` one whose ID was erased.
     /// Every active slot has exactly one entry. For a mesh with no patches,
@@ -558,6 +560,21 @@ pub(super) mod inspect {
             .count()
     }
 
+    /// Returns patch `p`'s erased entries of `kind`, the erase count in its
+    /// header, and its entry count.
+    fn map_erasures(maps: &[u32], p: usize, kind: usize) -> (usize, usize, usize) {
+        let header = layout::MAP_HEADER_WORDS * p;
+        let (offset, entries) = (
+            maps[header + 2 * kind] as usize,
+            maps[header + 2 * kind + 1] as usize,
+        );
+        let tombstones = (0..entries)
+            .filter(|i| maps[offset + 2 * i] == layout::MAP_TOMBSTONE)
+            .count();
+        let erased = maps[header + layout::MAP_ERASED_WORD + kind] as usize;
+        (tombstones, erased, entries)
+    }
+
     /// Panics unless the arena, masks and maps keep every invariant that
     /// edits must preserve:
     /// - owner tables point at active owned slots, one per global ID;
@@ -632,6 +649,12 @@ pub(super) mod inspect {
                     map_len(maps, p, k),
                     held[k].len(),
                     "patch {p} kind {k}: map size"
+                );
+                let (tombstones, erased, entries) = map_erasures(maps, p, k);
+                assert!(
+                    tombstones <= erased && erased <= entries / 4,
+                    "patch {p} kind {k}: {tombstones} tombstones, erase count {erased}, \
+                     {entries} entries"
                 );
             }
 

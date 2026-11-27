@@ -15,7 +15,9 @@
 // To add IDs from many invocations at once without knowing whether another
 // invocation adds the same ID, use `map_claim`, then `map_take` and
 // `map_set` in a later dispatch; their own comments give their rules.
-// `map_clear` empties a map so a workgroup can rebuild it.
+// `map_clear` empties a map so a workgroup can rebuild it; erased entries
+// use up room that only a rebuild returns, and `map_needs_rebuild` says when
+// that is due.
 
 @group(1) @binding(7) var<storage, read_write> maps: array<atomic<u32>>;
 
@@ -23,8 +25,10 @@
 const MAP_EMPTY: u32 = 0xffffffffu;
 // Key of an entry whose ID was erased. Lookups continue past it.
 const MAP_TOMBSTONE: u32 = 0xfffffffeu;
-// Words per patch at the start of the maps buffer.
-const MAP_HEADER_WORDS: u32 = 6u;
+// Words per patch at the start of the maps buffer: each kind's word offset
+// and entry count, then each kind's erase count.
+const MAP_HEADER_WORDS: u32 = 9u;
+const MAP_ERASED_WORDS: u32 = 6u;
 
 // Returned by `map_find` for an ID the patch does not hold.
 public const MAP_MISSING: u32 = 0xffffffffu;
@@ -166,13 +170,18 @@ public fn map_take(p: u32, kind: u32, global: u32) -> bool {
     return take.exchanged;
 }
 
+fn erased_word(p: u32, kind: u32) -> u32 {
+    return MAP_HEADER_WORDS * p + MAP_ERASED_WORDS + kind;
+}
+
 // Empties patch `p`'s map for `kind`, for rebuilding it with `map_set`.
 // Spread the work over a workgroup: each invocation passes its own `first`
-// (such as its local index) and the workgroup size as `step`. Nothing else
-// may use this map until every invocation has finished and passed a
-// `storageBarrier`.
+// (such as its local index) and the workgroup size as `step`; exactly one
+// invocation must pass `first` 0. Nothing else may use this map until every
+// invocation has finished and passed a `storageBarrier`.
 public fn map_clear(p: u32, kind: u32, first: u32, step: u32) {
     let t = map_table(p, kind);
+    if (first == 0u) { atomicStore(&maps[erased_word(p, kind)], 0u); }
     for (var at = first; at < t.entries; at += step) {
         atomicStore(&maps[t.offset + 2u * at], MAP_EMPTY);
         atomicStore(&maps[t.offset + 2u * at + 1u], MAP_MISSING);
@@ -180,11 +189,26 @@ public fn map_clear(p: u32, kind: u32, first: u32, step: u32) {
 }
 
 // Removes `global` of `kind` from patch `p`'s map. Returns false if the
-// patch held no copy of it.
+// patch held no copy of it. The erased entry stays used until the map is
+// rebuilt: see `map_needs_rebuild`.
 public fn map_erase(p: u32, kind: u32, global: u32) -> bool {
     let e = map_entry(map_table(p, kind), global);
     if (e == MAP_MISSING) { return false; }
     atomicStore(&maps[e + 1u], MAP_MISSING);
     atomicStore(&maps[e], MAP_TOMBSTONE);
+    atomicAdd(&maps[erased_word(p, kind)], 1u);
     return true;
+}
+
+// Returns true once patch `p`'s map for `kind` has had so many IDs erased
+// since it was uploaded or last cleared that it should be rebuilt with
+// `map_clear` and `map_set`. Until then, in the maps of a
+// `GpuEditableMesh` (whose maps have at least twice as many entries as
+// slots) and as long as every ID a map holds has a slot, `map_claim` can add
+// as many new IDs as the patch has free slots, and at most three quarters of
+// the entries are in use. Call it after the
+// erasures, across a `storageBarrier` or a dispatch boundary.
+public fn map_needs_rebuild(p: u32, kind: u32) -> bool {
+    let t = map_table(p, kind);
+    return atomicLoad(&maps[erased_word(p, kind)]) > t.entries / 4u;
 }

@@ -339,13 +339,31 @@ RXMesh.
     7–11 ms, fills 7–10 ms.
   - Shortcut: cleanup no longer rebuilds every involved patch's maps, so a
     fill that skips silently (see the follow-ups below) now leaves a stale
-    map entry until that kind is next dropped.
+    map entry until that map is next rebuilt.
+  - [x] Cleanup erases dropped copies from the maps in place, and rebuilds
+    a map only once its erase count (a new per-kind header word,
+    `MAP_HEADER_WORDS` 6 → 9) passes a quarter of its entries, or on a
+    failed acting patch. `map_claim` never reuses erased entries, so the
+    bound matters: with entries at least twice the capacity, it leaves
+    `map_claim` room for every free slot, so no acting patch fails on a
+    full map that preflight would pass, and keeps occupancy at or below
+    3/4. Reviewed with Codex and the advisor (a fixed occupancy threshold
+    was rejected: it can fail actors with free slots).
+  - Result (27 November 2026), interleaved A/B against ccf334e, 524 K
+    faces, identical statuses: cleanup 14.5–18.5 → 5.8–7.9 ms per batch;
+    cross-patch GPU time 52–58 → 45–49 ms (in order) and 67–70 → 59–63 ms
+    (shuffled); claim, fill and transfer unchanged. Delaunay settle of
+    513x513 (7 runs per invocation, three invocations each): 936–944 →
+    791–808 ms.
+  - Tried and dropped: loading `cavity_actor`'s four leader records once
+    instead of ~320 repeated atomic loads. Loading all 36 words up front
+    made bid 0.7–1.3 ms slower; loading only the filled slots matched the
+    original but did not beat it, so the repeated loads were cache hits.
+    Bid's cost is elsewhere: it reads every request each round, and does
+    scattered `taken` loads and `atomicMax` bids.
   Candidates left:
-  - cleanup's map rebuild is still most of its cost: erase dropped IDs
-    instead (needs a tombstone policy, since `map_claim` doesn't reuse
-    erased entries), or build maps in workgroup memory;
-  - `cavity_actor` makes up to ~320 atomic loads per pending request in
-    bid; load the four corners' leader records once;
+  - build rebuilt maps in workgroup memory, and erase a failed acting
+    patch's unfilled claims instead of rebuilding its maps;
   - compact the pending requests and the flagged patches into lists, and
     size the flat and per-patch stages by them;
   - stop clearing 14 words per vertex every round (clear only touched

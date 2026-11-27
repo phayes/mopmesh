@@ -147,8 +147,13 @@ pub(super) mod tests {
     use crate::gpu::editable::inspect::{
         PatchView, check_exact_ribbons, check_invariants, patch_views,
     };
+    use crate::gpu::patch_layout as layout;
+    use crate::gpu::patch_map_tests::{OP_ERASE, OP_SET, run_map_ops};
     use crate::gpu::test_support;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    /// IDs from here up are never real mesh elements in the test meshes.
+    const STALE: u32 = 0x4000_0000;
 
     fn read(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<u32> {
         let encoder = device.create_command_encoder(&Default::default());
@@ -488,5 +493,95 @@ pub(super) mod tests {
                 check_invariants(&arena, &masks, &read(&device, &queue, gpu.maps()));
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn cleanup_rebuilds_maps_past_the_erase_threshold() {
+        let (device, queue) = test_support::device(wgpu::Limits::default());
+        let migrate = CavityMigrate::new(&device);
+        let bench = &bench_meshes::generated(4096)[0];
+        let mesh = MeshBuilder::new()
+            .patch_size(16)
+            .positions(&bench.positions)
+            .triangles(&bench.triangles)
+            .build()
+            .unwrap();
+        let gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+        let patches = gpu.patch_count() as usize;
+
+        // Add and erase unused IDs in every map: a quarter of its entries'
+        // worth in odd patches, exactly at the threshold, and one more in
+        // even patches, past it. Even patches also keep a stale ID that only
+        // a rebuild removes.
+        let header = |p: usize| layout::MAP_HEADER_WORDS * p;
+        let fresh = read(&device, &queue, gpu.maps());
+        let mut ops = Vec::new();
+        for p in 0..patches {
+            for k in 0..3 {
+                let entries = fresh[header(p) + 2 * k + 1];
+                let erases = entries / 4 + u32::from(p % 2 == 0);
+                let (p, k) = (p as u32, k as u32);
+                for g in STALE..STALE + erases {
+                    ops.extend([[OP_SET, p, k, g, 0], [OP_ERASE, p, k, g, 0]]);
+                }
+                if p % 2 == 0 {
+                    ops.push([OP_SET, p, k, STALE - 1, 0]);
+                }
+            }
+        }
+        let results = run_map_ops(&device, &queue, gpu.maps(), &ops);
+        assert!(results.iter().all(|&r| r == 1), "every set and erase lands");
+        let maps = read(&device, &queue, gpu.maps());
+
+        // Run cleanup on every patch.
+        let state = CavityState::new(&device, &gpu, &[], 0).unwrap();
+        let mut words = vec![0u32; PATCH_WORDS * patches];
+        words
+            .iter_mut()
+            .skip(INVOLVED_WORD)
+            .step_by(PATCH_WORDS)
+            .for_each(|w| *w = 1);
+        queue.write_buffer(&state.patch_words, 0, bytemuck::cast_slice(&words));
+        let mut encoder = device.create_command_encoder(&Default::default());
+        migrate
+            .encode(&device, &mut encoder, &gpu, &state, 0..STAGES.len(), false)
+            .unwrap();
+        queue.submit([encoder.finish()]);
+
+        // Maps past the threshold were rebuilt, without erased entries or
+        // the stale ID, and their counts reset; the others are untouched.
+        let after = read(&device, &queue, gpu.maps());
+        for p in 0..patches {
+            for k in 0..3 {
+                let erased = after[header(p) + layout::MAP_ERASED_WORD + k];
+                let offset = after[header(p) + 2 * k] as usize;
+                let entries = after[header(p) + 2 * k + 1] as usize;
+                let table = offset..offset + 2 * entries;
+                if p % 2 == 0 {
+                    assert_eq!(erased, 0, "patch {p} kind {k}: erase count reset");
+                    let keys: Vec<u32> = after[table].iter().step_by(2).copied().collect();
+                    assert!(
+                        keys.iter()
+                            .all(|&g| g == layout::MAP_EMPTY || g < STALE - 1),
+                        "patch {p} kind {k}: rebuilt from the active slots only"
+                    );
+                } else {
+                    assert_eq!(
+                        after[table.clone()],
+                        maps[table],
+                        "patch {p} kind {k}: untouched"
+                    );
+                    assert_eq!(
+                        erased,
+                        (entries / 4) as u32,
+                        "patch {p} kind {k}: erase count"
+                    );
+                }
+            }
+        }
+        let arena = read(&device, &queue, gpu.arena());
+        let masks = read(&device, &queue, gpu.masks());
+        check_invariants(&arena, &masks, &after);
     }
 }

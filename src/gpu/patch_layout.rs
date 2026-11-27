@@ -86,8 +86,14 @@ impl PatchRecord {
 }
 
 /// Map-buffer words per patch at the start of the maps buffer: for vertices,
-/// edges and faces in turn, the table's word offset and its entry count.
-pub const MAP_HEADER_WORDS: usize = 6;
+/// edges and faces in turn, the table's word offset and its entry count;
+/// then, for each kind in turn, how many IDs the GPU has erased from the
+/// table since it was uploaded or last rebuilt (0 on upload).
+pub const MAP_HEADER_WORDS: usize = 9;
+/// Offset within a patch's map header of the vertex table's erase count;
+/// the edge and face counts follow.
+#[cfg(test)]
+pub const MAP_ERASED_WORD: usize = 6;
 /// Words per map entry: the global ID, then its local slot.
 pub const MAP_ENTRY_WORDS: u32 = 2;
 /// Key of a map entry that has never held an ID.

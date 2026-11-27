@@ -23,9 +23,10 @@
 //   6. `cavity_transfer`: owners hand the cavity faces, and their edges and
 //      vertices, to the acting patch.
 //   7. `cavity_cleanup`: every involved patch keeps exactly the copies its
-//      owned faces need, rebuilds its maps, and recomputes its interior
-//      vertices. Patches that are not involved are unchanged by the round,
-//      so they keep what the previous cleanup left.
+//      owned faces need, erases the others from its maps (rebuilding a map
+//      when `topology::patch_map` says it is due), and recomputes its
+//      interior vertices. Patches that are not involved are unchanged by
+//      the round, so they keep what the previous cleanup left.
 //
 // Every stage except conclude runs one workgroup of PATCH_LANES
 // invocations per patch, from uniform control flow.
@@ -43,7 +44,8 @@ import super::patch::{
     global_vertex_offset, global_edge_offset, global_face_offset, owner_offset,
 };
 import super::patch_map::{
-    map_clear, map_set, map_find, map_claim, map_take, MAP_CLAIM_NEW, MAP_CLAIM_FULL,
+    map_clear, map_set, map_find, map_claim, map_take, map_erase, map_needs_rebuild,
+    MAP_CLAIM_NEW, MAP_CLAIM_FULL,
 };
 import super::directed_edge::directed_start;
 import super::flip::free_bit;
@@ -64,8 +66,6 @@ const INVALID: u32 = 0xffffffffu;
 @group(1) @binding(4) var<storage, read_write> scratch: array<atomic<u32>>;
 
 var<workgroup> shared_word: u32;
-// Bit k set if `cavity_cleanup` dropped a copy of kind k in this patch.
-var<workgroup> dropped_kinds: atomic<u32>;
 
 // Shares a value from the first invocation with the whole workgroup.
 fn broadcast(lane: u32, value: u32) -> u32 {
@@ -395,9 +395,7 @@ public fn cavity_cleanup(lane: u32, p: u32) {
     let r = record(p);
     let faces = used(r, FACE);
 
-    // Clear the interior bits, this patch's keep bits and the dropped kinds.
-    if (lane == 0u) { atomicStore(&dropped_kinds, 0u); }
-    workgroupBarrier();
+    // Clear the interior bits and this patch's keep bits.
     for (var k = 0u; k < 3u; k++) {
         let words = (r.capacity[k] + 31u) / 32u;
         for (var w = lane; w < words; w += PATCH_LANES) {
@@ -453,22 +451,26 @@ public fn cavity_cleanup(lane: u32, p: u32) {
     }
     storageBarrier();
 
-    // Drop every active copy not kept, noting the kinds dropped.
+    // Drop every active copy not kept, erasing it from the map first.
     for (var k = 0u; k < 3u; k++) {
         for (var s = lane; s < used(r, k); s += PATCH_LANES) {
             if (mask_bit(r.active_masks[k], s) && !scratch_bit(r.active_masks[k], s)) {
+                map_erase(p, k, global_id(r, k, s));
                 deactivate(r, k, s);
-                atomicOr(&dropped_kinds, 1u << k);
             }
         }
     }
-    workgroupBarrier();
+    storageBarrier();
 
-    // A map still records exactly the active slots unless a copy of its
-    // kind was dropped, or this is a failed acting patch, whose maps hold
-    // claims that were never filled. Empty the others for a rebuild.
+    // Rebuild a map once erasures have used up too much of it, and every
+    // map of a failed acting patch, whose maps hold claims that were never
+    // filled. Empty those maps first.
     let failed_actor = flagged(p, CAVITY_ACTING_WORD) && failed(p);
-    let rebuild = broadcast(lane, atomicLoad(&dropped_kinds) | select(0u, 7u, failed_actor));
+    var due = select(0u, 7u, failed_actor);
+    for (var k = 0u; k < 3u; k++) {
+        if (map_needs_rebuild(p, k)) { due |= 1u << k; }
+    }
+    let rebuild = broadcast(lane, due);
     for (var k = 0u; k < 3u; k++) {
         if ((rebuild & (1u << k)) != 0u) { map_clear(p, k, lane, PATCH_LANES); }
     }
