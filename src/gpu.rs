@@ -19,6 +19,7 @@ mod bench_meshes;
 mod boundary;
 mod build;
 mod edge;
+mod editable;
 mod geometry;
 mod pipeline;
 mod reduce;
@@ -36,6 +37,7 @@ pub use attribute::{
 pub use boundary::{BoundaryQuery, MeshBoundary};
 pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
 pub use edge::{EdgeConnectivity, EdgeQuery};
+pub use editable::{EditCapacity, GpuEditableMesh};
 pub use geometry::{FaceAreaQuery, FaceNormalQuery, VertexNormalQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 pub use reduce::{DotQuery, GpuReduction, ReduceOp, ReduceQuery, ReduceValue};

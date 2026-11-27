@@ -4,18 +4,25 @@ Status: approved 26 November 2026. Nothing here is implemented yet.
 
 ## Direction: in-kernel local queries
 
-Editing is the main feature of this crate, so the long-term query model for
-editable meshes is RXMesh-style in-kernel local queries: each kernel stages
-its patch's current EV/FE in workgroup memory and derives adjacency on the
-spot. Nothing is kept that could go stale, and the work stays local. Global
-query buffers stay as the simple static API and as the test oracle. The
-topology version check in this plan is a safeguard until local queries exist,
-not the end state.
+The user's direction, given when approving this plan: editing is the
+standout feature of this crate, and we definitely want to revisit in-kernel
+local queries. On a separate occasion they also said to follow RXMesh.
+Nothing more specific has been decided.
 
-Revisit this when Milestone 3's workgroup staging lands. Design the WESL
-staging API so that editing kernels can use it: patch capacity, tombstoned
-slots, active masks, and a consumer-written kernel calling library staging
-functions, since WGSL has no callbacks.
+What follows is a proposal, not yet put to the user:
+
+- Editable meshes could use RXMesh-style in-kernel local queries: each kernel
+  loads its patch's current EV/FE into workgroup memory and derives adjacency
+  on the spot, so nothing is kept that could go stale.
+- Global query buffers would stay as the simple static API and the test
+  oracle.
+- The topology version check in this plan would then be a safeguard rather
+  than the end state.
+- One way to make Milestone 3's WESL staging usable by editing kernels:
+  patch capacity, tombstoned slots, active masks, and kernels the consumer
+  writes that call library staging functions, since WGSL has no callbacks.
+
+Check these choices with the user before treating them as decided.
 
 ## Bottom line
 
@@ -33,10 +40,12 @@ functions, since WGSL has no callbacks.
   batch become reusable from the next batch, so a rejected or interrupted edit
   never overwrites rows it still needs. Capacity only has to cover one batch's
   new elements, not every edit ever made.
-- **Global IDs with capacity.** Attributes and query results stay indexed by
-  global ID. The editable mesh reserves a global capacity per element kind and
-  keeps a global active mask. Inactive IDs are skipped by queries and hold
-  unspecified values. No flip changes global counts.
+- **Global IDs, with global capacity deferred.** Attributes and query results
+  stay indexed by global ID. Flips never create or delete global IDs, so global
+  spare capacity and global active masks arrive in Phase 6, together with the
+  splits and collapses that need them. Until then, attributes keep their
+  current sizes. Changed after approval, because no kernel in this milestone
+  would read them.
 - **Topology version, not just `MeshId`.** Each committed edit batch bumps a
   version, every time an edit is encoded, because only the GPU knows whether
   anything was accepted. Topology results (adjacency, edge connectivity, face
@@ -84,21 +93,24 @@ by P. That case is the main rejection test.
 
 The arena is one storage buffer in `u32` words, like the static arena.
 
-- **Header:** global counts and capacities for vertices, edges and faces;
-  the patch count; offsets of the regions below.
-- **Patch records:** one fixed-size record per patch, holding local counts and
-  local capacities for vertices, edges and faces, and word offsets of that
-  patch's regions.
+- **Header:** global vertex, edge and face counts; the patch count; word
+  offsets of the patch records and of the three owner tables.
+- **Patch records:** one fixed-size record per patch, holding local slot
+  capacities for vertices, edges and faces, the word offsets of that patch's
+  arena regions, and the word offsets of its masks in the mask buffer.
 - **Per-patch regions**, sized by capacity, not count: global vertex IDs, EV
   (two local vertex IDs per edge), FE (three `(local edge, reversed)` pairs per
-  face), global edge IDs, global face IDs, and bitmasks of active and owned
-  local slots (one bit per slot, in `u32` words).
+  face), global edge IDs and global face IDs. Unused slots hold `INVALID_ID`.
 - **Global owner tables:** for each global vertex, edge and face ID, the owner
-  `(patch, local)` handle, or `INVALID_ID` for inactive IDs.
-- **Global active masks**, one bit per global ID per kind.
-- **Query task lists:** the same owned-face and owned-edge tasks as the static
-  arena, with a global-ID → task-index table, so a commit can rewrite the task
-  of a face or edge that moved to a new local slot.
+  `(patch, local)` handle, as two words.
+- **Mask buffer:** a second buffer with each patch's active, owned and
+  interior bitmasks, one bit per local slot, packed into `u32` words.
+
+The static arena's face and edge task lists are left out. Every task field is
+a patch offset or a local index, which the owner handle and patch record
+already give. So queries dispatch over global IDs through the owner tables,
+and a flip commit has no task lists to rewrite. That also saves `4F + 7E`
+words. Changed after approval.
 
 Deleted local slots are tombstones: their active bit is cleared and their FE
 and EV rows are overwritten with `INVALID_ID`. Capacity per patch is
@@ -125,7 +137,7 @@ scan of each star.
 API sketch, names provisional:
 
 ```rust
-pub struct EditCapacity { pub factor: f32 }
+pub struct EditCapacity { /* factor, checked finite and >= 1 by `new` */ }
 pub struct GpuEditableMesh { /* arena, counts, capacities, MeshId, version */ }
 impl GpuEditableMesh {
     pub fn upload(device: &wgpu::Device, mesh: &Mesh, capacity: EditCapacity)
@@ -152,29 +164,37 @@ the accessor work below.
 
 ## Steps
 
-1. **Topology version and `Stale`.** Add the version to topology results and
-   the optional stamp to derived attributes, and check both in the queries
-   that take them. `GpuMesh` is always version 0. This touches `src/gpu.rs`,
-   `GpuError` and `src/gpu/attribute.rs`, which are shared, so tell the other
-   session before starting.
-2. **Editable arena and upload.** Host-side layout builder with capacities,
-   masks and owner tables, plus `GpuEditableMesh::upload`. A test checks that
-   the arena round-trips: reading it back and rebuilding the topology gives the
-   source mesh.
-3. **Queries on the editable arena.** Shared WESL accessors that read per-patch
-   counts from the header and skip inactive slots. Run the full existing query
-   suite on an unedited editable mesh against Alum. Coordinate before starting.
-4. **Single flip.** One kernel validates and then commits:
+The version check was step 1, but nothing can change a version before a flip
+exists, so it couldn't be tested. It now lands with the single flip.
+
+1. **Editable arena and upload.** A host-side layout builder with capacities,
+   masks and owner tables, plus `GpuEditableMesh::upload`. One layout
+   definition is used both to build the arena and to decode it in tests.
+   Host-side tests:
+   - decoding gives back the source triangles, at several patch sizes and
+     for an empty mesh;
+   - active bits match the counts, and owned bits match the owner tables;
+   - the interior bitmask matches a brute-force scan of each star;
+   - invalid capacity factors and device limits are rejected before
+     anything is allocated.
+2. **Queries on the editable arena.** A shared `GpuTopology` trait carries the
+   arena, counts, `MeshId` and version, and results record the version. Shared
+   WESL accessors skip inactive slots. Run the full existing query suite on an
+   unedited editable mesh against Alum. Agree the accessor layer with the
+   other session before starting.
+3. **Single flip, version and `Stale`.** The version bump, `GpuError::Stale`,
+   the optional topology stamp on derived attributes, and the staleness test
+   all land here. One kernel validates and then commits:
    - It finds the diamond from FE/EV in the owner patch, and rebuilds the
      orientation explicitly, because diamonds are not cyclic.
    - It checks boundary, interior, connected-opposites and degeneracy.
    - It claims free slots with the mask try-set, skipping slots freed in this
      batch.
    - It tombstones the old slots, writes the new EV/FE rows, and updates the
-     owner tables, task lists and active masks.
+     owner tables and active masks.
    - Rejections write a status and change nothing else. If a flip can't claim
      all three slots, it releases the ones it got and reports out of capacity.
-5. **Parallel compatible flips.** Add a claim dispatch: each candidate does an
+4. **Parallel compatible flips.** Add a claim dispatch: each candidate does an
    `atomicMin` of its priority on all four diamond vertices, and a later
    dispatch keeps only the candidates that won all four. The priority is a
    bijective hash of the global edge ID, reseeded on each call. Raw IDs would
@@ -183,7 +203,7 @@ the accessor work below.
    two flips creating the same new edge. No CPU readback happens between
    dispatches; the caller retries losers by calling again. Bounded retry
    rounds are the caller's choice for now.
-6. **Example and docs.** A downstream example that flips grid diagonals by a
+5. **Example and docs.** A downstream example that flips grid diagonals by a
    geometric rule, such as a Delaunay-style angle test, written in public WESL.
    It runs queries before and after the flips. Update the README contracts and
    the ROADMAP.
@@ -223,11 +243,11 @@ the other Milestone 4 leftovers are also out of scope.
 
 ## Coordination
 
-Step 3 changes how static kernels address local slots: they read per-patch
-counts and skip tombstones. The other session's Milestone 3 workgroup staging
-reads the same patch data. Before step 3, agree on one accessor layer in
-`shaders/topology/` that both use. Steps 1 and 2 don't touch shared kernels.
-No GPU work runs while the other session is benchmarking.
+Step 2 changes how kernels address local slots: they go through patch records
+and skip inactive slots. The other session's Milestone 3 workgroup staging
+reads the same patch data. Before step 2, agree on one accessor layer in
+`shaders/topology/` that both use. Step 1 doesn't touch shared kernels or
+shared Rust files, apart from one `mod` line in `src/gpu.rs`.
 
 ## Open questions
 
