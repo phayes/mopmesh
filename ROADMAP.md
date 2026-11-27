@@ -295,17 +295,30 @@ local cavities. The current Cargo version does not mean that release scope is co
    - [ ] Rerun on real scanned meshes (`MOPMESH_BENCH_OBJ`) once the Phase 0
      benchmark meshes are curated.
    - [ ] Rerun on a second adapter, ideally a discrete GPU.
-3. **Workgroup-local traversal experiment.** The baseline picks edge
-   incidence. The arena's edge records scan every face of the owner patch for
-   each owned edge, cost grows linearly with patch size, and boundary flags
-   share the same scan. The order-sensitive global VV/FF kernels are the
-   second target. Editing is a headline feature and the design follows
-   RXMesh, so the staging should also serve editing kernels. The
-   [staging plan](docs/workgroup_staging_plan.md) has the design and the
-   step 1 prototype results; the static arena adopts the editable header and
-   patch records (decided 26 November 2026). Compare staged and existing paths with identical
-   outputs. Acceptance: Alum parity and measured tradeoffs across mesh/patch
-   sizes; retain or revise the approach based on evidence.
+3. **Workgroup-local traversal (Milestone 3) — steps 1–3 done, step 4
+   skipped, step 5 open.** Each staged query runs one workgroup per patch and
+   finds each edge's faces in workgroup memory. Editing is a headline feature
+   and the design follows RXMesh, so static and editable meshes share one
+   patch layout and one set of staged kernels. The
+   [staging plan](docs/workgroup_staging_plan.md) has the design, decisions
+   and per-step results.
+   - [x] Step 1: prototype the staged edge-record kernel.
+   - [x] Step 2: static arena takes the editable header, patch records and
+     a full mask buffer (decided 26 November 2026). Edge records and face
+     vertices run per patch. Memory fell from 129–145 to 83–103 B/face.
+   - [x] Step 3: edge records, FF and diamonds come from one staged pass;
+     boundary flags from another. Outputs match the global kernels word for
+     word, on static and editable meshes. At 2.1 M faces, shuffled
+     adjacency fell from 12.4–12.9 to 9.7–10.1 ms, against 13.1–13.3 ms
+     flat; input order is still 4.5–5.3 against 2.8–2.9 ms.
+   - [x] Step 4 skipped (27 November 2026): VV alone is 0.9–1.1 ms in input
+     order and 2.4–2.7 ms shuffled, a quarter of shuffled adjacency, so
+     staging it could save little and would likely slow input order.
+   - [ ] Step 5: clean benchmark rerun and report update; see the plan.
+   - Follow-ups, not scheduled: the staged pass is still 2.5–3x the flat
+     edge pass in input order and is most of the shuffled adjacency cost;
+     patch size 32 runs 3.5–4x slower than before; an all-active static
+     reader could recover 5–15%; staging FE is untried.
 4. **Complete useful static functionality — done.** Edge/face attributes,
    normals, areas, boundary flags, reductions and smoothing landed with
    documented contracts, reference checks and the `smoothing` example. Their

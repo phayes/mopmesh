@@ -308,8 +308,7 @@ torus and irregular meshes, against today's face-task kernel:
   (3.17 against 2.68 ms on the grid), though it writes less; that is not
   yet explained. The staged edge pass itself is still 2.5–3x the flat edge
   pass on input-ordered meshes, and it is the remaining gap to flat there.
-  On shuffled meshes the global VV transpose is the largest cost, so step 4
-  is still worth doing.
+  On shuffled meshes, VV timed on its own (below) is not the largest cost.
 - **Staging FE as well (open question).** Not tried. The staged passes read
   FE from the patch's own contiguous region, and the gap above is in the
   staged pass as a whole, so FE staging is one candidate alongside the
@@ -323,9 +322,38 @@ torus and irregular meshes, against today's face-task kernel:
    See [Step 2 results](#step-2-results).
 3. **Stage the boundary and FF kernels — done.** See
    [Step 3 results](#step-3-results).
-4. **Stage VV,** if the benchmark still shows VV as the order-sensitive cost.
-   It needs per-vertex row offsets, so it comes after FF.
-5. **Rerun the baseline** at all sizes and both orders, and update the report.
+4. **Stage VV — skipped** (decided 27 November 2026). The step was to run
+   only if VV was still the order-sensitive cost. Measured on 26 November 2026 with the "VV (edge records given)" row, 2.1 M
+   faces, patch size 128, median GPU time: 0.86–1.08 ms in input order and
+   2.41–2.71 ms shuffled, out of 4.47–5.15 ms and 9.67–10.08 ms for the
+   whole adjacency query. VV is a quarter of the shuffled cost; the staged
+   edge, FF and diamond pass is the other 7.2–7.5 ms. Staging VV could save
+   at most part of 2.5 ms shuffled, and staged kernels have so far run
+   2.5–3x slower than flat ones in input order, where VV costs under 1 ms.
+5. **Rerun the baseline and update the reports.**
+   1. Before starting, ask the Milestone 5 session for a quiet GPU and CPU
+      (no builds or tests) for the whole run, and tell it when done.
+   2. Run on a clean committed tree:
+      `MOPMESH_BENCH=1 MOPMESH_BENCH_FACES=32768,524288,2097152
+      MOPMESH_BENCH_PATCHES=32,128,512 cargo test --release --lib
+      gpu_baseline_benchmark -- --ignored --nocapture`, saving the output.
+      This covers every generated mesh in input and shuffled order. Run it
+      a second time and compare medians; rerun any row whose medians differ
+      by more than about 10%, as earlier runs were noisy.
+   3. Update [docs/baseline_benchmark.md](baseline_benchmark.md): every
+      table, the memory figures (bytes per face and per held element), the
+      dispatch, buffer and bind-group counts, and the new "VV (edge records
+      given)" row. Rewrite the summary so it states where the arena now wins
+      (shuffled adjacency) and loses (input order, patch size 32), and fix
+      the text that still calls VV/FF global kernels (around line 38).
+   4. Update the plan's Step 2 and Step 3 speed tables from the clean run,
+      and mark this plan's status as complete.
+   5. Update `ROADMAP.md`: the Milestone 3 entry under "Next execution
+      milestones", the benchmark summary in item 2 ("slower on every query",
+      the 5.8x, 2.9x and 3.6–4x figures), and, in agreement with the Milestone 5 session, the "Current
+      position" paragraph and the test count.
+   6. Run fmt, clippy, `cargo doc --all-features` and
+      `cargo test --doc --all-features`, then ask the user to commit.
 
 ## Decisions for the user
 
