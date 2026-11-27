@@ -26,7 +26,7 @@ work, acceptance criteria and next steps, and the
 - Typed canonical GPU vertex, edge and face attributes with explicit updates, and GPU face centroids verified against Alum.
 - GPU face normals, face areas and area-weighted vertex normals, verified against Alum and an f64 reference.
 - GPU boundary flags, whole-attribute reductions (sum, min, max, dot) and uniform Laplacian smoothing with optional fixed vertices, plus a downstream smoothing example.
-- An editable GPU mesh with spare per-patch slots and masks, single edge flips inside a patch verified against Alum, and a value-based WESL flip API that downstream kernels can apply themselves.
+- An editable GPU mesh with spare per-patch slots and masks, parallel edge flips inside a patch verified against Alum, and a value-based WESL flip API that downstream kernels can apply themselves.
 - GPU mesh construction (`GpuMeshBuilder`) from position and triangle buffers already on the GPU, with the same validation as the host builder and every query verified against Alum.
 
 Alum is the CPU reference, not a separately implemented MOPMesh CPU oracle.
@@ -109,9 +109,11 @@ codes for a 1024³ grid.
 same value as the Rust constant `mopmesh::gpu::INVALID_ID`. Helpers that look up
 a missing face, endpoint or face slot return the matching constant.
 
-These public modules declare no resource bindings or compute entry points.
-Consumers choose those themselves. See `tests/shaders/consumer.wesl` and
-`tests/wesl_package.rs` for a complete linking example. Public module paths and
+These public modules take values and declare no resource bindings or compute
+entry points, except the opt-in `topology::patch_arena` readers, which bind
+the arena and masks in group 1. Consumers choose the rest themselves. See
+`tests/shaders/consumer.wesl` and `tests/wesl_package.rs` for a complete
+linking example. Public module paths and
 types are experimental. `face_vertices` accepts three EV records in face-edge
 order and three orientation flags, returning local vertex IDs. Consumers load
 records from their own buffers; no storage-pointer extensions are required.
@@ -509,8 +511,9 @@ use mopmesh::gpu::{EdgeFlipQuery, EditCapacity, FlipStatus, GpuEditableMesh};
 // Each patch gets 1.5 times as many slots as it has elements.
 let mut editable = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default())?;
 let flips = EdgeFlipQuery::new(&device);
-let status = flips.encode(&device, &mut encoder, &mut editable, edge_id);
-// After submitting, read status.buffer() and decode it:
+// Request any number of edges; they are flipped in parallel.
+let statuses = flips.encode(&device, &mut encoder, &mut editable, &edge_ids)?;
+// After submitting, read statuses.buffer(): one word per requested edge.
 // FlipStatus::from_word(word) == Some(FlipStatus::Flipped)
 ```
 
@@ -529,12 +532,20 @@ A flip is rejected, and the mesh left exactly as it was, when:
 - the two new corners are already joined by an edge (`Connected`);
 - the two faces don't form a proper four-sided region (`Degenerate`);
 - the patch has no free edge slot or two free face slots (`OutOfCapacity`);
+- another requested flip shares one of its four corners and won it
+  (`LostClaim`);
 - the edge ID is out of range (`NotAnEdge`).
 
-Slots freed by a flip are reused by later flips, so capacity only has to
-cover the flips in flight. Flips recorded one after another apply in order.
-Each `encode` call increases `GpuEditableMesh::version()`, even for a flip the
-GPU then rejects. Results computed before an edit are not updated; recompute
+`LostClaim` and `OutOfCapacity` can depend on the other flips in the same
+call, so request those edges again in a later call to retry them. Which of two
+conflicting flips wins is pseudo-random and changes from call to call. List
+each edge at most once per call: a repeated edge flips once, and requesting
+its losing copies again would flip it back.
+
+Slots freed by a flip are reused by flips in later calls, so capacity only has
+to cover one call's flips. Calls recorded one after another apply in order.
+Each `encode` call increases `GpuEditableMesh::version()`, even when the GPU
+rejects every flip. Results computed before an edit are not updated; recompute
 them afterwards. Static queries don't accept a `GpuEditableMesh` yet.
 
 **Flipping from your own WESL kernel.** `topology::flip` exposes the flip as
@@ -564,12 +575,38 @@ Rules for step 5:
 - **Order doesn't matter.** No two entries touch the same word.
 - **Arena writes can be plain stores, but mask updates must be atomic.** A
   flip writes only its own slots, while several slots share each mask word.
-- **One flip per patch per dispatch, for now.** Two concurrent flips in one
-  patch could share a corner or pick the same free slot. A claim step that
-  makes this safe is planned.
+- **One flip per patch per dispatch.** Two concurrent flips in one patch
+  could share a corner or pick the same free slot. To flip many edges at
+  once, use the three-dispatch protocol below.
+
+**Flipping many edges at once from WESL.** Give each candidate an index and
+keep, per candidate, a status word, its two face slots and three reserved
+slots, plus one atomic claim word per mesh vertex, zeroed beforehand. Then
+run three dispatches with no readback between them:
+
+1. **Claim.** Do steps 1–3 above, and step 4's interior and `c`–`d` checks,
+   without writing to the mesh. Leave free slots to the next dispatch. If the
+   candidate can flip, store its face slots and `atomicMax` its
+   `flip_priority(index, seed)` into the claim words of its four corners'
+   global vertex IDs.
+2. **Reserve.** Reload the candidate's two face rows and call `flip_quad`
+   again. Keep the candidate only if all four claim words still hold its
+   priority (otherwise `FLIP_LOST_CLAIM`). Then reserve one edge slot and two
+   face slots by atomic try-set: pick a slot with `free_bit`, check it is
+   below capacity, `atomicOr` its active bit, and keep it only if the bit was
+   clear before. If any of the three fails, clear the bits you set and report
+   `FLIP_OUT_OF_CAPACITY`.
+3. **Commit.** Reload the face rows, call `flip_quad` and `flip_writes` with
+   the reserved slots, and apply the writes.
+
+Use a different index for every candidate. In the reserve and commit
+dispatches, read only the candidate's own owner entry, face rows and their
+edges' rows: other winners are changing the rest of the patch. Pass a new
+`seed` for each retry round. The header of `topology::flip` has the full
+contract.
 
 [`runtime_shaders/edge_flip.wesl`](runtime_shaders/edge_flip.wesl) is the
-library's own kernel, written this way. The downstream example
+library's own kernel, written with the three dispatches. The downstream example
 [`tests/shaders/flip_consumer.wesl`](tests/shaders/flip_consumer.wesl) adds a
 shorter-diagonal rule, and its test checks that it edits the mesh word for word
 like `EdgeFlipQuery`.
@@ -632,9 +669,8 @@ self-intersections are not checked.
 Handles are mesh-relative addresses and must not be used with another mesh.
 Future migration and slot reuse invalidate them. Vertex attributes verify mesh
 identity and share canonical values across ribbons, as do edge and face
-attributes. Edits are limited to single edge flips inside one patch on a
-`GpuEditableMesh`; parallel flips, cross-patch edits, splits and collapses
-remain future work.
+attributes. Edits are limited to edge flips inside one patch on a
+`GpuEditableMesh`; cross-patch edits, splits and collapses remain future work.
 GPU topology queries currently access storage buffers directly; the scan uses
 workgroup scratch, but topology is not yet staged in workgroup memory. Query
 objects reuse pipelines while encode calls allocate fresh output/scratch

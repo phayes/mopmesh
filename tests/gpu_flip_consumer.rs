@@ -61,7 +61,9 @@ fn downstream_kernel_flips_only_shortening_edges_like_the_library() {
         if shortens {
             // The same flip through the library's own kernel.
             let mut encoder = device.create_command_encoder(&Default::default());
-            let library = query.encode(&device, &mut encoder, &mut by_library, edge);
+            let library = query
+                .encode(&device, &mut encoder, &mut by_library, &[edge])
+                .unwrap();
             queue.submit([encoder.finish()]);
             let library = read_words(&device, &queue, library.buffer())[0];
             assert_eq!(FlipStatus::from_word(library), Some(FlipStatus::Flipped));

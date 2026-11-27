@@ -41,7 +41,7 @@ pub use boundary::{BoundaryQuery, MeshBoundary};
 pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
 pub use edge::{EdgeConnectivity, EdgeQuery};
 pub use editable::{EditCapacity, GpuEditableMesh};
-pub use flip::{EdgeFlipQuery, FlipStatus, GpuFlipStatus};
+pub use flip::{EdgeFlipQuery, FlipStatus, GpuFlipStatuses};
 pub use geometry::{FaceAreaQuery, FaceNormalQuery, VertexNormalQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 pub use reduce::{DotQuery, GpuReduction, ReduceOp, ReduceQuery, ReduceValue};

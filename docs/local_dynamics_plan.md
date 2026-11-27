@@ -1,6 +1,15 @@
 # Milestone 5 plan: local dynamics
 
-Status: approved 26 November 2026. Nothing here is implemented yet.
+Status: approved 26 November 2026. Steps 1, 2 and 4 are implemented; step 3
+waits on static meshes moving to the patch-record layout.
+
+Step 4 as built: `EdgeFlipQuery::encode` takes a list of edges and records
+three dispatches (claim, reserve, commit). The priority hashes the
+candidate's index in the list, not its edge ID, so a repeated edge can't win
+twice; the seed is the mesh version. Slots are reserved with an atomic
+try-set in their own dispatch, before any slot is freed. Single flips go
+through the same path. A parallel downstream WESL example is left for
+step 5.
 
 ## Direction: in-kernel local queries
 

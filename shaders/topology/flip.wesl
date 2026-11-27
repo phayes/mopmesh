@@ -153,21 +153,78 @@ public fn flipped_faces(
 //            else { atomicMax(&masks[m.offset], m.bits); }
 //        }
 //
-// Rules for applying the list:
-// - Apply all of it or none of it. Nothing checks it on the GPU, so a
-//   partial commit leaves the patch inconsistent. Do every check (steps 2-4)
-//   before the first write.
-// - The entries never overlap, so their order doesn't matter.
-// - Arena entries may be plain stores, provided no other invocation touches
-//   the same patch slots at the same time. Each flip only writes slots of its
-//   own edge, faces and freshly picked slots.
-// - Mask entries must be atomic. Bits of different slots share a u32 word,
-//   so two flips in one patch can update the same word.
-// - Applying the same list twice is wrong: the second time, the old slots it
-//   clears no longer hold the old edge and faces.
-// - Concurrent flips in one patch also need a claim step so that no two of
-//   them share a corner or pick the same free slot. Until the library has
-//   one, flip one edge per patch per dispatch.
+// Apply the writes with these safeguards:
+// - Complete all checks and slot selection before writing anything. Apply
+//   the entire list exactly once; partial or repeated writes can corrupt
+//   the patch, the part of the mesh that stores this edge and its faces.
+// - The entries do not overlap, so they may be applied in any order.
+// - Plain stores are sufficient for arena entries only when no other GPU
+//   invocation accesses the same slots during the writes.
+// - Use atomic operations for mask entries. Masks pack the state of several
+//   slots into one word, which other flips may also update.
+// - The steps above support one flip per patch per dispatch. For several
+//   flips in the same patch, use the three stages below.
+
+// ---------------------------------------------------------------------------
+// Flipping many edges at once
+//
+// A batch can flip several edges safely by choosing flips that share no
+// corner vertices and reserving separate storage for each. Run `claim`,
+// `reserve`, and `commit` as three ordered GPU dispatches; there is no need
+// to read results back to the CPU between them. See
+// runtime_shaders/edge_flip.wesl for a complete example.
+//
+// Give every request a unique index. For each request, allocate a status
+// word and five slot indices: two for the original faces, followed by one
+// for the replacement edge and two for the replacement faces. Also allocate
+// one atomic claim word per mesh vertex and clear those words to zero.
+//
+// 1. Claim: perform checks 1-3 above without changing the mesh. For each
+//    valid request, save its face slots and use `atomicMax` to write
+//    `flip_priority(index, seed)` to all four corners' claim words, indexed
+//    by global vertex ID. Set its status to FLIP_DONE. At this stage that
+//    status means eligible to continue, not that the flip has happened.
+//    Store the reason for rejection for any invalid request.
+// 2. Reserve: for each eligible request, rebuild its quad from the saved
+//    face slots. It must have the highest priority at all four corners;
+//    otherwise set FLIP_LOST_CLAIM. For each winner, reserve one inactive
+//    edge slot and two inactive face slots. Use `free_bit` to find a slot,
+//    check the patch capacity, and set its active bit with `atomicOr`.
+//    The slot is yours only if the returned word had that bit clear. If
+//    any reservation fails, release only this request's reservations and
+//    set FLIP_OUT_OF_CAPACITY. Do not clear any other bits in this stage.
+// 3. Commit: for each request still at FLIP_DONE, reload its saved faces,
+//    call `flip_quad` and `flip_writes` with its reserved slots, and apply
+//    every write. After this stage, FLIP_DONE means the edge was flipped.
+//
+// Keep these constraints when adapting the example:
+// - Unique request indices give unique priorities for a fixed seed, so
+//   each corner has at most one winner.
+// - In reserve and commit, read only the request's own owner entry, saved
+//   face rows, and their edge rows. Do not scan the patch for faces or
+//   edges: reservations and commits change data elsewhere in the patch.
+// - Reserve replacement storage before freeing the original slots. A flip
+//   needs one spare edge slot and two spare face slots; slots freed in this
+//   batch become available to later batches.
+// - Requests rejected with FLIP_LOST_CLAIM or FLIP_OUT_OF_CAPACITY make no
+//   mesh changes themselves and may be retried. Change the seed for later
+//   batches to vary priorities. This does not guarantee a particular
+//   request will win, or make space in a patch with no spare slots.
+// - List each edge once. At most one duplicate request can flip it; retrying
+//   another copy after that success can flip the edge back.
+
+// Returns a repeatable, shuffled priority for a request. Higher values win
+// shared corners. With a fixed `seed`, distinct request indices have
+// distinct priorities; changing the seed can change which requests win.
+public fn flip_priority(index: u32, seed: u32) -> u32 {
+    var x = index ^ seed;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
 
 // One arena word to store.
 public struct ArenaWrite {

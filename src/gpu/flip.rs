@@ -1,5 +1,5 @@
 //! Edge flips on editable meshes.
-use super::{GpuEditableMesh, pipeline};
+use super::{GpuEditableMesh, GpuError, pipeline};
 use wgpu::util::DeviceExt;
 
 /// The outcome of one requested edge flip, as written by the GPU.
@@ -48,69 +48,185 @@ impl FlipStatus {
     }
 }
 
-/// One `u32` status word written by an edge flip; decode it with
-/// [`FlipStatus::from_word`]. The buffer supports `STORAGE | COPY_SRC`.
-pub struct GpuFlipStatus {
+/// GPU results for a batch of edge flips, in the same order as the requests.
+///
+/// After submitting and completing the commands from [`EdgeFlipQuery::encode`],
+/// read the first [`len`](Self::len) `u32` words and decode them with
+/// [`FlipStatus::from_word`]. The buffer supports `STORAGE | COPY_SRC`, so it
+/// can be used by another shader or copied to a CPU-readable buffer.
+pub struct GpuFlipStatuses {
     buffer: wgpu::Buffer,
+    len: u32,
 }
-impl GpuFlipStatus {
+impl GpuFlipStatuses {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
+    /// Number of results to read, including rejected requests.
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
-/// Flips single edges of a [`GpuEditableMesh`]. Cache one per device.
+/// Records batches of edge flips on a [`GpuEditableMesh`].
+/// Create one per device and reuse it for subsequent batches.
 pub struct EdgeFlipQuery {
-    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    claim: wgpu::ComputePipeline,
+    reserve: wgpu::ComputePipeline,
+    commit: wgpu::ComputePipeline,
 }
 
 impl EdgeFlipQuery {
     pub fn new(device: &wgpu::Device) -> Self {
+        use wgpu::BufferBindingType::{Storage, Uniform};
         let module = pipeline::shader_module(
             device,
             "MOPMesh edge flip",
             include_str!(concat!(env!("OUT_DIR"), "/edge_flip.wgsl")),
         );
-        Self {
-            pipeline: pipeline::compute_pipeline(
+        let write = Storage { read_only: false };
+        let (layout, pipeline_layout) = pipeline::buffer_layout(
+            device,
+            "MOPMesh edge flip",
+            &[
+                Uniform,
+                Storage { read_only: true },
+                write,
+                write,
+                write,
+                write,
+                write,
+            ],
+        );
+        let stage = |entry| {
+            pipeline::compute_pipeline(
                 device,
                 "MOPMesh edge flip",
                 &module,
-                "main",
-                None,
-            ),
+                entry,
+                Some(&pipeline_layout),
+            )
+        };
+        Self {
+            claim: stage("claim"),
+            reserve: stage("reserve"),
+            commit: stage("commit"),
+            layout,
         }
     }
 
-    /// Records a flip of `edge`, a global edge ID of `mesh`, and returns the
-    /// status the GPU will write. Flips recorded one after another apply in
-    /// order. Each call increases [`GpuEditableMesh::version`], even if the
-    /// flip is then rejected.
+    /// Records a batch of flips for the mesh-wide edge IDs in `edges`.
+    /// Returns a GPU status buffer with one result per request, in input order.
+    /// Submit the encoder's commands to run the flips and produce the results.
+    ///
+    /// Flips in one batch must not share any of their four corner vertices.
+    /// Each valid request gets a priority and proceeds only if it wins all
+    /// four corners; otherwise it reports [`FlipStatus::LostClaim`]. Priorities
+    /// depend on request order and the mesh version, so later calls can select
+    /// different winners.
+    ///
+    /// Each winner needs one spare edge slot and two spare face slots in its
+    /// patch. If it cannot reserve them, it reports [`FlipStatus::OutOfCapacity`].
+    /// When space is limited, GPU execution order can affect which winners
+    /// get slots. Requests with either status make no changes themselves and
+    /// may be retried later; a patch without spare slots still needs more capacity.
+    ///
+    /// List each edge at most once. At most one duplicate request can flip it,
+    /// and retrying another copy after a success can flip the edge back.
+    ///
+    /// Batches recorded into the encoder run in order. Every successful call
+    /// increases [`GpuEditableMesh::version`] when recorded, including an empty
+    /// batch or one whose flips are all rejected. An empty batch records no
+    /// GPU work. Returns [`GpuError::LimitsExceeded`] if the requests or mesh
+    /// exceed the device's buffer or dispatch limits, without recording work
+    /// or increasing the version.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         mesh: &mut GpuEditableMesh,
-        edge: u32,
-    ) -> GpuFlipStatus {
-        // Padded to 16 bytes, the minimum uniform struct size.
+        edges: &[u32],
+    ) -> Result<GpuFlipStatuses, GpuError> {
+        // Reject requests that exceed device limits before allocating buffers.
+        const RESOURCE: &str = "edge flips";
+        let limits = device.limits();
+        let count = u32::try_from(edges.len())
+            .map_err(|_| GpuError::LimitsExceeded { resource: RESOURCE })?;
+        let slot_bytes = u64::from(count) * u64::from(SLOT_WORDS) * 4;
+        pipeline::check_binding(&limits, slot_bytes, RESOURCE)?;
+        pipeline::check_binding(&limits, u64::from(mesh.vertex_count()) * 4, RESOURCE)?;
+        let grid = pipeline::workgroup_grid(&limits, count, RESOURCE)?;
+
+        // Advance the version even for an empty batch, which gets a one-word
+        // status buffer but has no results to read.
+        let seed = mesh.version() as u32;
+        mesh.bump_version();
+        let words = |n: u64| (n * 4).max(4);
+        let status = pipeline::output_buffer(
+            device,
+            "MOPMesh edge flip statuses",
+            words(u64::from(count)),
+        );
+        if count == 0 {
+            return Ok(GpuFlipStatuses {
+                buffer: status,
+                len: 0,
+            });
+        }
+        // Match the shader parameter layout, including its two padding words.
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MOPMesh edge flip request"),
-            contents: bytemuck::cast_slice(&[edge, 0, 0, 0]),
+            label: Some("MOPMesh edge flip parameters"),
+            contents: bytemuck::cast_slice(&[count, seed, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let status = pipeline::output_buffer(device, "MOPMesh edge flip status", 4);
+        let requests = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOPMesh edge flip requests"),
+            contents: bytemuck::cast_slice(edges),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let claims = pipeline::output_buffer(
+            device,
+            "MOPMesh edge flip claims",
+            words(u64::from(mesh.vertex_count())),
+        );
+        let slots = pipeline::output_buffer(device, "MOPMesh edge flip slots", slot_bytes);
         let bindings = pipeline::bind_buffers(
             device,
             "MOPMesh edge flip bindings",
-            &self.pipeline.get_bind_group_layout(0),
-            &[&params, mesh.arena(), mesh.masks(), &status],
+            &self.layout,
+            &[
+                &params,
+                &requests,
+                mesh.arena(),
+                mesh.masks(),
+                &claims,
+                &slots,
+                &status,
+            ],
         );
-        pipeline::dispatch(encoder, "MOPMesh edge flip", &self.pipeline, &bindings, 1);
-        mesh.bump_version();
-        GpuFlipStatus { buffer: status }
+
+        // Run the three stages in order so each sees the previous stage's results.
+        for (label, stage) in [
+            ("MOPMesh edge flip claim", &self.claim),
+            ("MOPMesh edge flip reserve", &self.reserve),
+            ("MOPMesh edge flip commit", &self.commit),
+        ] {
+            pipeline::dispatch_grid(encoder, label, stage, &bindings, grid);
+        }
+        Ok(GpuFlipStatuses {
+            buffer: status,
+            len: count,
+        })
     }
 }
+
+/// Five words per request: two original face slots, one reserved edge slot,
+/// and two reserved face slots. Must match `runtime_shaders/edge_flip.wesl`.
+const SLOT_WORDS: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -156,6 +272,80 @@ mod tests {
         ends
     }
 
+    /// A flip that passes the CPU reference checks, before checking storage
+    /// space or conflicts with other requests.
+    struct Valid {
+        /// Patch that stores the edge and contains all affected faces.
+        patch: u32,
+        /// Mesh-wide vertex IDs: the original edge endpoints, then the new endpoints.
+        corners: [u32; 4],
+    }
+
+    /// Checks whether edge `u-v` can flip within one patch of the test mesh.
+    /// Assumes valid input triangles; storage limits and competing requests
+    /// are checked separately.
+    fn classify(
+        mesh: &Mesh,
+        triangles: &[[u32; 3]],
+        [u, v]: [u32; 2],
+    ) -> Result<Valid, FlipStatus> {
+        let tris = triangles;
+        let on_edge: Vec<usize> = (0..tris.len())
+            .filter(|&f| tris[f].contains(&u) && tris[f].contains(&v))
+            .collect();
+        if on_edge.len() < 2 {
+            return Err(FlipStatus::Boundary);
+        }
+        let opposite = |f: usize| *tris[f].iter().find(|&&w| w != u && w != v).unwrap();
+        let (c, d) = (opposite(on_edge[0]), opposite(on_edge[1]));
+
+        // A flip must stay within one patch, including every face touching its corners.
+        let patch = face_patches(mesh);
+        let p = patch[on_edge[0]];
+        let interior = [u, v, c, d].iter().all(|&w| {
+            (0..tris.len())
+                .filter(|&f| tris[f].contains(&w))
+                .all(|f| patch[f] == p)
+        });
+        if !interior {
+            return Err(FlipStatus::NotInterior);
+        }
+        if tris.iter().any(|t| t.contains(&c) && t.contains(&d)) {
+            return Err(FlipStatus::Connected);
+        }
+        Ok(Valid {
+            patch: p,
+            corners: [u, v, c, d],
+        })
+    }
+
+    /// Builds expected triangles by applying the requested flips with Alum,
+    /// an independent mesh library. Face IDs remain aligned with the input.
+    fn alum_flips(
+        positions: &[[f32; 3]],
+        triangles: &[[u32; 3]],
+        edges: &[[u32; 2]],
+    ) -> Vec<[u32; 3]> {
+        let mut reference = PolyMeshF32::new();
+        for &[x, y, z] in positions {
+            reference.add_vertex(Vec3(x, y, z)).unwrap();
+        }
+        for t in triangles {
+            reference.add_face(&t.map(Into::into)).unwrap();
+        }
+        for &[u, v] in edges {
+            let edge = reference.find_halfedge(u.into(), v.into()).unwrap().edge();
+            reference.swap_edge_ccw(edge).unwrap();
+        }
+        reference
+            .faces()
+            .map(|f| {
+                let vs: Vec<u32> = reference.fv_ccw_iter(f).map(|v| v.index()).collect();
+                [vs[0], vs[1], vs[2]]
+            })
+            .collect()
+    }
+
     /// Predicts the flip of the edge `u-v` from the input triangles and patch
     /// assignment, using Alum for the flipped triangles.
     fn expect(
@@ -169,30 +359,13 @@ mod tests {
             triangles: None,
             new_edge: [0; 2],
         };
-        let tris = &fixture.triangles;
-        let on_edge: Vec<usize> = (0..tris.len())
-            .filter(|&f| tris[f].contains(&u) && tris[f].contains(&v))
-            .collect();
-        if on_edge.len() < 2 {
-            return reject(FlipStatus::Boundary);
-        }
-        let opposite = |f: usize| *tris[f].iter().find(|&&w| w != u && w != v).unwrap();
-        let (c, d) = (opposite(on_edge[0]), opposite(on_edge[1]));
-
-        // Every face around the four corners must belong to the same patch.
-        let patch = face_patches(mesh);
-        let p = patch[on_edge[0]];
-        let interior = [u, v, c, d].iter().all(|&w| {
-            (0..tris.len())
-                .filter(|&f| tris[f].contains(&w))
-                .all(|f| patch[f] == p)
-        });
-        if !interior {
-            return reject(FlipStatus::NotInterior);
-        }
-        if tris.iter().any(|t| t.contains(&c) && t.contains(&d)) {
-            return reject(FlipStatus::Connected);
-        }
+        let Valid {
+            patch: p,
+            corners: [_, _, c, d],
+        } = match classify(mesh, &fixture.triangles, [u, v]) {
+            Ok(valid) => valid,
+            Err(status) => return reject(status),
+        };
         let record = records(
             &editable_contents(mesh, capacity, &wgpu::Limits::default())
                 .unwrap()
@@ -205,26 +378,13 @@ mod tests {
             return reject(FlipStatus::OutOfCapacity);
         }
 
-        // Flip with Alum. Its faces keep their indices, so face IDs line up.
-        let mut reference = PolyMeshF32::new();
-        for &[x, y, z] in &fixture.positions {
-            reference.add_vertex(Vec3(x, y, z)).unwrap();
-        }
-        for t in tris {
-            reference.add_face(&t.map(Into::into)).unwrap();
-        }
-        let edge = reference.find_halfedge(u.into(), v.into()).unwrap().edge();
-        reference.swap_edge_ccw(edge).unwrap();
-        let triangles = reference
-            .faces()
-            .map(|f| {
-                let vs: Vec<u32> = reference.fv_ccw_iter(f).map(|v| v.index()).collect();
-                [vs[0], vs[1], vs[2]]
-            })
-            .collect();
         Expected {
             status: FlipStatus::Flipped,
-            triangles: Some(triangles),
+            triangles: Some(alum_flips(
+                &fixture.positions,
+                &fixture.triangles,
+                &[[u, v]],
+            )),
             new_edge: [c.min(d), c.max(d)],
         }
     }
@@ -268,11 +428,20 @@ mod tests {
             test_support::read_words(&self.device, &self.queue, encoder, buffer)
         }
         fn flip(&self, mesh: &mut GpuEditableMesh, edge: u32) -> FlipStatus {
+            self.flip_all(mesh, &[edge])[0]
+        }
+        fn flip_all(&self, mesh: &mut GpuEditableMesh, edges: &[u32]) -> Vec<FlipStatus> {
             let mut encoder = self.device.create_command_encoder(&Default::default());
-            let status = self.query.encode(&self.device, &mut encoder, mesh, edge);
-            let word =
-                test_support::read_words(&self.device, &self.queue, encoder, status.buffer())[0];
-            FlipStatus::from_word(word).unwrap_or_else(|| panic!("unknown status {word}"))
+            let statuses = self
+                .query
+                .encode(&self.device, &mut encoder, mesh, edges)
+                .unwrap();
+            let words =
+                test_support::read_words(&self.device, &self.queue, encoder, statuses.buffer());
+            words[..edges.len()]
+                .iter()
+                .map(|&w| FlipStatus::from_word(w).unwrap_or_else(|| panic!("unknown status {w}")))
+                .collect()
         }
     }
 
@@ -420,5 +589,344 @@ mod tests {
             rebuilt_views(&mesh, &fixture, &fixture.triangles),
             "an even number of flips restores the mesh"
         );
+    }
+
+    /// Reproduces the shader's request priorities on the CPU to predict winners.
+    fn priority(index: u32, seed: u32) -> u32 {
+        let mut x = index ^ seed;
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+        x
+    }
+
+    /// Predicts batch results for the original mesh, assuming enough spare storage.
+    /// Returns a status per request and the original endpoints of edges expected
+    /// to flip. A request wins only if it has the highest priority at every corner.
+    fn predict_batch(
+        mesh: &Mesh,
+        triangles: &[[u32; 3]],
+        edges: &[u32],
+        seed: u32,
+    ) -> (Vec<FlipStatus>, Vec<[u32; 2]>) {
+        let ends = edge_endpoints(mesh);
+        let checked: Vec<_> = edges
+            .iter()
+            .map(|&e| match ends.get(e as usize) {
+                None => Err(FlipStatus::NotAnEdge),
+                Some(&uv) => classify(mesh, triangles, uv),
+            })
+            .collect();
+
+        // Record the highest valid request priority at each affected vertex.
+        let mut claims = std::collections::HashMap::<u32, u32>::new();
+        for (i, valid) in checked.iter().enumerate() {
+            for &corner in valid.iter().flat_map(|v| &v.corners) {
+                let bid = claims.entry(corner).or_default();
+                *bid = (*bid).max(priority(i as u32, seed));
+            }
+        }
+
+        // Only requests with the highest priority at all four corners can flip.
+        let mut flipped = Vec::new();
+        let statuses = checked
+            .iter()
+            .enumerate()
+            .map(|(i, valid)| match valid {
+                Err(status) => *status,
+                Ok(v)
+                    if v.corners
+                        .iter()
+                        .all(|c| claims[c] == priority(i as u32, seed)) =>
+                {
+                    flipped.push([v.corners[0], v.corners[1]]);
+                    FlipStatus::Flipped
+                }
+                Ok(_) => FlipStatus::LostClaim,
+            })
+            .collect();
+        (statuses, flipped)
+    }
+
+    /// Builds small test meshes with two patch sizes to exercise batches
+    /// within a single patch and across multiple patches.
+    fn batch_meshes() -> Vec<(String, fixtures::Fixture, Mesh)> {
+        let small = fixtures::valid()
+            .into_iter()
+            .filter(|f| f.triangles.len() <= 200);
+        small
+            .flat_map(|fixture| {
+                [32, 128].map(|patch_size| {
+                    let mesh = MeshBuilder::new()
+                        .patch_size(patch_size)
+                        .positions(&fixture.positions)
+                        .triangles(&fixture.triangles)
+                        .build()
+                        .unwrap();
+                    (
+                        format!("{} at patch size {patch_size}", fixture.name),
+                        fixtures::Fixture {
+                            name: fixture.name,
+                            positions: fixture.positions.clone(),
+                            triangles: fixture.triangles.clone(),
+                        },
+                        mesh,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Requests every edge in a reordered list, then adds a duplicate when
+    /// possible and an invalid ID to check how those requests are handled.
+    fn batch_request(mesh: &Mesh) -> Vec<u32> {
+        let count = mesh.edge_count() as u32;
+        let mut edges: Vec<u32> = (0..count).map(|i| (i * 7 + 3) % count).collect();
+        if count.is_multiple_of(7) {
+            edges = (0..count).rev().collect();
+        }
+        edges.extend(edges.get(count as usize / 2).copied());
+        edges.push(count);
+        edges
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn batches_flip_exactly_the_predicted_winners_like_alum() {
+        let gpu = Gpu::new();
+        let capacity = EditCapacity::new(3.0).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut most_in_one_patch = 0;
+        for (context, fixture, mesh) in batch_meshes() {
+            let edges = batch_request(&mesh);
+            let mut editable = GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
+            // Exercise priority selection with a mesh version greater than zero.
+            editable.bump_version();
+            let seed = editable.version() as u32;
+            let (expected, flipped) = predict_batch(&mesh, &fixture.triangles, &edges, seed);
+            let statuses = gpu.flip_all(&mut editable, &edges);
+            assert_eq!(statuses, expected, "{context}");
+            seen.extend(statuses.iter().map(|s| format!("{s:?}")));
+
+            // Confirm the prediction's assumption: every patch has one spare edge
+            // slot and two spare face slots for each predicted winner.
+            let ends = edge_endpoints(&mesh);
+            let records = records(
+                &editable_contents(&mesh, capacity, &wgpu::Limits::default())
+                    .unwrap()
+                    .arena,
+            );
+            let mut per_patch = std::collections::HashMap::<u32, usize>::new();
+            for uv in &flipped {
+                let valid = classify(&mesh, &fixture.triangles, *uv).unwrap();
+                *per_patch.entry(valid.patch).or_default() += 1;
+            }
+            for (&p, &n) in &per_patch {
+                let patch = &mesh.patches()[p as usize];
+                let free_edges = records[p as usize].capacity[1] as usize - patch.edge_ids().len();
+                let free_faces = records[p as usize].capacity[2] as usize - patch.face_ids().len();
+                assert!(
+                    n <= free_edges && 2 * n <= free_faces,
+                    "{context}: patch {p} too full to predict"
+                );
+                most_in_one_patch = most_in_one_patch.max(n);
+            }
+
+            // Compare the GPU result with the same flips performed by Alum.
+            let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
+            check_owner_tables(&arena, &masks);
+            let triangles = alum_flips(&fixture.positions, &fixture.triangles, &flipped);
+            assert_eq!(
+                patch_views(&arena, &masks),
+                rebuilt_views(&mesh, &fixture, &triangles),
+                "{context}"
+            );
+            for (&edge, status) in edges.iter().zip(&statuses) {
+                if *status == FlipStatus::Flipped {
+                    let valid = classify(&mesh, &fixture.triangles, ends[edge as usize]).unwrap();
+                    let [_, _, c, d] = valid.corners;
+                    assert_eq!(
+                        edge_endpoints_after(&arena, edge),
+                        [c.min(d), c.max(d)],
+                        "{context}: edge {edge}"
+                    );
+                }
+            }
+        }
+        for status in [
+            "Flipped",
+            "LostClaim",
+            "Boundary",
+            "NotInterior",
+            "Connected",
+            "NotAnEdge",
+        ] {
+            assert!(seen.contains(status), "batches never produced {status}");
+        }
+        assert!(
+            most_in_one_patch > 1,
+            "no batch flipped two edges in one patch"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn retrying_lost_claims_eventually_flips_every_valid_diagonal() {
+        let gpu = Gpu::new();
+        let (positions, triangles) = fixtures::grid(9);
+        for patch_size in [32, 128] {
+            let mesh = MeshBuilder::new()
+                .patch_size(patch_size)
+                .positions(&positions)
+                .triangles(&triangles)
+                .build()
+                .unwrap();
+            let ends = edge_endpoints(&mesh);
+            let is_diagonal = |[a, b]: [u32; 2]| a % 9 != b % 9 && a / 9 != b / 9;
+            let diagonals: Vec<u32> = (0..ends.len() as u32)
+                .filter(|&e| is_diagonal(ends[e as usize]))
+                .collect();
+            let valid: Vec<u32> = diagonals
+                .iter()
+                .copied()
+                .filter(|&e| classify(&mesh, &triangles, ends[e as usize]).is_ok())
+                .collect();
+            assert!(!valid.is_empty());
+
+            // Retry requests blocked by competing flips or unavailable storage.
+            // Remove successful requests so their edges are not flipped back.
+            let mut editable =
+                GpuEditableMesh::upload(&gpu.device, &mesh, EditCapacity::default()).unwrap();
+            let mut pending = diagonals.clone();
+            let mut flipped = Vec::new();
+            let mut rounds = 0;
+            while !pending.is_empty() {
+                rounds += 1;
+                assert!(rounds <= 64, "patch size {patch_size}: no convergence");
+                let statuses = gpu.flip_all(&mut editable, &pending);
+                let mut retry = Vec::new();
+                for (&edge, status) in pending.iter().zip(&statuses) {
+                    match status {
+                        FlipStatus::Flipped => flipped.push(edge),
+                        FlipStatus::LostClaim | FlipStatus::OutOfCapacity => retry.push(edge),
+                        FlipStatus::NotInterior => assert!(!valid.contains(&edge)),
+                        other => panic!("patch size {patch_size}: edge {edge}: {other:?}"),
+                    }
+                }
+                assert!(
+                    retry.len() < pending.len(),
+                    "patch size {patch_size}: round {rounds} made no progress"
+                );
+                pending = retry;
+            }
+            flipped.sort();
+            assert_eq!(flipped, valid, "patch size {patch_size}");
+            if patch_size == 128 {
+                assert!(rounds > 1, "the whole grid flipped in one round");
+            }
+
+            let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
+            check_owner_tables(&arena, &masks);
+            let flipped_ends: Vec<_> = flipped.iter().map(|&e| ends[e as usize]).collect();
+            let fixture = fixtures::Fixture {
+                name: "grid 9",
+                positions: positions.clone(),
+                triangles: triangles.clone(),
+            };
+            assert_eq!(
+                patch_views(&arena, &masks),
+                rebuilt_views(
+                    &mesh,
+                    &fixture,
+                    &alum_flips(&positions, &triangles, &flipped_ends)
+                ),
+                "patch size {patch_size}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn batches_without_spare_slots_reject_every_winner_unchanged() {
+        let gpu = Gpu::new();
+        let (_, mesh, _) = single_patch_grid();
+        let (_, triangles) = fixtures::grid(9);
+        let mut editable =
+            GpuEditableMesh::upload(&gpu.device, &mesh, EditCapacity::new(1.0).unwrap()).unwrap();
+        let before = (gpu.read(editable.arena()), gpu.read(editable.masks()));
+        let edges = batch_request(&mesh);
+        let (predicted, _) = predict_batch(&mesh, &triangles, &edges, 0);
+        let expected: Vec<_> = predicted
+            .into_iter()
+            .map(|s| match s {
+                FlipStatus::Flipped => FlipStatus::OutOfCapacity,
+                other => other,
+            })
+            .collect();
+        assert!(expected.contains(&FlipStatus::OutOfCapacity));
+        assert_eq!(gpu.flip_all(&mut editable, &edges), expected);
+        assert!(
+            (gpu.read(editable.arena()), gpu.read(editable.masks())) == before,
+            "rejected flips changed the mesh"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn batches_near_capacity_stay_consistent() {
+        // Five percent extra storage allows at most three flips in this batch.
+        // More requests win their corners, so the test accepts whichever
+        // subset gets storage and checks that the resulting mesh is consistent.
+        let gpu = Gpu::new();
+        let (fixture, mesh, _) = single_patch_grid();
+        let mut editable =
+            GpuEditableMesh::upload(&gpu.device, &mesh, EditCapacity::new(1.05).unwrap()).unwrap();
+        let edges = batch_request(&mesh);
+        let (predicted, _) = predict_batch(&mesh, &fixture.triangles, &edges, 0);
+        let statuses = gpu.flip_all(&mut editable, &edges);
+        let ends = edge_endpoints(&mesh);
+        let mut flipped = Vec::new();
+        for (i, (&status, &expected)) in statuses.iter().zip(&predicted).enumerate() {
+            if expected == FlipStatus::Flipped {
+                assert!(
+                    matches!(status, FlipStatus::Flipped | FlipStatus::OutOfCapacity),
+                    "candidate {i}: {status:?}"
+                );
+            } else {
+                assert_eq!(status, expected, "candidate {i}");
+            }
+            if status == FlipStatus::Flipped {
+                flipped.push(ends[edges[i] as usize]);
+            }
+        }
+        assert!(flipped.len() <= 3, "more flips than spare slots");
+        let (arena, masks) = (gpu.read(editable.arena()), gpu.read(editable.masks()));
+        check_owner_tables(&arena, &masks);
+        assert_eq!(
+            patch_views(&arena, &masks),
+            rebuilt_views(
+                &mesh,
+                &fixture,
+                &alum_flips(&fixture.positions, &fixture.triangles, &flipped)
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn empty_batches_record_nothing_but_count_a_version() {
+        let gpu = Gpu::new();
+        let (_, mesh, _) = single_patch_grid();
+        let mut editable =
+            GpuEditableMesh::upload(&gpu.device, &mesh, EditCapacity::default()).unwrap();
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let statuses = gpu
+            .query
+            .encode(&gpu.device, &mut encoder, &mut editable, &[])
+            .unwrap();
+        assert!(statuses.is_empty());
+        assert_eq!(editable.version(), 1);
     }
 }
