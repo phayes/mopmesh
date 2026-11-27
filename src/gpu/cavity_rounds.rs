@@ -11,11 +11,18 @@ use wgpu::util::DeviceExt;
 
 /// Words per request: stage, acting patch, then four corner vertex IDs.
 pub(crate) const REQUEST_WORDS: usize = 6;
-pub(crate) const NONE: u32 = 0;
-pub(crate) const PENDING: u32 = 1;
-pub(crate) const SELECTED: u32 = 3;
-pub(crate) const LOST: u32 = 4;
-pub(crate) const FAILED: u32 = 5;
+/// Request stages, as `topology::cavity_rounds` names them; read by tests.
+#[cfg(test)]
+pub(crate) mod stage {
+    pub const NONE: u32 = 0;
+    pub const PENDING: u32 = 1;
+    pub const SELECTED: u32 = 3;
+    pub const LOST: u32 = 4;
+    pub const FAILED: u32 = 5;
+    pub const DONE: u32 = 6;
+}
+#[cfg(test)]
+pub(crate) use stage::*;
 /// Words per mesh vertex in a round's vertex records.
 const VERTEX_WORDS: u64 = 14;
 /// Words per patch in a round's patch words; the first is the patch's lock.
@@ -108,12 +115,13 @@ impl CavityRounds {
     /// recorded in order, starting at 0, with nothing else that changes
     /// `mesh` between a round's stages. With `migrate`, each selected
     /// request's acting patch also takes over the faces around its corners,
-    /// or the request becomes FAILED; this counts as an edit of `mesh`.
+    /// or the request becomes FAILED; the caller counts that edit with
+    /// [`GpuEditableMesh::mark_edited`].
     pub fn encode_round(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        mesh: &mut GpuEditableMesh,
+        mesh: &GpuEditableMesh,
         state: &CavityState,
         round: u32,
         migrate: bool,
@@ -162,7 +170,6 @@ impl CavityRounds {
             m.encode(device, encoder, mesh, state, before)?;
             pipeline::dispatch_grid_groups(encoder, "conclude", &self.conclude, &groups, flat);
             m.encode(device, encoder, mesh, state, after)?;
-            mesh.mark_edited();
         }
         Ok(())
     }
@@ -171,23 +178,69 @@ impl CavityRounds {
 impl CavityState {
     /// Uploads `requests`, REQUEST_WORDS words each, for a batch on `mesh`.
     /// `seed` orders requests that share an acting patch.
+    #[cfg(test)]
     pub fn new(
         device: &wgpu::Device,
         mesh: &GpuEditableMesh,
         requests: &[u32],
         seed: u32,
     ) -> Result<Self, GpuError> {
-        // Check sizes before allocating.
+        let count = (requests.len() / REQUEST_WORDS) as u32;
+        Self::allocate(device, mesh, count, seed, Some(requests))
+    }
+
+    /// Allocates `request_count` requests, all CAVITY_NONE, for a batch on
+    /// `mesh`, to be filled on the GPU. `seed` orders requests that share an
+    /// acting patch.
+    pub fn zeroed(
+        device: &wgpu::Device,
+        mesh: &GpuEditableMesh,
+        request_count: u32,
+        seed: u32,
+    ) -> Result<Self, GpuError> {
+        Self::allocate(device, mesh, request_count, seed, None)
+    }
+
+    /// Checks that a state for `request_count` requests on `mesh` fits the
+    /// device's limits, without allocating. Returns the byte sizes of the
+    /// taken words, vertex records, patch words, requests and slot scratch.
+    pub fn check(
+        device: &wgpu::Device,
+        mesh: &GpuEditableMesh,
+        request_count: u32,
+    ) -> Result<[u64; 5], GpuError> {
         let limits = device.limits();
         let vertex_bytes = (u64::from(mesh.vertex_count()) * 4).max(4);
         let record_bytes = vertex_bytes * VERTEX_WORDS;
         let patch_bytes = (u64::from(mesh.patch_count()) * 4 * PATCH_WORDS as u64).max(4);
-        let request_bytes = (requests.len() as u64 * 4).max(4);
+        let request_bytes = (u64::from(request_count) * REQUEST_WORDS as u64 * 4).max(4);
         let scratch_bytes = mesh.masks().size();
         for bytes in [record_bytes, patch_bytes, request_bytes, scratch_bytes] {
             pipeline::check_binding(&limits, bytes, RESOURCE)?;
         }
+        Ok([
+            vertex_bytes,
+            record_bytes,
+            patch_bytes,
+            request_bytes,
+            scratch_bytes,
+        ])
+    }
 
+    fn allocate(
+        device: &wgpu::Device,
+        mesh: &GpuEditableMesh,
+        request_count: u32,
+        seed: u32,
+        requests: Option<&[u32]>,
+    ) -> Result<Self, GpuError> {
+        let [
+            vertex_bytes,
+            record_bytes,
+            patch_bytes,
+            request_bytes,
+            scratch_bytes,
+        ] = Self::check(device, mesh, request_count)?;
         let scratch = |label, bytes| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -198,23 +251,34 @@ impl CavityState {
                 mapped_at_creation: false,
             })
         };
-        let mut words = requests.to_vec();
-        if words.is_empty() {
-            words.push(NONE);
-        }
+        // Requests start as given, or all CAVITY_NONE (zero).
+        let requests_buffer = match requests {
+            Some(words) if !words.is_empty() => {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("MOPMesh cavity requests"),
+                    contents: bytemuck::cast_slice(words),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                })
+            }
+            _ => scratch("MOPMesh cavity requests", request_bytes),
+        };
         Ok(Self {
-            requests: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("MOPMesh cavity requests"),
-                contents: bytemuck::cast_slice(&words),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
+            requests: requests_buffer,
             vertex_records: scratch("MOPMesh cavity vertex records", record_bytes),
             patch_words: scratch("MOPMesh cavity patch words", patch_bytes),
             taken: scratch("MOPMesh cavity taken vertices", vertex_bytes),
             scratch: scratch("MOPMesh cavity slot scratch", scratch_bytes),
-            request_count: (requests.len() / REQUEST_WORDS) as u32,
+            request_count,
             seed,
         })
+    }
+
+    /// One nonzero word per mesh vertex used by a selected request; the
+    /// batch's first round reads it as given.
+    pub fn taken(&self) -> &wgpu::Buffer {
+        &self.taken
     }
 
     pub fn requests(&self) -> &wgpu::Buffer {
@@ -331,8 +395,7 @@ pub(super) mod tests {
                     .triangles(&bench.triangles)
                     .build()
                     .unwrap();
-                let mut gpu =
-                    GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+                let gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
 
                 // Request every edge with two faces.
                 let mut words = Vec::with_capacity(REQUEST_WORDS * sim.edge_count());
@@ -382,7 +445,7 @@ pub(super) mod tests {
 
                     let mut encoder = device.create_command_encoder(&Default::default());
                     rounds
-                        .encode_round(&device, &mut encoder, &mut gpu, &state, round, false)
+                        .encode_round(&device, &mut encoder, &gpu, &state, round, false)
                         .unwrap();
                     let read = test_support::read_words(&device, &queue, encoder, state.requests());
                     assert_eq!(read, words, "{context}: round {round}");

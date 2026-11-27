@@ -83,6 +83,8 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         include_str!(concat!(env!("OUT_DIR"), "/edge_flip.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/cavity_rounds.wgsl")),
         include_str!(concat!(env!("OUT_DIR"), "/cavity_migrate.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/cross_patch_flip.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/flip_selected.wgsl")),
     ] {
         validate(wgsl);
     }

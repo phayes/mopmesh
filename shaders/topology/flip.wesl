@@ -33,6 +33,9 @@ public const FLIP_LOST_CLAIM: u32 = 6u;
 public const FLIP_OUT_OF_CAPACITY: u32 = 7u;
 // The requested edge ID is not an edge of the mesh.
 public const FLIP_NOT_AN_EDGE: u32 = 8u;
+// A flip across patch borders was still waiting for its turn when the
+// batch's rounds ran out. It may be retried in a later batch.
+public const FLIP_RETRY: u32 = 9u;
 
 // A face's three edges in winding order: edge IDs, and for each a flag that
 // is 1 when the face runs the edge against its stored vertex order.

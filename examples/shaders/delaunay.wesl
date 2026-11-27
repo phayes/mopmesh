@@ -7,9 +7,8 @@
 // conflicts, mesh updates and each edge's status.
 import mopmesh::topology::flip_pass::{
     flip_patch_count, flip_patch, flip_edge_end, flip_stage, flip_candidate, flip_request,
-    flip_finish,
+    flip_finish, flip_has_corners,
 };
-import mopmesh::topology::flip::FLIP_DONE;
 import mopmesh::topology::patch_staging::STAGED_EDGES;
 import mopmesh::topology::patch::PATCH_LANES;
 import mopmesh::parallel::grid::flat_group;
@@ -55,7 +54,7 @@ fn flip(
         flip_stage(lane, r, first);
         for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += PATCH_LANES) {
             let c = flip_candidate(r, first, e);
-            flip_request(c, c.status != FLIP_DONE || should_flip(c.corners));
+            flip_request(c, !flip_has_corners(c) || should_flip(c.corners));
         }
     }
     flip_finish(lane, r, edges);

@@ -330,6 +330,23 @@ fn compare(
 #[test]
 #[ignore = "requires a GPU adapter; run cargo test --test gpu_edited -- --ignored --nocapture"]
 fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
+    edited_queries_match_a_fresh_upload(EditCapacity::new(1.02).unwrap());
+}
+
+/// With the default spare room, flips also cross patch borders, moving
+/// elements between patches; queries must still match.
+#[test]
+#[ignore = "requires a GPU adapter; run cargo test --test gpu_edited -- --ignored --nocapture"]
+fn queries_after_flips_across_patch_borders_match_a_fresh_upload() {
+    edited_queries_match_a_fresh_upload(EditCapacity::default());
+}
+
+/// Flips a renumbered skewed grid uploaded with `capacity`, first into free
+/// slots and then in Delaunay batches, and compares every query with a
+/// fresh upload of the replayed triangles. Below a factor of 1.5, the free
+/// slots must run out; from 1.5, some batch flip must cross patch borders.
+fn edited_queries_match_a_fresh_upload(capacity: EditCapacity) {
+    let tight = capacity.factor() < 1.5;
     let (device, queue) = gpu_device();
     let q = Queries::new(&device);
     let flip = EdgeFlipQuery::new(&device);
@@ -354,7 +371,6 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         .unwrap();
     assert_eq!(mesh.face_count(), grid.face_count());
     assert!(mesh.patches().len() > 1);
-    let capacity = EditCapacity::new(1.02).unwrap();
     let mut editable = GpuEditableMesh::upload(&device, &mesh, capacity).unwrap();
     let position_buffer = wgpu::util::DeviceExt::create_buffer_init(
         &device,
@@ -388,13 +404,25 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         fresh_flipped > mesh.patches().len(),
         "only {fresh_flipped} flips into free slots"
     );
-    assert!(
-        fresh.contains(&Some(FlipStatus::OutOfCapacity)),
-        "free slots never ran out"
-    );
+    if tight {
+        assert!(
+            fresh.contains(&Some(FlipStatus::OutOfCapacity)),
+            "free slots never ran out"
+        );
+    }
 
     // Then flip in batches until one flips nothing, replaying each reported
-    // flip on the CPU.
+    // flip on the CPU. Count flips whose two faces started in different
+    // patches: those needed elements moved between patches.
+    let mut first_patch = vec![0; triangles.len()];
+    for p in mesh.patches() {
+        for (&f, owner) in p.face_ids().iter().zip(p.face_owners()) {
+            if owner.patch == p.id() {
+                first_patch[f as usize] = p.id();
+            }
+        }
+    }
+    let mut crossing = 0;
     let (mut flipped, mut stalled) = (0, false);
     for _ in 0..1000 {
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -411,6 +439,11 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         let words = delaunay::read_words(&device, &queue, &status);
         for (edge, &word) in words.iter().enumerate() {
             if FlipStatus::from_word(word) == Some(FlipStatus::Flipped) {
+                let [a, b] = endpoints[edge];
+                let faces: Vec<usize> = (0..triangles.len())
+                    .filter(|&f| triangles[f].contains(&a) && triangles[f].contains(&b))
+                    .collect();
+                crossing += usize::from(first_patch[faces[0]] != first_patch[faces[1]]);
                 replay::replay(&mut triangles, &mut endpoints, edge);
                 flipped += 1;
             }
@@ -425,6 +458,10 @@ fn queries_on_an_edited_mesh_match_a_fresh_upload_of_the_flipped_triangles() {
         flipped > mesh.patches().len(),
         "only {flipped} flips in batches"
     );
+    if !tight {
+        assert!(crossing > 0, "no flip crossed patch borders");
+    }
+    println!("{flipped} flips in batches, {crossing} across patch borders");
 
     // Compare against a fresh static upload of the replayed triangles.
     let fresh_mesh = MeshBuilder::new()

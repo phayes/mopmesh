@@ -1,6 +1,6 @@
 # Implementation roadmap
 
-Last reviewed: 26 November 2026.
+Last reviewed: 27 November 2026.
 
 This is the maintained execution checklist. The [technical design](MOPMesh_Technical_Design.md)
 explains the architecture and intended dynamic transaction model; the
@@ -14,11 +14,13 @@ contracts in the README alongside the code.
 The prototype has the planned static adjacency families, canonical vertex
 attributes, hierarchical scans, and two runnable downstream WESL examples.
 Geometry algorithms have begun, and so has topology editing:
-`GpuEditableMesh` supports single and parallel interior edge flips. Each
-flip batch is one dispatch with one workgroup per patch; selection repeats
-until the set of flips is maximal, and flips rewrite their own edge and face
-slots, so they need no spare capacity and `EdgeFlipQuery` never reports
-`OutOfCapacity`. Every query runs on edited meshes through `GpuTopology`, and
+`GpuEditableMesh` supports parallel edge flips, inside patches and across
+patch borders. Each batch first flips edges inside single patches in one
+dispatch with one workgroup per patch, rewriting their own slots; then up to
+eight rounds flip the edges across patch borders by migrating ownership to
+one acting patch, as RXMesh does, which needs spare slots (`EditCapacity`,
+default 2). At patch size 512 a Delaunay settle completes; small patches can
+report `OutOfCapacity` until patch splitting (Phase 6) exists. Every query runs on edited meshes through `GpuTopology`, and
 results from before an edit are rejected with `GpuError::Stale`. Meshes can be built and partitioned
 on the CPU (`MeshBuilder`, then `GpuMesh::upload`) or entirely on the GPU
 (`GpuMeshBuilder`); both run the same query suite against Alum. Static
@@ -260,10 +262,42 @@ Deferred findings from the milestone 1 review, to settle with measurements:
 - [ ] Measure workgroup-memory claims and patch-local request lists,
   especially for shuffled meshes.
 
-### 5 — Boundary dynamics: not started
+### 5 — Boundary dynamics: in progress
 
-- [ ] Implement cross-patch claims, separate commit phases, bounded retry queues and explicit failures.
-- [ ] Repair ownership and ribbons after edits; validate migration and handle invalidation.
+Cross-patch edits follow RXMesh: the patches around an edit agree on one
+acting patch, which takes over the faces around the edit and copies what it
+needs from its neighbours; the neighbours then drop the copies they no
+longer need. The plan was decided on 27 November 2026: lock by bidding,
+then act; per-patch hash maps from global IDs to slots; a cleanup pass as in
+RXMesh.
+
+- [x] Step 0: CPU simulation of migration (`src/gpu/bench_migration.rs`),
+  to size footprints, capacity and rounds before GPU work.
+- [x] Step 1: per-patch ID maps (`GpuEditableMesh::maps`,
+  `topology::patch_map`), `mark_edited`, and an invariant checker run after
+  every edit test (`00d2883`).
+- [x] Step 2: scheduling (`topology::cavity_rounds`). Each round, edits bid
+  for every patch around them, relayed through vertex owners; edits whose
+  footprints don't overlap proceed together, and the top bid always wins.
+  The acting patch is the one owning the most faces around the edit's
+  corners. Checked word for word against a CPU prediction (`b89e846`).
+- [x] Step 3: migration and cleanup (`topology::cavity_migrate`). Owners
+  copy what the acting patch lacks; an acting patch without room fails
+  before writing anything; ownership moves; every patch involved keeps
+  exactly what its owned faces need. Checked every round against the CPU
+  model, with queries unchanged and failed rounds leaving the arena
+  untouched (`b42c87e`).
+- [x] Step 4: cross-patch flips. `EdgeFlipQuery::encode` and the new
+  `finish_pass` (for custom WESL rules) flip edges across patch borders in
+  up to eight rounds after the interior pass; new status `Retry`; default
+  `EditCapacity` raised to 2, as in RXMesh's Delaunay app. Checked edge for
+  edge against a CPU prediction; the Delaunay example's rule settles 65x65
+  and 129x129 skewed grids at patch size 512 with zero violations. At patch
+  size 16, edges left report `OutOfCapacity` (patch splitting, Phase 6).
+- [ ] Step 5: measure, and document the design as built.
+- [ ] Step 6: review bid-then-act against RXMesh's try-lock host loop, with
+  the code and measurements in place.
+- [ ] Bounded retry queues and handle invalidation, beyond flips.
 
 ### 6 — Growth: not started
 

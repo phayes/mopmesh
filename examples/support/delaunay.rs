@@ -20,7 +20,8 @@ pub fn compile_shader() -> String {
 /// Builds a flat grid with `n` vertices along each side, distorted so it needs
 /// edge flips, split into patches of about `patch_size` faces. Returns the
 /// mesh, positions as `[x, y, z, 1]` values, and triangles as mesh-wide vertex
-/// IDs. Use `n >= 2`; the example uses 11 with patch size 256 to fit one patch.
+/// IDs. Use `n >= 2`; the example uses 33 with patch size 512, about four
+/// patches.
 pub fn skewed_grid(n: u32, patch_size: usize) -> (Mesh, Vec<[f32; 4]>, Vec<[u32; 3]>) {
     let mut positions = Vec::new();
     for y in 0..n {
@@ -98,9 +99,11 @@ impl DelaunayFlips {
     /// mesh-wide edge ID. Submit the encoder before reading results. Supply
     /// `positions` as a STORAGE buffer with one `vec4<f32>` per mesh-wide vertex ID.
     /// An eligible edge that needs no flip returns FLIP_NOT_REQUESTED (zero).
+    /// Edges across patch borders flip too, in the rounds `finish_pass` adds.
     ///
-    /// Returns an error if `begin_pass` exceeds device limits. A successful call
-    /// increases the mesh version, even when no edges flip.
+    /// Returns an error if `begin_pass` or `finish_pass` exceeds device
+    /// limits. A successful call increases the mesh version, even when no
+    /// edges flip.
     pub fn encode(
         &self,
         device: &wgpu::Device,
@@ -127,18 +130,24 @@ impl DelaunayFlips {
         compute.set_bind_group(1, pass.bind_group(), &[]);
         compute.dispatch_workgroups(x, y, 1);
         drop(compute);
-        Ok(pass.statuses().buffer().clone())
+
+        // Flip the requested edges that cross patch borders.
+        let statuses = query.finish_pass(device, encoder, mesh, pass)?;
+        Ok(statuses.buffer().clone())
     }
 }
 
-/// Counts successful flips and requests that can be retried from one batch.
+/// Counts the outcomes of one batch that decide whether to run another.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Round {
     /// Number of edges successfully flipped.
     pub flipped: u32,
-    /// Number of requests that lost a shared vertex to a selected flip. A
-    /// later batch can retry them.
+    /// Number of requests that lost a shared vertex to another flip, or ran
+    /// out of rounds. A later batch can retry them.
     pub retry: u32,
+    /// Number of requests whose patch had no room for the flip. Retrying
+    /// them rarely helps; upload with a larger `EditCapacity` instead.
+    pub out_of_room: u32,
 }
 impl Round {
     pub fn from_statuses(words: &[u32]) -> Self {
@@ -146,7 +155,8 @@ impl Round {
         for &word in words {
             match FlipStatus::from_word(word) {
                 Some(FlipStatus::Flipped) => round.flipped += 1,
-                Some(FlipStatus::LostClaim) => round.retry += 1,
+                Some(FlipStatus::LostClaim | FlipStatus::Retry) => round.retry += 1,
+                Some(FlipStatus::OutOfCapacity) => round.out_of_room += 1,
                 _ => {}
             }
         }

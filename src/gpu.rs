@@ -22,11 +22,10 @@ mod bench_meshes;
 mod bench_migration;
 mod boundary;
 mod build;
-// Test-only until cross-patch flips use them.
-#[cfg(test)]
 mod cavity_migrate;
-#[cfg(test)]
 mod cavity_rounds;
+#[cfg(test)]
+mod cross_patch_tests;
 mod edge;
 mod editable;
 mod flip;

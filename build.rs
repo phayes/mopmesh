@@ -22,6 +22,8 @@ fn main() {
         "edge_flip",
         "cavity_rounds",
         "cavity_migrate",
+        "cross_patch_flip",
+        "flip_selected",
         "scan",
         "edges",
         "vertex_neighbors",

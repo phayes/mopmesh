@@ -207,29 +207,43 @@ from `flip_candidate` to your rule, and passes your decision to
 `flip_request`. Then `flip_finish` selects a maximal set of non-conflicting
 flips and applies them.
 
-A candidate with `status == FLIP_DONE` is eligible for your rule; it has not
-flipped yet. Its `corners` are mesh-wide vertex IDs `[a, b, c, d]`, with current
-diagonal `a-b` and proposed diagonal `c-d`. Read them only for eligible
-candidates. Follow the example's collective calls and synchronization when
-adapting the kernel.
+Run your rule on every candidate for which `flip_has_corners(c)` is true; it
+has not flipped yet. Its `corners` are mesh-wide vertex IDs `[a, b, c, d]`,
+with current diagonal `a-b` and proposed diagonal `c-d`. Read them only for
+such candidates. Follow the example's collective calls and synchronization
+when adapting the kernel.
 
-Requested flips are selected in decreasing priority. A flip that shares a
-vertex with an already selected one reports `FLIP_LOST_CLAIM` and can be
-retried in a later batch. A flip whose `c-d` edge already exists reports
-`FLIP_CONNECTED` and blocks nothing. Each flip rewrites its own edge and face
-slots, so flips need no spare capacity.
+The dispatch flips requested edges whose four corners lie inside one patch,
+selected in decreasing priority; those across patch borders report
+`FLIP_NOT_INTERIOR` until the pass is finished. A flip that shares a vertex
+with an already selected one reports `FLIP_LOST_CLAIM` and can be retried in
+a later batch. A flip whose `c-d` edge already exists reports
+`FLIP_CONNECTED` and blocks nothing. Flips inside a patch rewrite their own
+edge and face slots, so they need no spare capacity.
+
+`EdgeFlipQuery::finish_pass` then flips the requested edges across patch
+borders, as RXMesh's cavity manager does: in up to eight rounds, the patches
+around each flip agree on one acting patch, which takes over every face
+around the flip's corners, copies the neighbors it needs, and flips the edge
+inside itself; the other patches drop the copies they no longer need. Flips
+inside patches win shared vertices. These flips need spare slots in the
+acting patch (`EditCapacity`, default 2): one without room reports
+`OutOfCapacity`, and one still waiting when the rounds end reports `Retry`.
+At the default patch size of 512 a Delaunay settle completes; small patches
+can run out of room.
 
 On the host, create a `GpuEditableMesh` and an `EdgeFlipQuery`. Use your own
 bindings at group 0 and `EdgeFlipQuery::pass_layout()` at group 1. For each batch,
-call `begin_pass`, bind its `bind_group()`, and dispatch `patch_grid()`
-workgroups; the results are in `statuses()`.
+call `begin_pass`, bind its `bind_group()`, dispatch `patch_grid()`
+workgroups, then call `finish_pass` with the pass; it returns the batch's
+statuses. `EdgeFlipQuery::encode` does all of this for a list of edge IDs.
 Do not combine `flip_pass` with `patch_arena` in the same shader: both use group 1.
 See the [host integration](examples/support/delaunay.rs).
 
 Flips preserve global edge and face IDs. Attribute slots remain valid, but
 values derived from connectivity need to be recomputed. Boundary edges,
-cross-patch neighborhoods, existing replacement diagonals, and degenerate
-configurations are rejected and reported per edge. Recompute query results
+existing replacement diagonals, and degenerate configurations are rejected
+and reported per edge. Recompute query results
 after edits and submit commands in recording order.
 
 For lower-level control with your own bindings,

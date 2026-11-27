@@ -25,8 +25,9 @@ async fn run() {
         .expect("GPU adapter required");
     let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
 
-    // Create an 11 x 11 grid and reserve GPU storage for replacement edges and faces.
-    let (mesh, positions, _) = delaunay::skewed_grid(11, 256);
+    // Create a 33 x 33 grid in several patches, with spare storage for the
+    // copies that flips across patch borders need.
+    let (mesh, positions, _) = delaunay::skewed_grid(33, 512);
     let mut gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
     let positions = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("positions"),
@@ -68,10 +69,14 @@ async fn run() {
         let result =
             delaunay::Round::from_statuses(&delaunay::read_words(&device, &queue, &status));
         println!(
-            "round {round}: {} flipped, {} to retry",
-            result.flipped, result.retry
+            "round {round}: {} flipped, {} to retry, {} out of room",
+            result.flipped, result.retry, result.out_of_room
         );
         total += result.flipped;
+        assert_eq!(
+            result.out_of_room, 0,
+            "a patch ran out of room; upload with a larger EditCapacity"
+        );
         if result.flipped == 0 && result.retry == 0 {
             println!(
                 "Delaunay after {total} flips, mesh version {}",

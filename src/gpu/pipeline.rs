@@ -263,7 +263,6 @@ pub(super) fn buffer_layout(
 
 /// Creates a buffer bind-group layout with each entry at the binding number
 /// paired with it, visible to compute shaders.
-#[cfg(test)]
 pub(super) fn buffer_layout_at(
     device: &wgpu::Device,
     label: &str,
@@ -290,7 +289,6 @@ pub(super) fn buffer_layout_at(
 
 /// Creates a bind group with each entire buffer bound at the binding number
 /// paired with it. The bindings must match `layout`.
-#[cfg(test)]
 pub(super) fn bind_buffers_at(
     device: &wgpu::Device,
     label: &str,

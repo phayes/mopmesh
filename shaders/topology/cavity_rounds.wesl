@@ -64,6 +64,10 @@ public const CAVITY_LOST: u32 = 4u;
 // Was selected, but its acting patch had no room for the copies it needed
 // (`topology::cavity_migrate`). Its corners are free again.
 public const CAVITY_FAILED: u32 = 5u;
+// Was selected in an earlier round and carried out. Set it yourself after
+// carrying out a selected request, so that CAVITY_SELECTED only marks this
+// round's selections.
+public const CAVITY_DONE: u32 = 6u;
 
 // Words per mesh vertex in the round's vertex records.
 public const CAVITY_VERTEX_WORDS: u32 = 14u;

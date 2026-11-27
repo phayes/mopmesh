@@ -20,6 +20,8 @@
 //! - `MOPMESH_BENCH_BIDS`: `relay` for relayed per-flip bids with no
 //!   footprint cap; by default bounded batches capped at
 //!   `MOPMESH_BENCH_FOOTPRINT`.
+//! - `MOPMESH_BENCH_CAPACITY`: spare-slot factor per patch, as
+//!   `EditCapacity`, default `2`.
 //!
 //! The model follows the Phase 5 plan:
 //! - An interior pass flips, greedily by priority, the requested edges whose
@@ -44,7 +46,7 @@ const VERTEX: usize = 0;
 const EDGE: usize = 1;
 const FACE: usize = 2;
 /// Spare slot capacity per patch, as [`EditCapacity::default`](super::EditCapacity).
-const CAPACITY: f64 = 1.5;
+const CAPACITY: f64 = 2.0;
 /// Rounds after which leftover flips are counted, as a candidate default.
 const ENCODED_ROUNDS: usize = 8;
 /// Face owners counted per vertex by the star-leader rule; a vertex with
@@ -549,12 +551,12 @@ impl Sim {
             .0
     }
 
-    fn edge_exists(&self, a: u32, b: u32) -> bool {
+    pub(super) fn edge_exists(&self, a: u32, b: u32) -> bool {
         self.edge_of.contains_key(&key(a, b))
     }
 
     /// Flips edge `e` with quad `[a, b, c, d]`, keeping its ID and its faces' IDs.
-    fn flip(&mut self, e: u32, [a, b, c, d]: [u32; 4]) {
+    pub(super) fn flip(&mut self, e: u32, [a, b, c, d]: [u32; 4]) {
         let runs = |t: &[u32; 3], u: u32, v: u32| (0..3).any(|k| t[k] == u && t[(k + 1) % 3] == v);
         let first = *self.star[a as usize]
             .iter()
@@ -903,7 +905,15 @@ fn migration_simulation() {
     let patches = numbers("MOPMESH_BENCH_PATCHES", "128,512");
     let max_footprint = numbers("MOPMESH_BENCH_FOOTPRINT", "8")[0] as usize;
     let sides = numbers("MOPMESH_BENCH_SIDES", "513");
-    println!("# MOPMesh migration simulation (CPU), footprint cap {max_footprint}");
+    let capacity: f64 = std::env::var("MOPMESH_BENCH_CAPACITY")
+        .map(|c| c.parse().expect("a capacity factor"))
+        .unwrap_or(CAPACITY);
+    let new_sim = |positions: &[[f32; 3]], triangles: &[[u32; 3]], patch_size| {
+        Sim::with_capacity(positions, triangles, patch_size, capacity)
+    };
+    println!(
+        "# MOPMesh migration simulation (CPU), footprint cap {max_footprint}, capacity {capacity}"
+    );
     if cfg!(debug_assertions) {
         println!("WARNING: debug build; slow");
     }
@@ -913,7 +923,7 @@ fn migration_simulation() {
     print_header();
     for mesh in faces.into_iter().flat_map(bench_meshes::generated) {
         for &patch_size in &patches {
-            let mut sim = Sim::new(&mesh.positions, &mesh.triangles, patch_size);
+            let mut sim = new_sim(&mesh.positions, &mesh.triangles, patch_size);
             let mut stats = Stats::default();
             let edges: Vec<u32> = (0..sim.ends.len() as u32).collect();
             sim.batch(&edges, 0, max_footprint, &mut stats);
@@ -929,7 +939,7 @@ fn migration_simulation() {
     for &n in &sides {
         let (positions, triangles) = skewed_grid(n);
         for &patch_size in &patches {
-            let mut sim = Sim::new(&positions, &triangles, patch_size);
+            let mut sim = new_sim(&positions, &triangles, patch_size);
             let mut stats = Stats::default();
             let mut batches = 0;
             for seed in 0..100u32 {

@@ -24,7 +24,7 @@
 //             flip_stage(lane, r, first);
 //             for (var e = first + lane; e < min(edges, first + STAGED_EDGES); e += PATCH_LANES) {
 //                 let c = flip_candidate(r, first, e);
-//                 flip_request(c, c.status != FLIP_DONE || my_rule(c.corners));
+//                 flip_request(c, !flip_has_corners(c) || my_rule(c.corners));
 //             }
 //         }
 //         flip_finish(lane, r, edges);
@@ -33,11 +33,13 @@
 // Call flip_patch_count, flip_edge_end, flip_stage and flip_finish from
 // every invocation, in uniform control flow, exactly as above.
 //
-// After the dispatch, each edge's outcome is in the status buffer, indexed
-// by mesh-wide edge ID. Flips that share any of their four vertices compete,
-// and at most one of them succeeds. An edge that reports FLIP_LOST_CLAIM can
-// be tried again in a later batch. Flips reuse their own edge and face
-// slots, so they need no free slots.
+// The dispatch flips the requested edges whose four corners are interior to
+// one patch. Requested edges that cross patch borders report
+// FLIP_NOT_INTERIOR; record `EdgeFlipQuery::finish_pass` after the dispatch
+// to flip them too. Then each edge's outcome is in the status buffer,
+// indexed by mesh-wide edge ID. Flips that share any of their four vertices
+// compete, and at most one of them succeeds. An edge that reports
+// FLIP_LOST_CLAIM or FLIP_RETRY can be tried again in a later batch.
 
 import super::patch::{
     PatchRecord, EDGE, FACE, PATCH_COUNT_WORD, RECORDS_WORD,
@@ -74,12 +76,16 @@ struct PassParams { seed: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
 // this vertex, or zero. Zero-initialized.
 @group(1) @binding(6) var<storage, read_write> partners: array<u32>;
 
-// Words per edge: a stage marker, the two face slots, and the four corners'
-// mesh-wide vertex IDs.
-const STATE_WORDS: u32 = 7u;
+// Words per edge in the pass's state buffer: a stage marker, the two face
+// slots, and the four corners' mesh-wide vertex IDs, which `flip_request`
+// saves for every requested edge with `flip_has_corners`.
+public const FLIP_STATE_WORDS: u32 = 7u;
+// Offset of the four corners within an edge's state words.
+public const FLIP_STATE_CORNERS: u32 = 3u;
+const STATE_WORDS: u32 = FLIP_STATE_WORDS;
 const STATE_STAGE: u32 = 0u;
 const STATE_FACES: u32 = 1u;
-const STATE_CORNERS: u32 = 3u;
+const STATE_CORNERS: u32 = FLIP_STATE_CORNERS;
 // Requested and eligible, not yet decided.
 const STAGE_CANDIDATE: u32 = 1u;
 // Won its corners this round; not yet checked for an existing c-d edge.
@@ -93,9 +99,10 @@ var<workgroup> shared_word: u32;
 var<workgroup> undecided: atomic<u32>;
 
 // An edge offered to your rule by `flip_candidate`.
-// `status == FLIP_DONE` means the edge can be requested; it hasn't flipped.
-// Any other status says why it can't flip; only read `corners` when the
-// status is FLIP_DONE.
+// `status == FLIP_DONE` means the edge can be requested and flipped inside
+// this patch; FLIP_NOT_INTERIOR means it can be requested but crosses patch
+// borders. Neither means it has flipped. Any other status says why it can't
+// flip. Only read `corners` when `flip_has_corners` returns true.
 //
 // `corners` contains mesh-wide vertex IDs [a, b, c, d]. The current edge
 // joins a to b, with a -> b in the edge's stored order; the replacement would
@@ -193,9 +200,10 @@ public fn flip_stage(lane: u32, r: PatchRecord, first: u32) {
 // Checks edge slot `e` of the chunk staged at `first`. Skipped by
 // flip_request when the slot is empty or another patch owns its edge.
 // Otherwise the edge must join two triangles forming a proper four-sided
-// region, and all four vertices must be interior to this patch. This check
-// doesn't look at positions, competing flips, or an existing c-d edge;
-// flip_finish checks the last two.
+// region; if one of its four vertices is not interior to this patch, the
+// status is FLIP_NOT_INTERIOR. This check doesn't look at positions,
+// competing flips, or an existing c-d edge; flip_finish (and finish_pass
+// for flips across patch borders) checks the last two.
 public fn flip_candidate(r: PatchRecord, first: u32, e: u32) -> FlipCandidate {
     var out: FlipCandidate;
     out.status = FLIP_NOT_REQUESTED;
@@ -216,18 +224,25 @@ public fn flip_candidate(r: PatchRecord, first: u32, e: u32) -> FlipCandidate {
     out.status = quad.status;
     if (quad.status != FLIP_DONE) { return out; }
 
-    // All affected vertices must stay within the patch.
+    // Fill in the region, then check that every affected vertex is interior
+    // to this patch.
     let local = array(quad.a, quad.b, quad.c, quad.d);
-    out.status = FLIP_NOT_INTERIOR;
-    for (var k = 0u; k < 4u; k++) {
-        if (!bit(r.interior_mask, local[k])) { return out; }
-    }
-
-    out.status = FLIP_DONE;
     for (var k = 0u; k < 4u; k++) { out.corners[k] = global_vertex(r, local[k]); }
     out.first_face = faces[0];
     out.second_face = faces[1];
+    out.status = FLIP_DONE;
+    for (var k = 0u; k < 4u; k++) {
+        if (!bit(r.interior_mask, local[k])) { out.status = FLIP_NOT_INTERIOR; }
+    }
     return out;
+}
+
+// Returns true when `candidate.corners` holds the edge's four corners:
+// for an edge that can flip inside this patch (FLIP_DONE) and for one that
+// would cross patch borders (FLIP_NOT_INTERIOR). Run your rule on every
+// such candidate.
+public fn flip_has_corners(candidate: FlipCandidate) -> bool {
+    return candidate.status == FLIP_DONE || candidate.status == FLIP_NOT_INTERIOR;
 }
 
 // Records your decision for a candidate. With `wanted` false, the edge is
@@ -243,14 +258,15 @@ public fn flip_request(candidate: FlipCandidate, wanted: bool) {
         return;
     }
     statuses[edge] = candidate.status;
-    if (candidate.status != FLIP_DONE) { return; }
+    if (!flip_has_corners(candidate)) { return; }
 
-    // Save the flip for flip_finish.
+    // Save the corners: flip_finish settles flips inside this patch, and
+    // `EdgeFlipQuery::finish_pass` the ones across patch borders.
     let base = edge * STATE_WORDS;
     state[base + STATE_FACES] = candidate.first_face;
     state[base + STATE_FACES + 1u] = candidate.second_face;
     for (var k = 0u; k < 4u; k++) { state[base + STATE_CORNERS + k] = candidate.corners[k]; }
-    state[base + STATE_STAGE] = STAGE_CANDIDATE;
+    if (candidate.status == FLIP_DONE) { state[base + STATE_STAGE] = STAGE_CANDIDATE; }
 }
 
 // Returns the mesh-wide ID of the edge in slot `e` if this patch owns it and

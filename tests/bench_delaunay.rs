@@ -57,8 +57,8 @@ fn delaunay_settle_benchmark() {
     }
     println!("adapter: {}", adapter.get_info().name);
     println!("median of {runs} runs; batch time is submit to completion, summed over batches");
-    println!("| grid | faces | patch size | batches | flipped | batch time |");
-    println!("|---|---:|---:|---:|---:|---:|");
+    println!("| grid | faces | patch size | batches | flipped | left out of room | batch time |");
+    println!("|---|---:|---:|---:|---:|---:|---:|");
 
     for &side in &sides {
         for &patch_size in &patches {
@@ -75,7 +75,7 @@ fn delaunay_settle_benchmark() {
                 let mut gpu =
                     GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
                 let (mut batches, mut flipped, mut time) = (0, 0, Duration::ZERO);
-                loop {
+                let out_of_room = loop {
                     batches += 1;
                     assert!(batches <= MAX_BATCHES, "{side}x{side}: not settled");
                     let start = Instant::now();
@@ -95,16 +95,16 @@ fn delaunay_settle_benchmark() {
                         &device, &queue, &status,
                     ));
                     if round.flipped == 0 {
-                        break;
+                        break round.out_of_room;
                     }
                     flipped += round.flipped;
-                }
-                results.push((time, batches, flipped));
+                };
+                results.push((time, batches, flipped, out_of_room));
             }
             results.sort();
-            let (time, batches, flipped) = results[results.len() / 2];
+            let (time, batches, flipped, out_of_room) = results[results.len() / 2];
             println!(
-                "| {side}x{side} | {} | {patch_size} | {batches} | {flipped} | {:.1} ms |",
+                "| {side}x{side} | {} | {patch_size} | {batches} | {flipped} | {out_of_room} | {:.1} ms |",
                 mesh.face_count(),
                 time.as_secs_f64() * 1e3
             );

@@ -108,7 +108,7 @@ impl CavityMigrate {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::MeshBuilder;
     use crate::gpu::EditCapacity;
@@ -141,7 +141,7 @@ mod tests {
     }
 
     /// Patch `p` as the model holds it, in the form `patch_views` reads.
-    fn model_view(sim: &Sim, p: u32) -> PatchView {
+    pub(in crate::gpu) fn model_view(sim: &Sim, p: u32) -> PatchView {
         let mut view = PatchView::default();
         for &v in sim.held(p, 0) {
             view.vertices.insert(v);
@@ -356,8 +356,9 @@ mod tests {
                         // GPU: the same round, with migration.
                         let mut encoder = device.create_command_encoder(&Default::default());
                         rounds
-                            .encode_round(&device, &mut encoder, &mut gpu, &state, round, true)
+                            .encode_round(&device, &mut encoder, &gpu, &state, round, true)
                             .unwrap();
+                        gpu.mark_edited();
                         queue.submit([encoder.finish()]);
                         let read_back = read(&device, &queue, state.requests());
                         assert_eq!(read_back, words, "{context}: requests");

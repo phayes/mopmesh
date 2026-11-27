@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 /// The most compute passes one flip batch records.
-const MAX_PASSES: u32 = 8;
+const MAX_PASSES: u32 = 256;
 
 /// Timestamp queries for the compute passes of one batch.
 struct PassTimer {
@@ -158,12 +158,16 @@ fn gpu_flip_benchmark() {
     }
     println!("adapter: {} ({:?})", info.name, info.backend);
     println!(
-        "one batch requesting every edge, fresh upload at capacity 1.5 per run; \
-         {runs} timed runs after {WARMUP} warm-up; medians in ms: GPU time of each \
-         compute pass in recording order, their sum, and wall time"
+        "one batch requesting every edge, fresh upload at the default capacity per run; \
+         {runs} timed runs after {WARMUP} warm-up; medians in ms: GPU time of the \
+         interior pass, of the cross-patch passes after it (with their count), \
+         their sum, and wall time"
     );
-    println!("| mesh | patch size | edges | flipped | lost claim | passes | GPU sum | wall |");
-    println!("|---|---:|---:|---:|---:|---|---:|---:|");
+    println!(
+        "| mesh | patch size | edges | flipped | lost claim | retry | out of room | \
+         interior | cross-patch | GPU sum | wall |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|");
 
     // Each mesh, then a shuffled copy of it.
     for mesh in faces.into_iter().flat_map(bench_meshes::generated) {
@@ -195,7 +199,9 @@ fn row(
     let edges: Vec<u32> = (0..mesh.edge_count() as u32).collect();
 
     // Each run flips a fresh upload, made before the timed batch starts.
-    let (mut passes, mut sums, mut walls) = (Vec::<Vec<Duration>>::new(), Vec::new(), Vec::new());
+    let (mut interiors, mut crosses, mut sums, mut walls) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut cross_passes = 0;
     let mut words = Vec::new();
     for run in 0..WARMUP + runs {
         let mut editable = GpuEditableMesh::upload(device, &mesh, EditCapacity::default()).unwrap();
@@ -208,10 +214,10 @@ fn row(
             *statuses.borrow_mut() = Some(result);
         });
         if run >= WARMUP {
-            passes.resize(times.len(), Vec::new());
-            for (pass, &t) in passes.iter_mut().zip(&times) {
-                pass.push(t);
-            }
+            let (interior, cross) = times.split_first().expect("the batch records passes");
+            interiors.push(*interior);
+            crosses.push(cross.iter().sum::<Duration>());
+            cross_passes = cross.len();
             sums.push(times.iter().sum::<Duration>());
             walls.push(wall);
         }
@@ -228,14 +234,16 @@ fn row(
             .filter(|&&w| FlipStatus::from_word(w) == Some(status))
             .count()
     };
-    let per_pass: Vec<String> = passes.iter_mut().map(|p| median(p)).collect();
     println!(
-        "| {} | {patch_size} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {patch_size} | {} | {} | {} | {} | {} | {} | {} ({cross_passes}) | {} | {} |",
         bench.name,
         edges.len(),
         count(FlipStatus::Flipped),
         count(FlipStatus::LostClaim),
-        per_pass.join(", "),
+        count(FlipStatus::Retry),
+        count(FlipStatus::OutOfCapacity),
+        median(&mut interiors),
+        median(&mut crosses),
         median(&mut sums),
         median(&mut walls),
     );

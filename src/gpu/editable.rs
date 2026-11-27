@@ -8,9 +8,11 @@ use wgpu::util::DeviceExt;
 ///
 /// Each patch gets `factor` times as many local vertex, edge and face slots as
 /// it has elements, rounded up. Edits that need more free slots in a patch than
-/// it has are rejected. Edge flips through [`EdgeFlipQuery`](super::EdgeFlipQuery)
-/// reuse their own slots and need no spare room; custom kernels that place
-/// edits in free slots do.
+/// it has are rejected. An edge flip across patch borders makes one patch take
+/// over the faces around it, and that patch needs room for copies of their
+/// neighbors; flips inside one patch need none. Small patches fill up sooner:
+/// with the default factor, a Delaunay settle at patch size 64 or less can
+/// leave edges that report [`FlipStatus::OutOfCapacity`](super::FlipStatus::OutOfCapacity).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditCapacity {
     factor: f32,
@@ -31,10 +33,10 @@ impl EditCapacity {
     }
 }
 
-/// A factor of 1.5.
+/// A factor of 2.
 impl Default for EditCapacity {
     fn default() -> Self {
-        Self { factor: 1.5 }
+        Self { factor: 2.0 }
     }
 }
 
@@ -464,8 +466,13 @@ pub(super) mod inspect {
     /// Returns the global endpoints of global edge `edge` in stored order,
     /// found through its owner-table entry.
     pub fn edge_endpoints(arena: &[u32], edge: u32) -> [u32; 2] {
+        edge_endpoints_in(arena, &records(arena), edge)
+    }
+
+    /// Like `edge_endpoints`, with the arena's `records` already decoded.
+    fn edge_endpoints_in(arena: &[u32], records: &[PatchRecord], edge: u32) -> [u32; 2] {
         let at = (arena[layout::OWNERS[1]] + layout::OWNER_WORDS * edge) as usize;
-        let r = &records(arena)[arena[at] as usize];
+        let r = &records[arena[at] as usize];
         let ev = (r.ev + layout::EV_WORDS * arena[at + 1]) as usize;
         [arena[ev], arena[ev + 1]].map(|v| arena[(r.vertex_ids + v) as usize])
     }
@@ -473,8 +480,13 @@ pub(super) mod inspect {
     /// Returns the global vertices of global face `face` in stored corner
     /// order, found through its owner-table entry.
     pub fn face_vertices(arena: &[u32], face: u32) -> [u32; 3] {
+        face_vertices_in(arena, &records(arena), face)
+    }
+
+    /// Like `face_vertices`, with the arena's `records` already decoded.
+    fn face_vertices_in(arena: &[u32], records: &[PatchRecord], face: u32) -> [u32; 3] {
         let at = (arena[layout::OWNERS[2]] + layout::OWNER_WORDS * face) as usize;
-        let r = &records(arena)[arena[at] as usize];
+        let r = &records[arena[at] as usize];
         let slot = arena[at + 1];
         [0, 1, 2].map(|i| {
             let fe = (r.fe + layout::FE_WORDS * slot + 2 * i) as usize;
@@ -553,6 +565,8 @@ pub(super) mod inspect {
     ///   exactly its active slots;
     /// - edge and face rows reference active slots, and every copy agrees
     ///   with the owner's connectivity;
+    /// - each edge joins two different vertices, and each face has three
+    ///   different edges and vertices;
     /// - each patch holds every face at a vertex of a face it owns, with
     ///   their edges and vertices;
     /// - every vertex or edge owner owns a face incident to it;
@@ -569,10 +583,10 @@ pub(super) mod inspect {
 
         // Mesh-wide connectivity from the owning copies.
         let edges: Vec<[u32; 2]> = (0..counts[1] as u32)
-            .map(|e| edge_endpoints(arena, e))
+            .map(|e| edge_endpoints_in(arena, &recs, e))
             .collect();
         let faces: Vec<[u32; 3]> = (0..counts[2] as u32)
-            .map(|f| face_vertices(arena, f))
+            .map(|f| face_vertices_in(arena, &recs, f))
             .collect();
         let face_edge_ids = |r: &PatchRecord, slot: u32| {
             [0, 1, 2].map(|i| {
@@ -629,6 +643,7 @@ pub(super) mod inspect {
                     ends.iter().all(|&v| active(0, v)),
                     "patch {p}: edge row to inactive vertex"
                 );
+                assert_ne!(ends[0], ends[1], "patch {p}: edge with one vertex");
                 assert_eq!(
                     ends.map(|v| id(0, v)),
                     edges[id(1, slot) as usize],
@@ -649,6 +664,12 @@ pub(super) mod inspect {
                     face_edge_ids(r, slot),
                     owner_face_edges[global],
                     "patch {p}: stale copy of face {global}"
+                );
+                let [e0, e1, e2] = owner_face_edges[global];
+                let [a, b, c] = faces[global];
+                assert!(
+                    e0 != e1 && e1 != e2 && e0 != e2 && a != b && b != c && a != c,
+                    "patch {p}: face {global} repeats an edge or vertex"
                 );
             }
 
@@ -708,8 +729,9 @@ pub(super) mod inspect {
     /// edges and vertices. `check_invariants` checks the converse.
     pub fn check_exact_ribbons(arena: &[u32], masks: &[u32]) {
         let views = patch_views(arena, masks);
+        let recs = records(arena);
         let faces: Vec<[u32; 3]> = (0..arena[layout::FACE_COUNT])
-            .map(|f| face_vertices(arena, f))
+            .map(|f| face_vertices_in(arena, &recs, f))
             .collect();
         let mut star = vec![Vec::new(); arena[layout::VERTEX_COUNT] as usize];
         for (f, t) in faces.iter().enumerate() {
@@ -963,7 +985,7 @@ mod tests {
             assert_eq!(EditCapacity::new(factor), None, "{factor}");
         }
         assert_eq!(EditCapacity::new(1.0).unwrap().factor(), 1.0);
-        assert_eq!(EditCapacity::default().factor(), 1.5);
+        assert_eq!(EditCapacity::default().factor(), 2.0);
     }
 
     #[test]

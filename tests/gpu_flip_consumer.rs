@@ -170,11 +170,155 @@ fn delaunay_example_settles_on_a_delaunay_mesh_with_disjoint_flips() {
     panic!("flipping did not settle within 64 rounds");
 }
 
+/// The outcome of `settle`.
+struct Settled {
+    triangles: Vec<[u32; 3]>,
+    positions: Vec<[f32; 4]>,
+    /// Endpoints of each edge ID, after the replayed flips.
+    endpoints: Vec<[u32; 2]>,
+    /// The last batch's status words and counts.
+    statuses: Vec<u32>,
+    last: delaunay::Round,
+    batches: usize,
+}
+
+/// Runs the example's rule, cross-patch rounds included, on a `side` x
+/// `side` skewed grid until a batch flips and retries nothing, replaying
+/// each reported flip on the CPU.
+fn settle(side: u32, patch_size: usize) -> Settled {
+    let (device, queue) = gpu_device();
+    let (mesh, positions, mut triangles) = delaunay::skewed_grid(side, patch_size);
+    let mut gpu = GpuEditableMesh::upload(&device, &mesh, EditCapacity::default()).unwrap();
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("delaunay positions"),
+        contents: bytemuck::cast_slice(&positions),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let query = EdgeFlipQuery::new(&device);
+    let flips = delaunay::DelaunayFlips::new(&device, &query);
+    let mut endpoints = replay::edge_endpoints(&mesh);
+    for batch in 1..=64 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let status = flips
+            .encode(&device, &mut encoder, &query, &mut gpu, &buffer)
+            .unwrap();
+        queue.submit([encoder.finish()]);
+        let words = delaunay::read_words(&device, &queue, &status);
+        let round = delaunay::Round::from_statuses(&words);
+
+        // A vertex may belong to at most one successful flip in this batch.
+        let mut corners = std::collections::HashSet::new();
+        for (id, &word) in words.iter().enumerate() {
+            if FlipStatus::from_word(word) == Some(FlipStatus::Flipped) {
+                for v in replay::replay(&mut triangles, &mut endpoints, id) {
+                    assert!(corners.insert(v), "two flips in one batch share vertex {v}");
+                }
+            }
+        }
+        if round.flipped == 0 && round.retry == 0 {
+            return Settled {
+                triangles,
+                positions,
+                endpoints,
+                statuses: words,
+                last: round,
+                batches: batch,
+            };
+        }
+    }
+    panic!("flipping did not settle within 64 batches");
+}
+
+/// Counts edges that join faces in different patches and fail the
+/// example's angle test.
+fn crossing_violations(side: u32, patch_size: usize) -> usize {
+    let (mesh, positions, triangles) = delaunay::skewed_grid(side, patch_size);
+    let mut patch_of = vec![0; triangles.len()];
+    for p in mesh.patches() {
+        for (&f, owner) in p.face_ids().iter().zip(p.face_owners()) {
+            if owner.patch == p.id() {
+                patch_of[f as usize] = p.id();
+            }
+        }
+    }
+    let mut faces_of: std::collections::HashMap<(u32, u32), Vec<usize>> = Default::default();
+    for (f, t) in triangles.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            faces_of.entry((a.min(b), a.max(b))).or_default().push(f);
+        }
+    }
+    faces_of
+        .values()
+        .filter(|fs| fs.len() == 2 && patch_of[fs[0]] != patch_of[fs[1]])
+        .filter(|fs| violations(&[triangles[fs[0]], triangles[fs[1]]], &positions) > 0)
+        .count()
+}
+
+/// At the default patch size and capacity, flips across patch borders let
+/// the example settle multi-patch grids completely.
+#[test]
+#[ignore = "requires a GPU adapter; run cargo test --test gpu_flip_consumer -- --ignored --nocapture"]
+fn delaunay_example_settles_across_patch_borders() {
+    for side in [65, 129] {
+        assert!(
+            crossing_violations(side, 512) > 0,
+            "{side}: some violation crosses patches"
+        );
+        let s = settle(side, 512);
+        assert_eq!(s.last.out_of_room, 0, "{side}: no patch runs out of room");
+        assert_eq!(violations(&s.triangles, &s.positions), 0, "{side}: settled");
+        println!(
+            "{side}x{side} at patch size 512: settled in {} batches",
+            s.batches
+        );
+    }
+}
+
+/// Small patches can run out of room, which must be reported rather than
+/// look settled, and must leave a valid mesh.
+#[test]
+#[ignore = "requires a GPU adapter; run cargo test --test gpu_flip_consumer -- --ignored --nocapture"]
+fn delaunay_example_reports_patches_out_of_room() {
+    let s = settle(65, 16);
+    let left = violating_edges(&s.triangles, &s.positions);
+    println!(
+        "65x65 at patch size 16: {} batches, {} violations, {:?}",
+        s.batches,
+        left.len(),
+        s.last
+    );
+    assert!(s.last.out_of_room > 0, "some patch runs out of room");
+    assert!(
+        !left.is_empty(),
+        "edges left out of room still break the rule"
+    );
+
+    // Every edge still breaking the rule reported OutOfCapacity.
+    for (id, &[a, b]) in s.endpoints.iter().enumerate() {
+        if left.contains(&(a.min(b), a.max(b))) {
+            assert_eq!(
+                FlipStatus::from_word(s.statuses[id]),
+                Some(FlipStatus::OutOfCapacity),
+                "edge {id}"
+            );
+        }
+    }
+}
+
 /// Counts interior edges that fail the example's Delaunay angle test:
 /// the two opposite angles sum to more than 180 degrees plus 0.001 radians.
 /// Positions are indexed by mesh-wide vertex ID; triangles must have
 /// consistent orientation and nonzero edge lengths.
 fn violations(triangles: &[[u32; 3]], positions: &[[f32; 4]]) -> usize {
+    violating_edges(triangles, positions).len()
+}
+
+/// The edges counted by `violations`, as `(a, b)` with `a < b`.
+fn violating_edges(
+    triangles: &[[u32; 3]],
+    positions: &[[f32; 4]],
+) -> std::collections::HashSet<(u32, u32)> {
     let angle = |at: u32, p: u32, q: u32| {
         let o = positions[at as usize];
         let (p, q) = (positions[p as usize], positions[q as usize]);
@@ -201,7 +345,8 @@ fn violations(triangles: &[[u32; 3]], positions: &[[f32; 4]]) -> usize {
                     .get(&(b, a))
                     .is_some_and(|&other| theta + other > std::f32::consts::PI + 1e-3)
         })
-        .count()
+        .map(|(&edge, _)| edge)
+        .collect()
 }
 
 /// A 9 x 9 grid in one patch with x shifted by `shear * y`, its positions as

@@ -1,4 +1,5 @@
 //! Edge flips on editable meshes.
+use super::cavity_rounds::{CavityRounds, CavityState};
 use super::{GpuEditableMesh, GpuError, pipeline};
 use wgpu::util::DeviceExt;
 
@@ -6,7 +7,10 @@ use wgpu::util::DeviceExt;
 ///
 /// Flipping an edge shared by two triangles replaces it with the other
 /// diagonal of the four-sided region they form. Every outcome except
-/// [`Flipped`](Self::Flipped) leaves the mesh unchanged.
+/// [`Flipped`](Self::Flipped) leaves the mesh's triangles unchanged. A flip
+/// across patch borders may still have moved elements to another patch,
+/// changing their owning patch and local slot in the editable mesh's
+/// buffers; query results don't change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipStatus {
     /// The edge was flipped. It keeps its edge ID and now joins the other two
@@ -19,25 +23,32 @@ pub enum FlipStatus {
     /// The edge is on the mesh boundary, with only one face.
     Boundary,
     /// A face around one of the four affected vertices belongs to another
-    /// patch. Only edges well inside one patch can be flipped.
+    /// patch. Reported only by a flip pass that is not finished with
+    /// [`EdgeFlipQuery::finish_pass`], or by your own kernels; finishing the
+    /// pass flips such edges across patch borders instead.
     NotInterior,
     /// The two vertices the new edge would join are already joined by an edge.
     Connected,
     /// The two faces on the edge don't form a proper four-sided region.
     Degenerate,
     /// A flip selected in the same batch uses one of the affected vertices.
-    /// Flips are selected in decreasing priority, and one that reports
-    /// [`Connected`](Self::Connected) blocks no other flip.
+    /// Flips inside one patch are selected first, in decreasing priority;
+    /// flips across patch borders then take turns for the vertices left. One
+    /// that reports [`Connected`](Self::Connected) blocks no other flip.
     LostClaim,
-    /// The patch has no free slot for the new edge or faces. Reported by your
-    /// own WESL kernels that place flips in free slots with `flip_writes`;
-    /// [`EdgeFlipQuery`] and `topology::flip_pass` reuse each flip's own
-    /// slots, so they never report it.
+    /// No room for the flip. For a flip across patch borders, the patch
+    /// taking over the faces around it had too few free slots for the copies
+    /// it needs (see [`EditCapacity`](super::EditCapacity)). Your own WESL
+    /// kernels that place flips in free slots with `flip_writes` report it
+    /// when a patch has no free slot for the new edge or faces.
     OutOfCapacity,
     /// The requested edge ID is not less than the mesh's edge count. Reported
     /// by your own WESL kernels that use the `FLIP_NOT_AN_EDGE` constant;
     /// [`EdgeFlipQuery::encode`] returns an error for such IDs instead.
     NotAnEdge,
+    /// The flip crosses patch borders and was still waiting for its turn
+    /// when the batch ended. It may be retried in a later batch.
+    Retry,
 }
 
 impl FlipStatus {
@@ -54,6 +65,7 @@ impl FlipStatus {
             6 => Self::LostClaim,
             7 => Self::OutOfCapacity,
             8 => Self::NotAnEdge,
+            9 => Self::Retry,
             _ => return None,
         })
     }
@@ -89,12 +101,21 @@ impl GpuFlipStatuses {
 /// your own WESL rule, using `topology::flip_pass`.
 ///
 /// Create a pass with [`EdgeFlipQuery::begin_pass`], bind it at group 1, and
-/// record one dispatch of [`patch_grid`](Self::patch_grid) workgroups. Use a
-/// fresh pass for each batch; its state must not be reused.
+/// record one dispatch of [`patch_grid`](Self::patch_grid) workgroups. That
+/// flips the requested edges inside single patches; then record
+/// [`EdgeFlipQuery::finish_pass`] to flip the ones across patch borders. Use
+/// a fresh pass for each batch; its state must not be reused.
 pub struct FlipPass {
     bind_group: wgpu::BindGroup,
     statuses: GpuFlipStatuses,
     patch_grid: [u32; 2],
+    claims: wgpu::Buffer,
+    state: wgpu::Buffer,
+    partners: wgpu::Buffer,
+    params: wgpu::Buffer,
+    seed: u32,
+    /// The mesh's stamp when the pass began; finishing checks it.
+    topology: super::TopologyStamp,
 }
 impl FlipPass {
     /// The bindings to set at group 1 for this batch's dispatch.
@@ -122,6 +143,41 @@ pub struct EdgeFlipQuery {
     requests: wgpu::BindGroupLayout,
     pass: wgpu::BindGroupLayout,
     flip: wgpu::ComputePipeline,
+    /// Flips this round's selected cross-patch requests.
+    flip_selected: wgpu::ComputePipeline,
+    /// The gather, merge and finish stages, and their bindings.
+    glue: wgpu::BindGroupLayout,
+    gather: wgpu::ComputePipeline,
+    merge: wgpu::ComputePipeline,
+    finish: wgpu::ComputePipeline,
+    rounds: CavityRounds,
+}
+
+/// Cross-patch rounds recorded by each [`EdgeFlipQuery::finish_pass`].
+const CROSS_PATCH_ROUNDS: u32 = 8;
+
+/// Checks, without allocating, that a batch's cross-patch flips on `mesh`
+/// fit the device's limits.
+fn check_cross_patch(device: &wgpu::Device, mesh: &GpuEditableMesh) -> Result<(), GpuError> {
+    pipeline::workgroup_grid(
+        &device.limits(),
+        mesh.edge_count(),
+        "cross-patch edge flips",
+    )?;
+    CavityState::check(device, mesh, mesh.edge_count())?;
+    Ok(())
+}
+
+/// A storage buffer that can also be cleared and copied, zeroed at creation.
+fn scratch_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 impl EdgeFlipQuery {
@@ -151,16 +207,58 @@ impl EdgeFlipQuery {
             bind_group_layouts: &[Some(&requests), Some(&pass)],
             immediate_size: 0,
         });
-        Self {
-            flip: pipeline::compute_pipeline(
+        let flip = pipeline::compute_pipeline(
+            device,
+            "MOPMesh edge flip",
+            &module,
+            "flip",
+            Some(&pipeline_layout),
+        );
+
+        // Cross-patch flips: the selected-request flip shares both layouts;
+        // gather, merge and finish bind their own buffers at group 0.
+        let selected_module = pipeline::shader_module(
+            device,
+            "MOPMesh selected cross-patch flips",
+            include_str!(concat!(env!("OUT_DIR"), "/flip_selected.wgsl")),
+        );
+        let flip_selected = pipeline::compute_pipeline(
+            device,
+            "MOPMesh selected cross-patch flips",
+            &selected_module,
+            "flip",
+            Some(&pipeline_layout),
+        );
+        let read = Storage { read_only: true };
+        let (glue, glue_layout) = pipeline::buffer_layout(
+            device,
+            "MOPMesh cross-patch flips",
+            &[write, read, write, write, write, Uniform],
+        );
+        let glue_module = pipeline::shader_module(
+            device,
+            "MOPMesh cross-patch flips",
+            include_str!(concat!(env!("OUT_DIR"), "/cross_patch_flip.wgsl")),
+        );
+        let stage = |entry| {
+            pipeline::compute_pipeline(
                 device,
-                "MOPMesh edge flip",
-                &module,
-                "flip",
-                Some(&pipeline_layout),
-            ),
+                "MOPMesh cross-patch flips",
+                &glue_module,
+                entry,
+                Some(&glue_layout),
+            )
+        };
+        Self {
+            flip,
+            flip_selected,
+            gather: stage("gather"),
+            merge: stage("merge"),
+            finish: stage("finish"),
+            glue,
             requests,
             pass,
+            rounds: CavityRounds::new(device),
         }
     }
 
@@ -174,8 +272,9 @@ impl EdgeFlipQuery {
     /// Prepares bindings and a zeroed status buffer for one batch of flips on
     /// `mesh`, chosen by application shaders that import
     /// `topology::flip_pass`. This does not record GPU work. Record the
-    /// batch's dispatch with the returned pass before starting another batch
-    /// on the same mesh.
+    /// batch's dispatch with the returned pass, then
+    /// [`finish_pass`](Self::finish_pass) to flip the requested edges across
+    /// patch borders, before starting another batch on the same mesh.
     ///
     /// Every successful call increases [`GpuEditableMesh::version`], including
     /// a pass that is never dispatched. Later batches may choose different
@@ -210,10 +309,9 @@ impl EdgeFlipQuery {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let vertices = u64::from(mesh.vertex_count());
-        let claims = pipeline::output_buffer(device, "MOPMesh edge flip claims", words(vertices));
-        let partners =
-            pipeline::output_buffer(device, "MOPMesh edge flip partners", words(vertices));
-        let state = pipeline::output_buffer(device, "MOPMesh edge flip state", state_bytes.max(4));
+        let claims = scratch_buffer(device, "MOPMesh edge flip claims", words(vertices));
+        let partners = scratch_buffer(device, "MOPMesh edge flip partners", words(vertices));
+        let state = scratch_buffer(device, "MOPMesh edge flip state", state_bytes.max(4));
         let statuses = GpuFlipStatuses {
             buffer: pipeline::output_buffer(device, "MOPMesh edge flip statuses", words(edges)),
             len: mesh.edge_count(),
@@ -236,7 +334,130 @@ impl EdgeFlipQuery {
             bind_group,
             statuses,
             patch_grid,
+            claims,
+            state,
+            partners,
+            params,
+            seed,
+            topology: mesh.topology(),
         })
+    }
+
+    /// Records the second half of a batch begun with
+    /// [`begin_pass`](Self::begin_pass), after your dispatch: flips the
+    /// requested edges that cross patch borders, which your dispatch reported
+    /// as [`FlipStatus::NotInterior`]. Returns the batch's final statuses.
+    ///
+    /// A cross-patch flip goes ahead only if no flip inside a patch, and no
+    /// earlier cross-patch flip of this batch, uses one of its four vertices.
+    /// The patch owning the most faces around them takes over every face
+    /// around them, then flips the edge; that needs free slots in it (see
+    /// [`EditCapacity`](super::EditCapacity)). Each edge reports
+    /// [`Flipped`](FlipStatus::Flipped), [`Connected`](FlipStatus::Connected),
+    /// [`LostClaim`](FlipStatus::LostClaim),
+    /// [`OutOfCapacity`](FlipStatus::OutOfCapacity), or
+    /// [`Retry`](FlipStatus::Retry) if the batch ended before its turn.
+    ///
+    /// Takes no new mesh version: the batch was counted by `begin_pass`.
+    /// Returns [`GpuError::Stale`] if `mesh` was edited since `begin_pass`
+    /// or is not the mesh the pass began on, or
+    /// [`GpuError::LimitsExceeded`] if the rounds exceed the device's limits;
+    /// on error nothing is recorded.
+    pub fn finish_pass(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &GpuEditableMesh,
+        pass: FlipPass,
+    ) -> Result<GpuFlipStatuses, GpuError> {
+        // Check the pass and sizes before recording anything.
+        if pass.topology != mesh.topology() {
+            return Err(GpuError::Stale);
+        }
+        check_cross_patch(device, mesh)?;
+        Ok(self.finish_checked(device, encoder, mesh, pass))
+    }
+
+    /// Records `finish_pass` once `check_cross_patch` has passed for `mesh`.
+    fn finish_checked(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &GpuEditableMesh,
+        pass: FlipPass,
+    ) -> GpuFlipStatuses {
+        const RESOURCE: &str = "cross-patch edge flips";
+        let checked = "checked by check_cross_patch";
+        let edges = mesh.edge_count();
+        let flat = pipeline::workgroup_grid(&device.limits(), edges, RESOURCE).expect(checked);
+        let state = CavityState::zeroed(device, mesh, edges, pass.seed).expect(checked);
+
+        // Bind the glue stages and the per-round flip of selected requests,
+        // which writes its own statuses for merge to read.
+        let round_statuses = scratch_buffer(
+            device,
+            "MOPMesh cross-patch flip round statuses",
+            (u64::from(edges) * 4).max(4),
+        );
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOPMesh cross-patch flip parameters"),
+            contents: bytemuck::cast_slice(&[edges, 0, 0, 0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let glue = pipeline::bind_buffers(
+            device,
+            RESOURCE,
+            &self.glue,
+            &[
+                pass.statuses.buffer(),
+                &pass.state,
+                &round_statuses,
+                state.requests(),
+                state.taken(),
+                &params,
+            ],
+        );
+        let selected =
+            pipeline::bind_buffers(device, RESOURCE, &self.requests, &[state.requests()]);
+        let round_pass = pipeline::bind_buffers(
+            device,
+            RESOURCE,
+            &self.pass,
+            &[
+                mesh.arena(),
+                mesh.masks(),
+                &pass.claims,
+                &pass.state,
+                &pass.params,
+                &round_statuses,
+                &pass.partners,
+            ],
+        );
+
+        // Turn requested cross-patch edges into cavity requests, with the
+        // vertices of this batch's interior flips already taken.
+        pipeline::dispatch_grid_groups(encoder, "gather", &self.gather, &[&glue], flat);
+        encoder.copy_buffer_to_buffer(&pass.partners, 0, state.taken(), 0, pass.partners.size());
+
+        // Each round: select and migrate, flip the selected edges, merge.
+        for round in 0..CROSS_PATCH_ROUNDS {
+            self.rounds
+                .encode_round(device, encoder, mesh, &state, round, true)
+                .expect(checked);
+            for buffer in [&pass.claims, &pass.state, &pass.partners, &round_statuses] {
+                encoder.clear_buffer(buffer, 0, None);
+            }
+            pipeline::dispatch_grid_groups(
+                encoder,
+                "flip selected",
+                &self.flip_selected,
+                &[&selected, &round_pass],
+                pass.patch_grid,
+            );
+            pipeline::dispatch_grid_groups(encoder, "merge", &self.merge, &[&glue], flat);
+        }
+        pipeline::dispatch_grid_groups(encoder, "finish", &self.finish, &[&glue], flat);
+        pass.statuses
     }
 
     /// Records a batch of flips for the mesh-wide edge IDs in `edges`.
@@ -246,17 +467,18 @@ impl EdgeFlipQuery {
     /// the same as listing it once.
     ///
     /// Flips in one batch must not share any of their four corner vertices.
-    /// Each valid flip gets a priority, and flips are selected in decreasing
-    /// priority; one that shares a vertex with an already selected flip
-    /// reports [`FlipStatus::LostClaim`] and may be retried later. Priorities
-    /// depend on the edge ID and the mesh version, so later calls can select
-    /// different winners. Flips reuse their own edge and face slots, so they
-    /// need no spare capacity.
+    /// Flips inside one patch are selected first: each gets a priority, and
+    /// they are selected in decreasing priority. Flips across patch borders
+    /// then take turns for the vertices left, as
+    /// [`finish_pass`](Self::finish_pass) describes. A flip that loses a
+    /// shared vertex reports [`FlipStatus::LostClaim`] and may be retried
+    /// later. Priorities depend on the edge ID and the mesh version, so later
+    /// calls can select different winners.
     ///
     /// Batches recorded into the encoder run in order. Every successful call
-    /// increases [`GpuEditableMesh::version`] when recorded, including an empty
-    /// batch or one whose flips are all rejected. An empty batch records no
-    /// GPU work.
+    /// increases [`GpuEditableMesh::version`] by one when recorded, including
+    /// an empty batch or one whose flips are all rejected. An empty batch
+    /// records no GPU work.
     ///
     /// Returns [`GpuError::ElementOutOfRange`] if an ID is not less than the
     /// mesh's edge count, or [`GpuError::LimitsExceeded`] if the batch
@@ -269,6 +491,32 @@ impl EdgeFlipQuery {
         mesh: &mut GpuEditableMesh,
         edges: &[u32],
     ) -> Result<GpuFlipStatuses, GpuError> {
+        // Check the IDs and every limit before allocating or recording.
+        if edges.iter().any(|&e| e >= mesh.edge_count()) {
+            return Err(GpuError::ElementOutOfRange {
+                resource: "edge flip requests",
+            });
+        }
+        check_cross_patch(device, mesh)?;
+        let pass = self.encode_interior(device, encoder, mesh, edges)?;
+        if edges.is_empty() {
+            return Ok(pass.statuses);
+        }
+        Ok(self.finish_checked(device, encoder, mesh, pass))
+    }
+
+    /// Records the first half of `encode`: flips the requested edges inside
+    /// single patches, leaving those across patch borders as
+    /// [`FlipStatus::NotInterior`]. Returns the pass for
+    /// [`finish_pass`](Self::finish_pass). An empty batch still counts a
+    /// version and records nothing.
+    pub(crate) fn encode_interior(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &mut GpuEditableMesh,
+        edges: &[u32],
+    ) -> Result<FlipPass, GpuError> {
         // Check the IDs, then prepare the pass, which counts an edit even
         // when there are no requests.
         const RESOURCE: &str = "edge flip requests";
@@ -278,7 +526,7 @@ impl EdgeFlipQuery {
         }
         let pass = self.begin_pass(device, mesh)?;
         if edges.is_empty() {
-            return Ok(pass.statuses);
+            return Ok(pass);
         }
 
         // Mark each requested edge in a bit mask.
@@ -300,7 +548,7 @@ impl EdgeFlipQuery {
             &[&bindings, pass.bind_group()],
             pass.patch_grid(),
         );
-        Ok(pass.statuses)
+        Ok(pass)
     }
 }
 
@@ -312,8 +560,8 @@ const STATE_WORDS: u32 = 7;
 mod tests {
     use super::*;
     use crate::gpu::editable::inspect::{
-        PatchView, check_invariants, edge_endpoints as edge_endpoints_after, face_vertices,
-        patch_views,
+        PatchView, check_exact_ribbons, check_invariants, edge_endpoints as edge_endpoints_after,
+        face_vertices, patch_views,
     };
     use crate::gpu::editable::{EditCapacity, editable_contents};
     use crate::gpu::test_support::{self, fixtures};
@@ -449,6 +697,15 @@ mod tests {
         tris
     }
 
+    /// Rotates a triangle to start at its smallest vertex, keeping its winding.
+    fn rotate_face([a, b, c]: [u32; 3]) -> [u32; 3] {
+        match a.min(b).min(c) {
+            m if m == a => [a, b, c],
+            m if m == b => [b, c, a],
+            _ => [c, a, b],
+        }
+    }
+
     /// Asserts that every global face in `arena` holds the triangle at its ID.
     fn assert_faces_by_id(arena: &[u32], expected: &[[u32; 3]], context: &str) {
         for (face, &t) in expected.iter().enumerate() {
@@ -534,14 +791,16 @@ mod tests {
         fn flip(&self, mesh: &mut GpuEditableMesh, edge: u32) -> FlipStatus {
             self.flip_all(mesh, &[edge])[0]
         }
-        /// Flips the listed edges in one batch and returns each listed edge's
-        /// status, in list order. Asserts that unlisted edges report nothing.
+        /// Flips the listed edges in one batch, inside single patches only,
+        /// and returns each listed edge's status, in list order. Asserts that
+        /// unlisted edges report nothing.
         fn flip_all(&self, mesh: &mut GpuEditableMesh, edges: &[u32]) -> Vec<FlipStatus> {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             let statuses = self
                 .query
-                .encode(&self.device, &mut encoder, mesh, edges)
-                .unwrap();
+                .encode_interior(&self.device, &mut encoder, mesh, edges)
+                .unwrap()
+                .statuses;
             assert_eq!(statuses.len(), mesh.edge_count());
             let words =
                 test_support::read_words(&self.device, &self.queue, encoder, statuses.buffer());
@@ -633,6 +892,101 @@ mod tests {
         }
         for status in ["Flipped", "Boundary", "NotInterior", "Connected"] {
             assert!(seen.contains(status), "fixtures never produced {status}");
+        }
+    }
+
+    /// Like `each_edge_flips_like_alum_or_is_rejected_unchanged`, through
+    /// `EdgeFlipQuery::encode`: edges across patch borders flip too. Patches
+    /// may exchange elements, so only the triangles are compared.
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn each_edge_flips_like_alum_across_patch_borders() {
+        let gpu = Gpu::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let small = fixtures::valid()
+            .into_iter()
+            .filter(|f| f.triangles.len() <= 200);
+        for fixture in small {
+            for patch_size in fixtures::PATCH_SIZES {
+                for factor in [1.0, 2.0] {
+                    let capacity = EditCapacity::new(factor).unwrap();
+                    let context = format!(
+                        "{} at patch size {patch_size}, factor {factor}",
+                        fixture.name
+                    );
+                    let mesh = MeshBuilder::new()
+                        .patch_size(patch_size)
+                        .positions(&fixture.positions)
+                        .triangles(&fixture.triangles)
+                        .build()
+                        .unwrap();
+                    for (edge, &uv) in edge_endpoints(&mesh).iter().enumerate() {
+                        let context = format!("{context}: edge {edge} {uv:?}");
+                        let mut gpu_mesh =
+                            GpuEditableMesh::upload(&gpu.device, &mesh, capacity).unwrap();
+                        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                        let statuses = gpu
+                            .query
+                            .encode(&gpu.device, &mut encoder, &mut gpu_mesh, &[edge as u32])
+                            .unwrap();
+                        gpu.queue.submit([encoder.finish()]);
+                        let words = gpu.read(statuses.buffer());
+                        let status = FlipStatus::from_word(words[edge]).unwrap();
+                        let (arena, masks) =
+                            (gpu.read(gpu_mesh.arena()), gpu.read(gpu_mesh.masks()));
+                        check_invariants(&arena, &masks, &gpu.read(gpu_mesh.maps()));
+                        check_exact_ribbons(&arena, &masks);
+
+                        // The outcome: as before for edges inside a patch;
+                        // across borders, flipped like Alum, Connected, or
+                        // out of room with the triangles unchanged.
+                        let classified = classify(&mesh, &fixture.triangles, uv);
+                        let crossing = matches!(classified, Err(FlipStatus::NotInterior));
+                        let triangles = match classified {
+                            Err(FlipStatus::NotInterior) => match status {
+                                FlipStatus::Flipped => documented_flips(&fixture.triangles, &[uv]),
+                                FlipStatus::Connected | FlipStatus::OutOfCapacity => {
+                                    fixture.triangles.clone()
+                                }
+                                other => panic!("{context}: crossing edge reported {other:?}"),
+                            },
+                            _ => {
+                                let expected = expect(&mesh, &fixture, uv);
+                                assert_eq!(status, expected.status, "{context}");
+                                match expected.triangles {
+                                    Some(_) => documented_flips(&fixture.triangles, &[uv]),
+                                    None => fixture.triangles.clone(),
+                                }
+                            }
+                        };
+                        assert_faces_by_id(&arena, &triangles, &context);
+                        if status == FlipStatus::Flipped {
+                            let as_set = |ts: &[[u32; 3]]| {
+                                ts.iter()
+                                    .map(|&t| rotate_face(t))
+                                    .collect::<std::collections::BTreeSet<_>>()
+                            };
+                            let alum = alum_flips(&fixture.positions, &fixture.triangles, &[uv]);
+                            assert_eq!(as_set(&triangles), as_set(&alum), "{context}: like Alum");
+                        }
+                        seen.insert(format!(
+                            "{}{status:?}",
+                            if crossing { "crossing " } else { "" }
+                        ));
+                    }
+                }
+            }
+        }
+        for status in [
+            "crossing Flipped",
+            "crossing OutOfCapacity",
+            "Flipped",
+            "Boundary",
+        ] {
+            assert!(
+                seen.contains(status),
+                "fixtures never produced {status}: {seen:?}"
+            );
         }
     }
 
