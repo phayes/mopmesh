@@ -8,11 +8,19 @@ use crate::{Mesh, MeshId};
 use wgpu::util::DeviceExt;
 mod adjacency;
 mod attribute;
+#[cfg(test)]
+mod bench;
+mod build;
 mod edge;
 mod pipeline;
 mod scan;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod validate;
 pub use adjacency::{AdjacencyQuery, MeshAdjacency};
 pub use attribute::{FaceCentroidQuery, FaceCentroids, GpuValue, GpuVertexAttribute};
+pub use build::{GpuBuildError, GpuMeshBuilder, GpuMeshInput};
 pub use edge::{EdgeConnectivity, EdgeQuery};
 use pipeline::{WORKGROUP_SIZE, check_binding, workgroups};
 
@@ -31,6 +39,9 @@ pub enum GpuError {
     LimitsExceeded { resource: &'static str },
     /// The inputs belong to different meshes. Use resources with matching mesh IDs.
     MeshMismatch,
+    /// A buffer or slice you passed in has too few values, the wrong length,
+    /// or lacks a required buffer usage. `resource` identifies which one.
+    InvalidBuffer { resource: &'static str },
 }
 
 impl std::fmt::Display for GpuError {
@@ -40,6 +51,9 @@ impl std::fmt::Display for GpuError {
                 write!(f, "{resource} exceeds GPU buffer, index or dispatch limits")
             }
             Self::MeshMismatch => f.write_str("GPU resources belong to different meshes"),
+            Self::InvalidBuffer { resource } => {
+                write!(f, "{resource} has the wrong size or buffer usage")
+            }
         }
     }
 }
@@ -73,77 +87,85 @@ fn arena_words(mesh: &Mesh, limits: &wgpu::Limits) -> Result<u64, GpuError> {
     Ok(words)
 }
 
+/// Returns the connectivity arena for `mesh`, word for word as [`GpuMesh::upload`]
+/// stores it (layout documented on [`GpuMesh::arena`]), or an error if it exceeds
+/// the device's buffer limits.
+fn arena_contents(mesh: &Mesh, limits: &wgpu::Limits) -> Result<Vec<u32>, GpuError> {
+    let word_count = arena_words(mesh, limits)?;
+    // Counts fit u32: the builder allows at most u32::MAX / 3 faces,
+    // each contributing at most three edges, and at most u32::MAX vertices.
+    let count = mesh.face_count() as u32;
+    let edge_count = mesh.edge_count() as u32;
+
+    // Store each patch's vertex IDs, edge endpoints, face edges, and face IDs.
+    // Collect one query task per owned face or edge to avoid duplicate results.
+    let mut words = Vec::with_capacity(word_count as usize);
+    words.extend([count, 0, edge_count, 0]);
+    let mut tasks = Vec::with_capacity(count as usize);
+    let mut edge_tasks = Vec::with_capacity(edge_count as usize);
+    for p in mesh.patches() {
+        let vertex_offset = words.len() as u32;
+        words.extend_from_slice(p.vertex_ids());
+        let ev_offset = words.len() as u32;
+        for edge in p.edge_vertices() {
+            words.extend_from_slice(edge);
+        }
+        let faces_offset = words.len() as u32;
+        for (local, face) in p.face_edges().iter().enumerate() {
+            let face_offset = words.len() as u32;
+            for edge in face {
+                words.extend([edge.edge, u32::from(edge.reversed)]);
+            }
+            if p.face_owners()[local].patch == p.id() {
+                tasks.push([ev_offset, face_offset, vertex_offset, p.face_ids()[local]]);
+            }
+        }
+        let face_ids_offset = words.len() as u32;
+        words.extend_from_slice(p.face_ids());
+        for (local, owner) in p.edge_owners().iter().enumerate() {
+            if owner.patch == p.id() {
+                edge_tasks.push([
+                    local as u32,
+                    p.face_ids().len() as u32,
+                    faces_offset,
+                    face_ids_offset,
+                    p.edge_ids()[local],
+                    vertex_offset,
+                    ev_offset,
+                ]);
+            }
+        }
+    }
+
+    // Append the face and edge tasks, and store their starting word offsets in the header.
+    words[1] = words.len() as u32;
+    for task in tasks {
+        words.extend(task);
+    }
+    words[3] = words.len() as u32;
+    for task in edge_tasks {
+        words.extend(task);
+    }
+    Ok(words)
+}
+
 impl GpuMesh {
     /// Uploads `mesh`'s fixed connectivity for use by GPU queries.
     /// Upload vertex attributes, such as positions, separately with
     /// [`GpuMesh::upload_vertex_attribute`]. Returns [`GpuError::LimitsExceeded`]
     /// before allocating GPU buffers if the connectivity is too large.
     pub fn upload(device: &wgpu::Device, mesh: &Mesh) -> Result<Self, GpuError> {
-        let word_count = arena_words(mesh, &device.limits())?;
-        // Counts fit u32: the builder allows at most u32::MAX / 3 faces,
-        // each contributing at most three edges, and at most u32::MAX vertices.
-        let count = mesh.face_count() as u32;
-        let edge_count = mesh.edge_count() as u32;
-
-        // Store each patch's vertex IDs, edge endpoints, face edges, and face IDs.
-        // Collect one query task per owned face or edge to avoid duplicate results.
-        let mut words = Vec::with_capacity(word_count as usize);
-        words.extend([count, 0, edge_count, 0]);
-        let mut tasks = Vec::with_capacity(count as usize);
-        let mut edge_tasks = Vec::with_capacity(edge_count as usize);
-        for p in mesh.patches() {
-            let vertex_offset = words.len() as u32;
-            words.extend_from_slice(p.vertex_ids());
-            let ev_offset = words.len() as u32;
-            for edge in p.edge_vertices() {
-                words.extend_from_slice(edge);
-            }
-            let faces_offset = words.len() as u32;
-            for (local, face) in p.face_edges().iter().enumerate() {
-                let face_offset = words.len() as u32;
-                for edge in face {
-                    words.extend([edge.edge, u32::from(edge.reversed)]);
-                }
-                if p.face_owners()[local].patch == p.id() {
-                    tasks.push([ev_offset, face_offset, vertex_offset, p.face_ids()[local]]);
-                }
-            }
-            let face_ids_offset = words.len() as u32;
-            words.extend_from_slice(p.face_ids());
-            for (local, owner) in p.edge_owners().iter().enumerate() {
-                if owner.patch == p.id() {
-                    edge_tasks.push([
-                        local as u32,
-                        p.face_ids().len() as u32,
-                        faces_offset,
-                        face_ids_offset,
-                        p.edge_ids()[local],
-                        vertex_offset,
-                        ev_offset,
-                    ]);
-                }
-            }
-        }
-
-        // Append the face and edge tasks, and store their starting word offsets in the header.
-        words[1] = words.len() as u32;
-        for task in tasks {
-            words.extend(task);
-        }
-        words[3] = words.len() as u32;
-        for task in edge_tasks {
-            words.extend(task);
-        }
+        let words = arena_contents(mesh, &device.limits())?;
         let arena = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh static connectivity"),
             contents: bytemuck::cast_slice(&words),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         Ok(Self {
             arena,
-            face_count: count,
+            face_count: words[0],
             vertex_count: mesh.positions().len() as u32,
-            edge_count,
+            edge_count: words[2],
             mesh: mesh.id(),
         })
     }
@@ -155,6 +177,7 @@ impl GpuMesh {
     /// EV stores two local vertex IDs per edge; FE stores three pairs of
     /// (local edge ID, reversed 0/1) per face; vertices stores global IDs.
     /// All offsets are measured in u32 words. This ABI is experimental.
+    /// The buffer supports `STORAGE | COPY_SRC`.
     pub fn arena(&self) -> &wgpu::Buffer {
         &self.arena
     }
@@ -437,5 +460,128 @@ mod tests {
                 resource: "connectivity arena"
             })
         );
+    }
+
+    #[test]
+    fn arena_contents_have_the_computed_word_count() {
+        let limits = wgpu::Limits::default();
+        for fixture in test_support::fixtures::valid() {
+            for patch_size in test_support::fixtures::PATCH_SIZES {
+                let (mesh, words) = test_support::reference(&fixture, patch_size, &limits).unwrap();
+                assert_eq!(
+                    words.len() as u64,
+                    arena_words(&mesh, &limits).unwrap(),
+                    "{}, patch size {patch_size}",
+                    fixture.name
+                );
+            }
+        }
+    }
+
+    // Checks the comparison harness end to end: the uploaded arena, read back
+    // from the GPU, equals the CPU reference words for every fixture.
+    #[test]
+    #[ignore = "requires a GPU adapter; run cargo test --lib -- --ignored --nocapture"]
+    fn uploaded_arena_matches_the_cpu_reference() {
+        let (device, queue) = test_support::device(wgpu::Limits::default());
+        let limits = device.limits();
+        for fixture in test_support::fixtures::valid() {
+            for patch_size in test_support::fixtures::PATCH_SIZES {
+                let context = format!("{}, patch size {patch_size}", fixture.name);
+                let (mesh, expected) =
+                    test_support::reference(&fixture, patch_size, &limits).unwrap();
+                let gpu = GpuMesh::upload(&device, &mesh).unwrap();
+                let encoder = device.create_command_encoder(&Default::default());
+                let actual = test_support::read_words(&device, &queue, encoder, gpu.arena());
+                test_support::assert_arena_eq(&context, &mesh, &actual, &expected);
+            }
+        }
+        // Every invalid fixture is rejected by the CPU reference.
+        for fixture in test_support::fixtures::invalid() {
+            assert!(
+                test_support::reference(&fixture, 128, &limits).is_err(),
+                "{}",
+                fixture.name
+            );
+        }
+    }
+
+    /// The per-patch region sizes of `mesh`, in arena order.
+    fn patch_sizes(mesh: &Mesh) -> Vec<validate::PatchSizes> {
+        mesh.patches()
+            .iter()
+            .map(|p| validate::PatchSizes {
+                vertices: p.vertex_ids().len() as u32,
+                edges: p.edge_ids().len() as u32,
+                faces: p.face_ids().len() as u32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validator_accepts_cpu_arenas_and_rejects_corrupted_ones() {
+        let limits = wgpu::Limits::default();
+        let methods = [
+            crate::mesh::Partition::BreadthFirst,
+            crate::mesh::Partition::InputOrder,
+            crate::mesh::Partition::Morton,
+        ];
+        for fixture in test_support::fixtures::valid() {
+            for (patch_size, method) in test_support::fixtures::PATCH_SIZES
+                .into_iter()
+                .flat_map(|size| methods.map(|method| (size, method)))
+            {
+                let name = format!("{}, patch size {patch_size}, {method:?}", fixture.name);
+                let builder = MeshBuilder::new().patch_size(patch_size).partition(method);
+                let (mesh, words) =
+                    test_support::reference_with(&fixture, builder, &limits).unwrap();
+                let sizes = patch_sizes(&mesh);
+                let check = |words: &[u32]| {
+                    validate::validate_arena(
+                        words,
+                        fixture.positions.len(),
+                        &fixture.triangles,
+                        &sizes,
+                        patch_size,
+                    )
+                };
+                assert_eq!(check(&words), Ok(()), "{name}");
+
+                // Changing words in each region must be caught; small meshes
+                // are enough, and keep the test fast.
+                if method != crate::mesh::Partition::BreadthFirst
+                    || mesh.face_count() == 0
+                    || mesh.face_count() > 1000
+                {
+                    continue;
+                }
+                for index in [
+                    4,
+                    words[1] as usize - 1,
+                    words[1] as usize + 3,
+                    words.len() - 1,
+                ] {
+                    let mut corrupted = words.clone();
+                    corrupted[index] ^= 1;
+                    assert!(check(&corrupted).is_err(), "{name}: word {index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "arena differs at word 20 (patch 0 FE, word 0)")]
+    fn arena_comparison_names_the_first_differing_region() {
+        // The tetrahedron in one patch: 4 header words, 4 vertex IDs and 12 EV
+        // words come before the FE records.
+        let fixture = test_support::fixtures::valid()
+            .into_iter()
+            .find(|f| f.name == "tetrahedron")
+            .unwrap();
+        let (mesh, expected) =
+            test_support::reference(&fixture, 128, &wgpu::Limits::default()).unwrap();
+        let mut actual = expected.clone();
+        actual[20] ^= 1;
+        test_support::assert_arena_eq("tetrahedron", &mesh, &actual, &expected);
     }
 }

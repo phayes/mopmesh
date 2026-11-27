@@ -8,6 +8,8 @@ use mopmesh::{
 };
 #[path = "../examples/support/boundary.rs"]
 mod boundary;
+#[path = "support/fixtures.rs"]
+mod fixtures;
 #[path = "../examples/support/neighborhood.rs"]
 mod neighborhood;
 
@@ -21,77 +23,18 @@ fn gpu_topology_queries_match_alum() {
     eprintln!("GPU: {:?}", adapter.get_info());
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let query = FaceVertexQuery::new(&device);
-    let mut positions = Vec::new();
-    let mut triangles = Vec::new();
-    for y in 0..9 {
-        for x in 0..9 {
-            positions.push([x as f32, y as f32, 0.]);
-        }
+    for fixture in fixtures::valid() {
+        eprintln!("checking {}", fixture.name);
+        check(
+            &device,
+            &queue,
+            &query,
+            &fixture.positions,
+            &fixture.triangles,
+        );
     }
-    for y in 0..8 {
-        for x in 0..8 {
-            let a = y * 9 + x;
-            triangles.extend([[a, a + 1, a + 9], [a + 1, a + 10, a + 9]]);
-        }
-    }
-    // 128 faces exercises two workgroups, boundaries, and ribbon duplication.
-    check(&device, &queue, &query, &positions, &triangles);
-    let hole_faces: Vec<_> = triangles
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i / 2 != 27)
-        .map(|(_, &face)| face)
-        .collect();
-    check(&device, &queue, &query, &positions, &hole_faces);
-    // A partial final workgroup, closed surface, and an empty dispatch.
-    check(
-        &device,
-        &queue,
-        &query,
-        &[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
-        &[[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
-    );
-    check(&device, &queue, &query, &[], &[]);
-    check(
-        &device,
-        &queue,
-        &query,
-        &[
-            [0., 0., 0.],
-            [1., 0., 0.],
-            [0., 1., 0.],
-            [3., 0., 0.],
-            [4., 0., 0.],
-            [3., 1., 0.],
-        ],
-        &[[0, 1, 2], [3, 4, 5]],
-    );
-    // A row larger than a workgroup exercises atomic contention without a
-    // fixed per-vertex capacity; boundary vertices have only two neighbors.
-    let n = 129u32;
-    let mut fan_positions = vec![[0., 0., 0.]];
-    for i in 0..n {
-        let angle = std::f32::consts::TAU * i as f32 / n as f32;
-        fan_positions.push([angle.cos(), angle.sin(), 0.]);
-    }
-    let fan_faces: Vec<_> = (0..n).map(|i| [0, i + 1, (i + 1) % n + 1]).collect();
-    check(&device, &queue, &query, &fan_positions, &fan_faces);
-    // 4,225 vertices require three scan levels, with partial blocks at two levels.
-    let mut large_positions = Vec::new();
-    let mut large_faces = Vec::new();
-    for y in 0..65 {
-        for x in 0..65 {
-            large_positions.push([x as f32, y as f32, 0.]);
-        }
-    }
-    for y in 0..64 {
-        for x in 0..64 {
-            let a = y * 65 + x;
-            large_faces.extend([[a, a + 1, a + 65], [a + 1, a + 66, a + 65]]);
-        }
-    }
-    check(&device, &queue, &query, &large_positions, &large_faces);
     // Reject oversized uploads before creating a GPU buffer.
+    let (positions, triangles) = fixtures::grid(9);
     let (small_device, _) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: wgpu::Limits {
             max_storage_buffer_binding_size: 64,
@@ -205,7 +148,7 @@ fn check(
             faces
         })
         .collect();
-    for patch_size in [1, 3, 128] {
+    for patch_size in fixtures::PATCH_SIZES {
         let mesh = MeshBuilder::new()
             .positions(positions)
             .triangles(triangles)

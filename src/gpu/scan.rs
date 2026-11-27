@@ -8,6 +8,7 @@ struct Level {
     count: u32,
     offset: u32,
     next_offset: u32,
+    grid: [u32; 2],
 }
 
 /// The first `count` words are input and become exclusive prefixes. Remaining
@@ -26,13 +27,14 @@ impl ScanPlan {
             let blocks = remaining.div_ceil(WIDTH);
             let next_offset = offset + u64::from(remaining);
             words = next_offset + u64::from(blocks);
-            if words > u64::from(u32::MAX) || blocks > limits.max_compute_workgroups_per_dimension {
+            if words > u64::from(u32::MAX) {
                 return Err(GpuError::LimitsExceeded { resource: RESOURCE });
             }
             levels.push(Level {
                 count: remaining,
                 offset: offset as u32,
                 next_offset: next_offset as u32,
+                grid: pipeline::workgroup_grid(limits, remaining, RESOURCE)?,
             });
             if blocks == 1 {
                 break;
@@ -105,18 +107,18 @@ impl ScanPipeline {
         let levels: Vec<_> = plan
             .levels
             .iter()
-            .map(|level| level.count.div_ceil(WIDTH))
+            .map(|level| level.grid)
             .zip(&bindings)
             .collect();
-        for &(groups, bindings) in &levels {
+        for &(grid, bindings) in &levels {
             let label = "MOPMesh scan blocks";
-            pipeline::dispatch(encoder, label, &self.scan, bindings, groups);
+            pipeline::dispatch_grid(encoder, label, &self.scan, bindings, grid);
         }
         // The highest level already includes all preceding values. Work downward,
         // adding each block's starting offset to its locally computed prefixes.
-        for &(groups, bindings) in levels.iter().rev().skip(1) {
+        for &(grid, bindings) in levels.iter().rev().skip(1) {
             let label = "MOPMesh scan propagate";
-            pipeline::dispatch(encoder, label, &self.add, bindings, groups);
+            pipeline::dispatch_grid(encoder, label, &self.add, bindings, grid);
         }
     }
 }

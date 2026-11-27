@@ -17,6 +17,14 @@ fn main() {
         "edges",
         "vertex_neighbors",
         "face_neighbors",
+        "build_elements",
+        "build_connectivity",
+        "build_patch_members",
+        "build_patch_rows",
+        "build_patch_local",
+        "build_arena",
+        "build_split",
+        "radix_sort",
     ] {
         let resolver = wesl::resolver::StandardResolver::new(".");
         let compiled = wesl::Compiler::default()

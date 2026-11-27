@@ -41,6 +41,45 @@ pub(super) fn workgroups(
     Ok(groups)
 }
 
+/// Returns a two-dimensional workgroup grid covering `count` invocations: as
+/// many groups along x as the device allows, then further rows along y.
+/// Shaders recover the flat index with `shaders::parallel::grid::flat_index`.
+/// Returns `[0, 0]` for an empty input, or a limit error labeled with
+/// `resource` if even a square grid would exceed the device limit.
+pub(super) fn workgroup_grid(
+    limits: &wgpu::Limits,
+    count: u32,
+    resource: &'static str,
+) -> Result<[u32; 2], GpuError> {
+    let groups = count.div_ceil(WORKGROUP_SIZE);
+    let width = groups.min(limits.max_compute_workgroups_per_dimension);
+    if groups == 0 {
+        return Ok([0, 0]);
+    }
+    let rows = groups.div_ceil(width);
+    if rows > limits.max_compute_workgroups_per_dimension {
+        return Err(GpuError::LimitsExceeded { resource });
+    }
+    Ok([width, rows])
+}
+
+/// Like [`dispatch`], over a grid from [`workgroup_grid`].
+pub(super) fn dispatch_grid(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    bindings: &wgpu::BindGroup,
+    [x, y]: [u32; 2],
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bindings, &[]);
+    pass.dispatch_workgroups(x, y, 1);
+}
+
 pub(super) fn shader_module(
     device: &wgpu::Device,
     label: &str,

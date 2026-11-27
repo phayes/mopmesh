@@ -294,7 +294,19 @@ fn invalid_inputs_are_rejected() {
         BuildError::InvalidVertex { face: 0, vertex: 9 }
     );
     assert_eq!(build(&p, &[[0, 0, 1]]), BuildError::DegenerateFace(0));
-    assert_eq!(build(&p, &[[0, 1, 3]]), BuildError::DegenerateFace(0));
+    // Distinct vertices at equal coordinates are degenerate; -0.0 equals 0.0.
+    assert_eq!(
+        build(&[[0., 0., 0.], [1., 0., 0.], [-0., 0., 0.]], &[[0, 1, 2]]),
+        BuildError::DegenerateFace(0)
+    );
+    // Three distinct collinear corners are accepted.
+    assert!(
+        MeshBuilder::new()
+            .positions(&[[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]])
+            .triangles(&[[0, 1, 2]])
+            .build()
+            .is_ok()
+    );
     assert_eq!(
         build(&p, &[[0, 1, 2], [2, 1, 0]]),
         BuildError::DuplicateFace(1)

@@ -1,7 +1,6 @@
 use crate::{DirectedEdge, EdgeHandle, FaceHandle, Patch, VertexHandle};
-use std::collections::VecDeque;
 
-mod build;
+pub(crate) mod build;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MeshId(u64);
 impl MeshId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
@@ -43,7 +42,9 @@ impl fmt::Display for BuildError {
             Self::InvalidVertex { face, vertex } => {
                 write!(f, "face {face} references missing vertex {vertex}")
             }
-            Self::DegenerateFace(face) => write!(f, "face {face} has zero area"),
+            Self::DegenerateFace(face) => {
+                write!(f, "face {face} has two corners at the same position")
+            }
             Self::DuplicateFace(face) => write!(f, "face {face} repeats an earlier face"),
             Self::NonManifoldEdge([a, b]) => {
                 write!(f, "edge ({a}, {b}) is shared by more than two faces")
@@ -59,19 +60,50 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 /// Constructs storage for oriented manifold triangles, with or without boundary.
-/// Empty meshes are accepted; isolated vertices and zero-area faces are rejected.
+/// Empty meshes are accepted; isolated vertices are rejected, and so are faces
+/// with two corners at equal coordinates. Collinear faces are accepted.
 #[derive(Debug)]
 pub struct MeshBuilder<'a> {
     positions: &'a [[f32; 3]],
     triangles: &'a [[u32; 3]],
     patch_size: usize,
+    split: Split<'a>,
 }
+
+/// How [`MeshBuilder`] splits faces into patches. Every method gives each
+/// patch at most `patch_size` owned faces and the same result on every build;
+/// they differ in patch shape and so in ribbon overhead. Only breadth-first is
+/// used outside tests; the others exist to compare against the GPU split.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Partition {
+    /// Grows each patch across shared edges from the lowest unassigned face.
+    /// Gives compact, connected patches; runs on the CPU only.
+    #[default]
+    BreadthFirst,
+    /// Consecutive runs of `patch_size` faces in input order. Patch quality
+    /// depends entirely on how the input is ordered.
+    InputOrder,
+    /// Consecutive runs of `patch_size` faces in Morton (Z-curve) order of
+    /// their centroids. Patches are spatially compact but may be disconnected.
+    Morton,
+}
+
+/// A split method, or (in tests) a given face-to-patch assignment.
+#[derive(Clone, Copy, Debug)]
+enum Split<'a> {
+    Method(Partition),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Given(&'a [u32]),
+}
+
 impl Default for MeshBuilder<'_> {
     fn default() -> Self {
         Self {
             positions: &[],
             triangles: &[],
             patch_size: 128,
+            split: Split::Method(Partition::default()),
         }
     }
 }
@@ -92,6 +124,19 @@ impl<'a> MeshBuilder<'a> {
         self.patch_size = size;
         self
     }
+    /// How faces are split into patches; [`Partition::BreadthFirst`] by default.
+    #[cfg(test)]
+    pub(crate) fn partition(mut self, method: Partition) -> Self {
+        self.split = Split::Method(method);
+        self
+    }
+    /// Uses a given owning patch per face instead of a split method. Patch IDs
+    /// must cover `0..P` without gaps; each patch may own any number of faces.
+    #[cfg(test)]
+    pub(crate) fn face_patches(mut self, face_patch: &'a [u32]) -> Self {
+        self.split = Split::Given(face_patch);
+        self
+    }
 
     pub fn build(self) -> Result<Mesh, BuildError> {
         if self.patch_size == 0 || self.patch_size > u32::MAX as usize {
@@ -101,31 +146,7 @@ impl<'a> MeshBuilder<'a> {
         {
             return Err(BuildError::TooManyElements);
         }
-        for (v, p) in self.positions.iter().enumerate() {
-            if p.iter().any(|x| !x.is_finite()) {
-                return Err(BuildError::NonFinitePosition(v as u32));
-            }
-        }
-        // Check each face on its own.
-        for (face, &vs) in self.triangles.iter().enumerate() {
-            let face = face as u32;
-            for &v in &vs {
-                if v as usize >= self.positions.len() {
-                    return Err(BuildError::InvalidVertex { face, vertex: v });
-                }
-            }
-            let [a, b, c] = vs.map(|v| self.positions[v as usize].map(f64::from));
-            let u: [f64; 3] = std::array::from_fn(|i| b[i] - a[i]);
-            let v: [f64; 3] = std::array::from_fn(|i| c[i] - a[i]);
-            let cross = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
-            if cross == [0.0; 3] {
-                return Err(BuildError::DegenerateFace(face));
-            }
-        }
+        build::check_elements(self.positions, self.triangles)?;
         // Corners around each vertex in face order; corner `c` is slot `c % 3` of face `c / 3`.
         let vertex_corners =
             build::Rows::group(self.positions.len(), 3 * self.triangles.len(), |c| {
@@ -133,57 +154,32 @@ impl<'a> MeshBuilder<'a> {
             });
 
         // Find edges and report the first duplicate-face or edge error in face order.
-        let duplicate = build::find_duplicate_face(self.positions.len(), self.triangles);
-        let edges = build::connect_edges(self.positions.len(), self.triangles);
-        match (duplicate, &edges) {
-            (Some(d), Err((face, _))) if d <= *face => return Err(BuildError::DuplicateFace(d)),
-            (Some(d), Ok(_)) => return Err(BuildError::DuplicateFace(d)),
-            _ => {}
-        }
-        let edges = edges.map_err(|(_, error)| error)?;
+        let edges = build::check_edges(self.positions.len(), self.triangles)?;
 
         // Every vertex must be used, and its faces must form one fan, not a bow tie.
-        for v in 0..self.positions.len() {
-            let corners = vertex_corners.row(v);
-            if corners.is_empty() {
-                return Err(BuildError::IsolatedVertex(v as u32));
-            }
-            if !build::is_single_fan(v as u32, corners, self.triangles, &edges) {
-                return Err(BuildError::NonManifoldVertex(v as u32));
-            }
-        }
+        build::check_fans(&vertex_corners, self.triangles, &edges)?;
         let build::Edges {
             endpoints: edges,
             faces: edge_faces,
             face_edges,
         } = edges;
-        // Deterministic breadth-first face partitioning across shared edges.
-        let mut face_patch = vec![u32::MAX; self.triangles.len()];
-        let mut groups = Vec::<Vec<u32>>::new();
-        for seed in 0..self.triangles.len() {
-            if face_patch[seed] != u32::MAX {
-                continue;
+        // Split the faces into patches, then list each patch's owned faces.
+        let face_patch = match self.split {
+            Split::Method(method) => build::split_faces(
+                method,
+                self.positions,
+                self.triangles,
+                &face_edges,
+                &edge_faces,
+                self.patch_size,
+            ),
+            Split::Given(face_patch) => {
+                assert_eq!(face_patch.len(), self.triangles.len(), "one patch per face");
+                face_patch.to_vec()
             }
-            let id = groups.len() as u32;
-            let mut group = vec![seed as u32];
-            let mut queue = VecDeque::from([seed as u32]);
-            face_patch[seed] = id;
-            while let Some(f) = queue.pop_front() {
-                for d in face_edges[f as usize] {
-                    for &n in &edge_faces[d.edge as usize] {
-                        if n != build::NO_FACE
-                            && group.len() < self.patch_size
-                            && face_patch[n as usize] == u32::MAX
-                        {
-                            face_patch[n as usize] = id;
-                            group.push(n);
-                            queue.push_back(n);
-                        }
-                    }
-                }
-            }
-            groups.push(group);
-        }
+        };
+        let patch_count = face_patch.iter().max().map_or(0, |&p| p as usize + 1);
+        let groups = build::Rows::group(patch_count, self.triangles.len(), |f| face_patch[f]);
         let vertex_patch: Vec<_> = (0..self.positions.len())
             .map(|v| {
                 vertex_corners
@@ -218,11 +214,10 @@ impl<'a> MeshBuilder<'a> {
         let mut vertex_owners = vec![VertexHandle { patch: 0, local: 0 }; vertex_count];
         let mut edge_owners = vec![EdgeHandle { patch: 0, local: 0 }; edge_count];
         let mut face_owners = vec![FaceHandle { patch: 0, local: 0 }; face_count];
-        let mut patches = Vec::with_capacity(groups.len());
-        for (id, group) in groups.iter().enumerate() {
-            let id = id as u32;
+        let mut patches = Vec::with_capacity(patch_count);
+        for id in 0..patch_count as u32 {
             let mut faces = Vec::new();
-            for &f in group {
+            for &f in groups.row(id as usize) {
                 for &v in &self.triangles[f as usize] {
                     for &c in vertex_corners.row(v as usize) {
                         let g = c / 3;

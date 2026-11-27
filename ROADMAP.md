@@ -13,13 +13,17 @@ contracts in the README alongside the code.
 
 The prototype has the planned static adjacency families, canonical vertex
 attributes, hierarchical scans, and two runnable downstream WESL examples.
-Geometry algorithms have begun; topology editing has not. Construction and
-partitioning run on the CPU; uploaded topology is immutable.
+Geometry algorithms have begun; topology editing has not. The public API
+builds and partitions on the CPU; a GPU build producing the same arena format
+works internally and awaits its public API. Uploaded topology is immutable.
 
-The static API review is complete; see the [findings and decisions](docs/static_api_review.md).
+The static API review is complete. Its contract decisions are in the README's
+shared contracts; its deferred findings are listed under
+[static API review follow-ups](#static-api-review-follow-ups).
 
-The last full verification run passed 16 tests: 14 hardware-independent tests
-and two opt-in GPU tests. Those test functions cover many fixtures and patch
+The last full verification run passed 28 tests: 18 hardware-independent tests
+and ten opt-in GPU tests (one is the GPU build benchmark, which returns at
+once unless `MOPMESH_BENCH` is set). Those test functions cover many fixtures and patch
 sizes; the count is not a measure of exhaustive coverage. Clippy and formatting
 checks passed, and both examples ran. GPU execution has only been verified on
 Apple M1 Max / Metal; Naga validation uses no optional capabilities.
@@ -55,8 +59,7 @@ There is no 16-bit storage/arithmetic variant, subword numeric packing, native
 (single-single/double-single) precision path.
 
 Host-side `u64`/`usize` size calculations, overflow checks and wgpu API arguments
-remain appropriate. CPU construction retains `f64` intermediates for degeneracy
-validation; these do not define a wider GPU data format. Capacity beyond the
+remain appropriate. Capacity beyond the
 32-bit indexing or device limits must produce an explicit error, not a fallback
 to wider or packed representations.
 
@@ -102,6 +105,72 @@ evidence of production readiness.
 - [x] Review the static API and buffer contracts before expanding them further.
 - [ ] Stage topology in workgroup memory and evaluate patch-local traversal.
 - [ ] Demonstrate locality benefits against an unpartitioned GPU baseline.
+
+### GPU construction follow-ups
+
+Building the arena on the GPU is in progress; see the
+[strategy](docs/gpu_build_strategy.md).
+
+- [ ] **Port more build logic into `shaders/`** (corner grouping, the fan walk,
+  patch membership, local-ID lookup) when editing shows the interfaces it
+  needs. Only value-level helpers have moved so far (`shaders/build/`).
+- [ ] **Move CPU code used only to check the GPU behind a feature.** The
+  public Rust API is for running the GPU shaders, not for running the
+  algorithms on the CPU. Comparison-only CPU code (the alternative split
+  methods, the explicit split, the arena validator, and eventually
+  `MeshBuilder` itself if the GPU build replaces it) should sit behind a
+  non-default feature such as `cpu-reference`, used by the tests. Until then
+  it stays crate-private.
+- [ ] **Revisit the edge ID ordering promise.** Ascending (smaller, larger)
+  vertex-pair order costs a per-vertex count, scan and rank pass on the GPU.
+  Once the GPU build is benchmarked, measure that cost and check whether
+  callers still need stable, face-order-independent IDs; if not, numbering
+  edge leaders in corner order is cheaper.
+- [ ] **Check whether an RXMesh-style split is needed.** Lloyd iterations
+  (`prior_art/RXMesh/include/rxmesh/patcher/`) give compact, near-equal
+  patches. Deferred: build it only if the GPU build benchmark shows Morton
+  patches hurting ribbon overhead or query times. First benchmark (2.1 M
+  faces): Morton within 2–3% of breadth-first on ribbon overhead, query times
+  within noise except centroids (+19%); not needed yet. Re-check on real,
+  irregular meshes.
+- [ ] **Speed up the GPU build further.** Done so far: one workgroup per
+  patch-row sort, and a header kernel instead of a mapped arena (2.1 M
+  faces: 173 → 145 ms; 32 K faces: 24 → 12 ms). Remaining: patch contents
+  is still 63 ms at 2.1 M faces, mostly outside the sort (member writes,
+  grouping, local-ID binary searches); at 32 K faces the 8-pass Morton sort
+  and per-dispatch overhead keep the GPU build slower than the CPU path and
+  Alum. Do the profiling item below before the next round.
+- [ ] **Profile the GPU build per kernel.** The benchmark's stage breakdown
+  submits and waits per stage, which hides which kernel inside a stage is
+  slow. Use wgpu timestamp queries (where the adapter supports them) around
+  each dispatch, for each grid size and split, and record the results in the
+  benchmark doc before choosing the next optimization.
+- [ ] **Maybe: a fully deterministic GPU path that matches the CPU exactly.**
+  An optional mode keeping every intermediate in canonical order (sorted
+  corner and patch rows) with a split the CPU can reproduce bit for bit
+  (input order, or integer-exact Morton keys). It would restore word-for-word
+  CPU comparison at some speed cost, and could serve callers who need results
+  identical to the CPU builder. Decide after the fast path is benchmarked.
+
+### Static API review follow-ups
+
+Deferred findings from the milestone 1 review, to settle with measurements:
+
+- [ ] **Shared face-vertex intermediate (P2).** `VertexFaceQuery`,
+  `AdjacencyQuery` and `FaceCentroidQuery` each compile and run their own
+  `FaceVertexQuery` (and two compile their own scan). Measure before adding
+  shared-intermediate inputs.
+- [ ] **Per-call allocation (P3).** Every `encode` allocates outputs,
+  scratch and uniform buffers; the scan allocates one uniform per level.
+  Measure the cost, then decide on reusable buffers.
+- [ ] **Selective adjacency (P4).** `AdjacencyQuery` always computes VE/VV,
+  FF and diamonds together. Measure selective execution.
+- [ ] **Explicit counts in two shaders (L3).** `face_centroids.wesl` and
+  `face_neighbors.wesl` bound loops with `arrayLength`, so they need
+  exact-size inputs. Switch to explicit counts when buffers are pooled or
+  oversized.
+- [ ] **`missing_docs` (D-1).** Enable it for the public API in the release
+  phase.
 
 ### 3 — Static algorithms: started
 
@@ -154,11 +223,12 @@ local cavities. The current Cargo version does not mean that release scope is co
 
 ## Next execution milestones
 
-1. **Static API and architecture review — done.** [Findings](docs/static_api_review.md)
-   cover layouts, identity/device requirements, ordering, sentinels, error
-   handling, pipeline setup, batched-query cost and temporary allocations.
-   Fixes landed with regression tests; deferred findings P2–P4 and L3 feed
-   the benchmark baseline.
+1. **Static API and architecture review — done.** It covered layouts,
+   identity/device requirements, ordering, sentinels, error handling,
+   pipeline setup, batched-query cost and temporary allocations. Fixes landed
+   with regression tests; the deferred findings are listed under
+   [static API review follow-ups](#static-api-review-follow-ups) and feed the
+   benchmark baseline.
 2. **Benchmark baseline.** Add representative meshes and an unpartitioned WESL
    baseline. Measure construction/upload separately from warm GPU execution;
    report allocations, dispatches, query throughput, bytes/triangle, scratch and
@@ -166,7 +236,9 @@ local cavities. The current Cargo version does not mean that release scope is co
    Acceptance: reproducible runs and a baseline report, with no assumed speedup.
    An [approximate comparison against Alum](docs/approximate_benchmark.md)
    exists. Host construction was rewritten after it showed construction about
-   16x slower than Alum's; it is now about 2.4x slower.
+   16x slower than Alum's; it is now about 2.4x slower. Construction on the
+   GPU is in progress ([strategy](docs/gpu_build_strategy.md)); it is already
+   1.3–1.4x faster than Alum's build at 522 K faces and above.
 3. **Workgroup-local traversal experiment.** Select a bottleneck from the
    baseline; edge incidence is a candidate because it currently scans local
    faces per owned edge. Compare staged and existing paths with identical

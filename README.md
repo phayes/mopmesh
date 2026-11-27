@@ -87,7 +87,18 @@ import mopmesh::topology::edge::{EdgeRecord, is_boundary_edge, edge_face_count};
 import mopmesh::topology::edge::{INVALID_FACE, INVALID_VERTEX};
 import mopmesh::topology::face::INVALID_SLOT;
 import mopmesh::geometry::edge::edge_length;
+import mopmesh::topology::face::face_vertex_slot;
+import mopmesh::build::exact::{is_finite_position, same_position, has_coincident_corners};
+import mopmesh::build::edge_group::{EdgeGroup, empty_edge_group, edge_group_add};
+import mopmesh::build::edge_group::{edge_group_misoriented, edge_group_error_corner};
+import mopmesh::build::morton::{morton_cell, morton_code_30, morton_spread_10};
 ```
+
+The `build` modules hold value-level pieces of mesh construction that
+editing code can reuse: exact position checks on f32 bit patterns (load
+positions with `bitcast<vec3<u32>>`), an `EdgeGroup` value that collects the
+corners on one edge and reports the corner that makes it invalid, and Morton
+codes for a 1024³ grid.
 
 `INVALID_FACE`, `INVALID_VERTEX` and `INVALID_SLOT` all equal `0xffffffff`, the
 same value as the Rust constant `mopmesh::gpu::INVALID_ID`. Helpers that look up
@@ -192,7 +203,8 @@ bindings and 64 invocations per workgroup.
   buffers, logical counts and `mesh_id()`. Empty results hold zeroed placeholders
   so the buffer is always bindable; use the counts, never the buffer size.
 
-`GpuMesh::arena()` exposes immutable scalar connectivity. All offsets are u32
+`GpuMesh::arena()` exposes immutable scalar connectivity, with STORAGE and
+COPY_SRC usage. All offsets are u32
 word offsets, with no struct padding. The four-word header holds face count,
 face-task offset, edge count, and edge-task offset. Patch regions contain global
 vertex IDs, EV endpoint pairs, FE triples of `(local edge ID, reversed 0/1)`
@@ -378,20 +390,26 @@ The initial release supports native 32-bit GPU values: `u32`/`i32` integer data
 and `f32` geometry, including vectors/records made of independent 32-bit fields.
 It excludes 16-bit formats, subword numeric packing, native or emulated 64-bit
 GPU values, and paired-float precision schemes. Packing and alternative widths
-are outside the committed roadmap. Host `u64`/`usize` size checks and the CPU
-builder's `f64` degeneracy calculations remain in use; they do not introduce
-wider GPU representations.
+are outside the committed roadmap. Host `u64`/`usize` size checks remain in
+use; they do not introduce wider GPU representations.
+
+The order of elements within a patch (its local IDs), the order of the arena's
+face and edge tasks, and which patch owns which faces are unspecified. They
+are the same on every build of the same input, but may change between
+releases. Global vertex, face and edge IDs do not depend on them.
 
 `patch_size` limits owned faces only. Ribbons include the complete face stars
 of vertices on owned faces, so high-valence vertices can cause substantial
 duplication. Full one-ring queries are guaranteed for owned elements; resolve
 ribbon elements to their owner before querying their full neighborhood.
 
-Construction rejects non-finite coordinates, invalid indices, zero-area or
+Construction rejects non-finite coordinates, invalid indices, degenerate or
 duplicate triangles, inconsistent winding, non-manifold edges or vertices,
 and isolated vertices. Empty meshes and disconnected components are supported.
-Exact zero area is tested in f64; near-degenerate triangles are not filtered.
-Geometric self-intersections are not checked.
+A triangle is degenerate when two of its corners have equal coordinates
+(including a repeated vertex ID; `0.0` equals `-0.0`). Triangles whose three
+distinct corners are collinear, or nearly so, are accepted. Geometric
+self-intersections are not checked.
 
 Handles are mesh-relative addresses and must not be used with another mesh.
 Future migration and slot reuse invalidate them. Vertex attributes verify mesh
@@ -425,7 +443,7 @@ Alum and do not require those checkouts.
 ## Next steps
 
 Follow the [execution milestones](ROADMAP.md#next-execution-milestones). The
-static API review is complete ([findings](docs/static_api_review.md)). Next,
+static API review is complete. Next,
 establish an unpartitioned GPU benchmark baseline, then evaluate
 workgroup-local traversal. Complete remaining static attributes and geometry
 operators before starting interior edge flips. Static performance viability

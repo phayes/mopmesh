@@ -65,4 +65,22 @@ fn built_in_gpu_query_is_valid_portable_wgsl() {
         "/face_vertices.wgsl"
     )));
     validate(include_str!(concat!(env!("OUT_DIR"), "/vertex_faces.wgsl")));
+    validate(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/build_elements.wgsl"
+    )));
+    validate(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/build_connectivity.wgsl"
+    )));
+    for wgsl in [
+        include_str!(concat!(env!("OUT_DIR"), "/build_patch_members.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/build_patch_rows.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/build_patch_local.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/build_arena.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/build_split.wgsl")),
+        include_str!(concat!(env!("OUT_DIR"), "/radix_sort.wgsl")),
+    ] {
+        validate(wgsl);
+    }
 }

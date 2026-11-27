@@ -91,7 +91,7 @@ Use explicit patch/local handles initially; document invalidation after migratio
 
 The initial release uses native `u32`/`i32` integer values and `f32` geometry on the GPU, with `u32` connectivity indices and word offsets. Vectors and records contain independent 32-bit fields. Do not introduce 16-bit formats or subword numeric packing, native or emulated 64-bit GPU values, or paired-float (single-single/double-single) precision schemes. Exceeding index/device limits is an error, not a reason to select a wider representation. Alternative widths or compression require a measured need and a separate design decision; they are not committed future work.
 
-This constraint does not apply to host allocation arithmetic: retain `u64`/`usize` for buffer sizes, overflow checks and wgpu interfaces. The CPU builder also retains `f64` intermediates for degeneracy validation. Neither constitutes a wider GPU representation.
+This constraint does not apply to host allocation arithmetic: retain `u64`/`usize` for buffer sizes, overflow checks and wgpu interfaces. This does not constitute a wider GPU representation.
 
 The implemented static arena uses u32 word offsets and unpacked connectivity, with host-generated owned-face and owned-edge tasks. CPU patches carry ownership maps; the GPU arena does not yet contain general ownership metadata, active masks, free slots or edit capacities. Canonical vertex attributes and query results live in separate buffers. See the [current layouts](README.md#gpu-usage) before writing a consumer.
 
@@ -168,7 +168,7 @@ See [ROADMAP.md](ROADMAP.md) for the maintained phase checklist, acceptance gate
 
 Current position: the reference setup is mostly complete; infrastructure and static query coverage are in place; static algorithms have begun; dynamics and measured optimization have not. Downstream examples are core acceptance work, and both boundary and neighborhood compositions now run against the public package.
 
-The static API review is complete ([findings](docs/static_api_review.md)). The next sequence is **benchmark baseline → workgroup-local traversal experiment → remaining static attributes/algorithms → interior edge flips**. Baseline profiling has been moved ahead of dynamics rather than deferred to the late optimization phase. Broader cross-vendor tuning still belongs to later phases.
+The static API review is complete; its deferred findings are tracked in the [roadmap](ROADMAP.md#static-api-review-follow-ups). The next sequence is **benchmark baseline → workgroup-local traversal experiment → remaining static attributes/algorithms → interior edge flips**. Baseline profiling has been moved ahead of dynamics rather than deferred to the late optimization phase. Broader cross-vendor tuning still belongs to later phases.
 
 ## Current project layout
 

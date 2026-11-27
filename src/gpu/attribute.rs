@@ -22,10 +22,12 @@ pub trait GpuValue: sealed::Sealed + bytemuck::Pod {}
 impl<T: sealed::Sealed + bytemuck::Pod> GpuValue for T {}
 
 /// A GPU buffer with one attribute value per vertex, in original input order.
-/// Bind it as an array of the WGSL scalar or vector type matching `T`. The buffer
-/// supports `STORAGE | COPY_SRC | COPY_DST`; direct writes must preserve that
-/// element layout and vertex order. An empty attribute has a zero placeholder
-/// the size of one element, but its length is zero.
+/// Bind it as an array of the WGSL scalar or vector type matching `T`. Buffers
+/// this crate creates support `STORAGE | COPY_SRC | COPY_DST`; a buffer from
+/// [`GpuMesh::vertex_attribute_from_buffer`] keeps its own usage and may be
+/// longer than the attribute. Direct writes must preserve the element layout
+/// and vertex order. An empty attribute has a zero placeholder the size of one
+/// element, but its length is zero.
 pub struct GpuVertexAttribute<T: GpuValue> {
     buffer: wgpu::Buffer,
     mesh: MeshId,
@@ -47,9 +49,28 @@ impl GpuMesh {
         if self.mesh != attribute.mesh {
             return Err(GpuError::MeshMismatch);
         }
-        let bytes = bytemuck::cast_slice(&attribute.values);
+        self.create_vertex_attribute(device, &attribute.values)
+    }
+
+    /// Copies one value per vertex, in input vertex order, to a new GPU buffer
+    /// with `STORAGE | COPY_SRC | COPY_DST` usage. Use this for meshes built
+    /// with [`GpuMeshBuilder`](super::GpuMeshBuilder), which have no CPU
+    /// attributes. Returns [`GpuError::InvalidBuffer`] unless `values` has
+    /// exactly [`vertex_count`](Self::vertex_count) entries, or
+    /// [`GpuError::LimitsExceeded`] if the buffer would be too large. Errors
+    /// occur before GPU allocation.
+    pub fn create_vertex_attribute<T: GpuValue>(
+        &self,
+        device: &wgpu::Device,
+        values: &[T],
+    ) -> Result<GpuVertexAttribute<T>, GpuError> {
+        const RESOURCE: &str = "vertex attribute";
+        if values.len() != self.vertex_count as usize {
+            return Err(GpuError::InvalidBuffer { resource: RESOURCE });
+        }
+        let bytes = bytemuck::cast_slice(values);
         let size = bytes.len().max(std::mem::size_of::<T>()) as u64;
-        check_binding(&device.limits(), size, "vertex attribute")?;
+        check_binding(&device.limits(), size, RESOURCE)?;
         let zero = T::zeroed();
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MOPMesh canonical vertex attribute"),
@@ -64,6 +85,31 @@ impl GpuMesh {
         });
         Ok(GpuVertexAttribute {
             buffer,
+            mesh: self.mesh,
+            len: self.vertex_count,
+            marker: PhantomData,
+        })
+    }
+
+    /// Uses an existing buffer as a vertex attribute of this mesh, without
+    /// copying it: GPU writes to `buffer` are seen by queries that read the
+    /// attribute. For example, pass the positions buffer given to
+    /// [`GpuMeshBuilder::build`](super::GpuMeshBuilder::build) to compute face
+    /// centroids. The buffer must hold one `T` per vertex in input vertex order,
+    /// starting at byte 0, and at least one `T` for an empty mesh. Returns
+    /// [`GpuError::InvalidBuffer`] if it is smaller or lacks `STORAGE` usage.
+    pub fn vertex_attribute_from_buffer<T: GpuValue>(
+        &self,
+        buffer: &wgpu::Buffer,
+    ) -> Result<GpuVertexAttribute<T>, GpuError> {
+        let needed = std::mem::size_of::<T>() as u64 * u64::from(self.vertex_count.max(1));
+        if buffer.size() < needed || !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
+            return Err(GpuError::InvalidBuffer {
+                resource: "vertex attribute",
+            });
+        }
+        Ok(GpuVertexAttribute {
+            buffer: buffer.clone(),
             mesh: self.mesh,
             len: self.vertex_count,
             marker: PhantomData,
@@ -89,6 +135,9 @@ impl<T: GpuValue> GpuVertexAttribute<T> {
     /// and GPU attributes are snapshots; neither automatically updates the other.
     /// Queue writes become visible on the next submission, including to commands
     /// already encoded. Submit earlier readers before calling this method.
+    /// Returns [`GpuError::MeshMismatch`] if `attribute` belongs to another mesh
+    /// (always the case for a mesh from [`GpuMeshBuilder`](super::GpuMeshBuilder)),
+    /// or [`GpuError::InvalidBuffer`] if the buffer lacks `COPY_DST` usage.
     pub fn write(
         &mut self,
         queue: &wgpu::Queue,
@@ -96,6 +145,11 @@ impl<T: GpuValue> GpuVertexAttribute<T> {
     ) -> Result<(), GpuError> {
         if self.mesh != attribute.mesh {
             return Err(GpuError::MeshMismatch);
+        }
+        if !self.buffer.usage().contains(wgpu::BufferUsages::COPY_DST) {
+            return Err(GpuError::InvalidBuffer {
+                resource: "vertex attribute",
+            });
         }
         if !self.is_empty() {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&attribute.values));
